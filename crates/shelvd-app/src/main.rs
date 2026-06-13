@@ -156,6 +156,7 @@ impl ApplicationHandler<UserEvent> for App {
         let attributes = Window::default_attributes()
             .with_title("shelvd")
             .with_inner_size(LogicalSize::new(960.0, 600.0))
+            .with_min_inner_size(LogicalSize::new(360.0, 240.0))
             // winit's client-side titlebar (sctk-adwaita) mis-accounts its own
             // height on GNOME / Pop!_OS: every interactive move round-trips a
             // configure that subtracts the ~36px titlebar again, so the window
