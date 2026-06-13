@@ -1,0 +1,19 @@
+[package]
+name = "shelvd-render"
+description = "GPU renderer for shelvd: cell quads and glyph runs via wgpu + glyphon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+shelvd-core.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+raw-window-handle.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+log.workspace = true

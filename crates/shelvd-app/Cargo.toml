@@ -1,0 +1,24 @@
+[package]
+name = "shelvd-app"
+description = "shelvd terminal application: window, event loop, and wiring (binary `shelvd`)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "shelvd"
+path = "src/main.rs"
+
+[dependencies]
+shelvd-core.workspace = true
+shelvd-pty.workspace = true
+shelvd-term.workspace = true
+shelvd-render.workspace = true
+winit.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+pollster.workspace = true
