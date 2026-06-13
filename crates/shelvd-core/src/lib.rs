@@ -17,5 +17,7 @@ pub use config::Config;
 pub use error::{Error, Result};
 pub use geometry::{CellMetrics, GridSize, Padding, PixelSize};
 pub use palette::Palette;
-pub use snapshot::{CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot};
+pub use snapshot::{
+    CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, RowDecor, StickyHeader,
+};
 pub use theme::Theme;

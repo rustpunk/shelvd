@@ -65,6 +65,29 @@ pub struct CursorSnapshot {
     pub text_color: Rgba,
 }
 
+/// Per-visible-row command-block decoration, parallel to the rows of a
+/// [`GridSnapshot`]. `shelvd-term` fills this in; the renderer just paints it,
+/// so all block-color resolution still lives behind the load-bearing seam.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowDecor {
+    /// The command block this row belongs to (0 = none).
+    pub block_id: u32,
+    /// The row's block finished with a non-zero exit code.
+    pub failed: bool,
+    /// This is the first row of its block — draw a separator above it.
+    pub block_top: bool,
+}
+
+/// A command header pinned to the top of the viewport when its block's prompt
+/// has scrolled out of view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StickyHeader {
+    /// The block's command text.
+    pub command: String,
+    /// The block finished with a non-zero exit code.
+    pub failed: bool,
+}
+
 /// A complete, render-ready snapshot of the visible grid.
 #[derive(Clone, Debug)]
 pub struct GridSnapshot {
@@ -77,6 +100,17 @@ pub struct GridSnapshot {
     pub background: Rgba,
     /// Background painted over cells flagged [`CellFlags::SELECTED`].
     pub selection_color: Rgba,
+    /// Per-row block decoration, length == `rows`.
+    pub rows_decor: Vec<RowDecor>,
+    /// Sticky command header for the block at the top of the viewport, if its
+    /// prompt has scrolled off.
+    pub sticky: Option<StickyHeader>,
+    /// Left-edge stripe color for a failed block.
+    pub block_stripe: Rgba,
+    /// Subtle background wash (with alpha) over a failed block's rows.
+    pub block_tint: Rgba,
+    /// Hairline color drawn between adjacent blocks.
+    pub block_separator: Rgba,
 }
 
 impl GridSnapshot {
@@ -90,6 +124,11 @@ impl GridSnapshot {
             cursor: None,
             background: bg,
             selection_color: bg,
+            rows_decor: vec![RowDecor::default(); rows as usize],
+            sticky: None,
+            block_stripe: bg,
+            block_tint: bg,
+            block_separator: bg,
         }
     }
 
