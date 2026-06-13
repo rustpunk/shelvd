@@ -37,6 +37,35 @@ enum UserEvent {
 /// How long each cursor blink phase (visible, then hidden) lasts.
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Duration of the smooth "fill transition": when a burst of output makes the
+/// bottom-anchor reserve shrink by several rows at once, the grid glides up to
+/// its new position over this window instead of jumping.
+const FILL_ANIM: Duration = Duration::from_millis(120);
+
+/// Frame cadence while the fill transition is animating (~60fps).
+const FILL_ANIM_TICK: Duration = Duration::from_millis(16);
+
+/// Smallest anchor-shift decrease (in rows) that triggers the glide. Single-line
+/// scrolls (Δ == 1) stay instant so ordinary typing feels snappy.
+const FILL_ANIM_MIN_ROWS: u16 = 2;
+
+/// Eased remaining grid offset for the fill transition: starts at `from_px`
+/// (t = 0, content held where it was) and eases out to 0 (t >= 1, content
+/// settled at the anchored position). Cubic ease-out keeps it snappy.
+fn fill_anim_offset(from_px: f32, t: f32) -> f32 {
+    if t >= 1.0 {
+        return 0.0;
+    }
+    let t = t.max(0.0);
+    let eased = 1.0 - (1.0 - t).powi(3);
+    from_px * (1.0 - eased)
+}
+
+/// Progress of the fill transition in [0, 1] given when it started.
+fn elapsed_t(started: Instant, now: Instant) -> f32 {
+    (now.duration_since(started).as_secs_f32() / FILL_ANIM.as_secs_f32()).clamp(0.0, 1.0)
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -84,6 +113,16 @@ struct State {
     overlay: Option<OverlayState>,
     /// Overlay colors resolved from the theme at startup.
     overlay_colors: OverlayColors,
+    /// Current downward pixel offset of the grid layer for the fill transition
+    /// (0 == idle). Eases from `anim_from_px` to 0 over [`FILL_ANIM`].
+    anim_offset_px: f32,
+    /// The offset the current glide started from.
+    anim_from_px: f32,
+    /// When the current glide started.
+    anim_started: Instant,
+    /// Anchor shift (top-reserved blank rows) observed after the last PTY chunk,
+    /// used to detect the burst-shrink that triggers a glide.
+    prev_anchor_shift: u16,
 }
 
 impl App {
@@ -136,6 +175,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.config.theme.palette.clone(),
             self.config.theme.cursor_shape,
         );
+        let terminal_anchor = terminal.anchor_shift();
 
         let proxy = self.proxy.clone();
         let pty_opts = PtyOptions {
@@ -176,6 +216,10 @@ impl ApplicationHandler<UserEvent> for App {
             last_blink: Instant::now(),
             overlay: None,
             overlay_colors: overlay_colors(&self.config),
+            anim_offset_px: 0.0,
+            anim_from_px: 0.0,
+            anim_started: Instant::now(),
+            prev_anchor_shift: terminal_anchor,
         });
     }
 
@@ -227,6 +271,33 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         if dirty {
+            // Fill transition: if a burst of output shrank the bottom-anchor
+            // reserve by several rows at once, glide the grid up instead of
+            // letting it jump. Only at the live edge of the main screen.
+            let shift = state.terminal.anchor_shift();
+            if shift < state.prev_anchor_shift
+                && !state.terminal.alt_screen()
+                && !state.terminal.is_scrolled()
+            {
+                let delta = state.prev_anchor_shift - shift;
+                if delta >= FILL_ANIM_MIN_ROWS {
+                    let now = Instant::now();
+                    let cell_h = state.renderer.cell_metrics().height;
+                    // Accumulate onto any offset still in flight so back-to-back
+                    // bursts compound smoothly rather than snapping.
+                    let remaining = fill_anim_offset(
+                        state.anim_from_px,
+                        elapsed_t(state.anim_started, now),
+                    );
+                    let max_px = state.window.inner_size().height as f32;
+                    let from = (delta as f32 * cell_h + remaining).min(max_px);
+                    state.anim_from_px = from;
+                    state.anim_offset_px = from;
+                    state.anim_started = now;
+                }
+            }
+            state.prev_anchor_shift = shift;
+
             state.window.request_redraw();
         }
     }
@@ -259,6 +330,9 @@ impl ApplicationHandler<UserEvent> for App {
                     pixel_width: size.width as u16,
                     pixel_height: size.height as u16,
                 });
+                // A resize re-lays-out the grid; cancel any glide and re-baseline
+                // the anchor so the new layout never triggers a spurious one.
+                cancel_fill_anim(state);
                 state.window.request_redraw();
             }
 
@@ -273,6 +347,7 @@ impl ApplicationHandler<UserEvent> for App {
                     pixel_width: size.width as u16,
                     pixel_height: size.height as u16,
                 });
+                cancel_fill_anim(state);
                 state.window.request_redraw();
             }
 
@@ -510,7 +585,9 @@ impl ApplicationHandler<UserEvent> for App {
                     .overlay
                     .as_ref()
                     .map(|ov| ov.to_overlay(state.overlay_colors));
-                if let Err(e) = state.renderer.render(&snapshot, overlay.as_ref()) {
+                if let Err(e) =
+                    state.renderer.render(&snapshot, overlay.as_ref(), state.anim_offset_px)
+                {
                     log::error!("render error: {e}");
                 }
             }
@@ -523,27 +600,52 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        let now = Instant::now();
+        // The next instant the loop must wake on its own, if any. The fill
+        // transition and the cursor blink each contribute one; we take the
+        // soonest, and otherwise idle on `Wait`. This keeps the loop event-driven
+        // — it only ticks while something is actively animating.
+        let mut wake: Option<Instant> = None;
+
+        // --- fill transition ---------------------------------------------------
+        if state.anim_offset_px != 0.0 {
+            let t = elapsed_t(state.anim_started, now);
+            state.anim_offset_px = fill_anim_offset(state.anim_from_px, t);
+            state.window.request_redraw();
+            if t < 1.0 {
+                wake = Some(now + FILL_ANIM_TICK);
+            }
+        }
+
+        // --- cursor blink ------------------------------------------------------
         if state.focused && state.terminal.cursor_blinking() {
-            let now = Instant::now();
             if now.duration_since(state.last_blink) >= CURSOR_BLINK_INTERVAL {
                 state.blink_on = !state.blink_on;
                 state.last_blink = now;
                 state.window.request_redraw();
             }
-            // Wake again at the next toggle; this is the only thing that turns
-            // the otherwise event-driven loop into a ~2 Hz tick, and only while
-            // a blinking cursor is focused.
-            event_loop
-                .set_control_flow(ControlFlow::WaitUntil(state.last_blink + CURSOR_BLINK_INTERVAL));
-        } else {
-            // Not blinking: make sure the cursor is solid, then idle the loop.
-            if !state.blink_on {
-                state.blink_on = true;
-                state.window.request_redraw();
-            }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            let next_blink = state.last_blink + CURSOR_BLINK_INTERVAL;
+            wake = Some(wake.map_or(next_blink, |w| w.min(next_blink)));
+        } else if !state.blink_on {
+            // Not blinking: make sure the cursor is solid again.
+            state.blink_on = true;
+            state.window.request_redraw();
+        }
+
+        match wake {
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
+}
+
+/// Stop any in-flight fill transition and re-baseline the anchor to the current
+/// layout, so the next layout change is measured from solid ground (used after a
+/// resize / scale change, which re-lay out the whole grid).
+fn cancel_fill_anim(state: &mut State) {
+    state.anim_offset_px = 0.0;
+    state.anim_from_px = 0.0;
+    state.prev_anchor_shift = state.terminal.anchor_shift();
 }
 
 /// Translate a key press into the byte sequence a terminal expects.
@@ -839,8 +941,30 @@ fn paste_to_pty(state: &mut State, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{mouse_report, MouseAction};
+    use super::{fill_anim_offset, mouse_report, MouseAction};
     use winit::keyboard::ModifiersState;
+
+    #[test]
+    fn fill_anim_offset_eases_from_full_to_zero() {
+        let from = 48.0;
+        // t = 0 holds the content where it was; t >= 1 settles at the anchor.
+        assert_eq!(fill_anim_offset(from, 0.0), from);
+        assert_eq!(fill_anim_offset(from, 1.0), 0.0);
+        assert_eq!(fill_anim_offset(from, 1.5), 0.0, "past the end stays settled");
+        // Negative time is clamped to the start.
+        assert_eq!(fill_anim_offset(from, -0.5), from);
+
+        // Strictly decreasing across the animation, and always within (0, from).
+        let mut prev = from;
+        for i in 1..10 {
+            let t = i as f32 / 10.0;
+            let cur = fill_anim_offset(from, t);
+            assert!(cur < prev, "offset decreases monotonically: {cur} !< {prev}");
+            assert!(cur >= 0.0 && cur <= from, "offset stays in range: {cur}");
+            prev = cur;
+        }
+    }
+
 
     fn none() -> ModifiersState {
         ModifiersState::empty()

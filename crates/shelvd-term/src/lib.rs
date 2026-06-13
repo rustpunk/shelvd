@@ -138,6 +138,10 @@ pub struct Terminal {
     palette: Palette,
     cursor_shape: CursorShape,
     dims: TermDimensions,
+    /// Whether any PTY output has arrived yet. Before the shell prints its first
+    /// byte the grid is empty; suppressing the cursor until then avoids a lone
+    /// cursor flashing at the bottom of an otherwise blank, bottom-anchored screen.
+    seen_output: bool,
 }
 
 impl Terminal {
@@ -169,6 +173,7 @@ impl Terminal {
             palette,
             cursor_shape,
             dims,
+            seen_output: false,
         }
     }
 
@@ -179,6 +184,9 @@ impl Terminal {
     /// grid line where it occurred, the stream is fed to alacritty in segments
     /// split at every marker terminator, reading the cursor in between.
     pub fn process(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.seen_output = true;
+        }
         let hits = self.scanner.scan(bytes);
         if hits.is_empty() {
             self.advance_segment(bytes);
@@ -563,6 +571,13 @@ impl Terminal {
         self.term.grid().display_offset() != 0
     }
 
+    /// Blank rows currently reserved above the grid by the bottom-anchor layout.
+    /// The app watches this for the smooth fill transition: when a burst of output
+    /// makes it shrink, content jumps up by that many cell-heights in one frame.
+    pub fn anchor_shift(&self) -> u16 {
+        self.display_shift().max(0) as u16
+    }
+
     // --- terminal modes ------------------------------------------------------
 
     /// Whether the program enabled bracketed paste (DEC 2004).
@@ -637,12 +652,20 @@ impl Terminal {
         Point::new(Line(row as i32 - shift - offset), Column((col as usize).min(max_col)))
     }
 
-    /// Blank rows to reserve above the grid so the live prompt rests on the
+    /// Rows of breathing room left below the bottom-anchored prompt so it does not
+    /// sit flush against the window's bottom edge. Reserved when the grid has ample
+    /// room; it shrinks (and then vanishes) as output fills the screen, since the
+    /// shift is clamped at 0 and content always wins over the gutter.
+    const BOTTOM_GUTTER: i32 = 1;
+
+    /// Blank rows to reserve above the grid so the live prompt rests near the
     /// bottom of the window (Warp-style) instead of climbing down from the top.
     /// Active only at the live edge of the main screen, and only until output
     /// grows tall enough to fill the grid; scrolled history and full-screen apps
     /// (the alternate screen) are laid out top-to-bottom as usual, so it returns
-    /// 0 there and the snapshot matches a conventional terminal.
+    /// 0 there and the snapshot matches a conventional terminal. A small
+    /// [`Self::BOTTOM_GUTTER`] keeps the prompt off the very last row when room
+    /// permits, collapsing gracefully as the screen fills.
     fn display_shift(&self) -> i32 {
         let grid = self.term.grid();
         if grid.display_offset() != 0 || self.term.mode().contains(TermMode::ALT_SCREEN) {
@@ -652,19 +675,30 @@ impl Terminal {
         if rows <= 1 {
             return 0;
         }
-        (rows - 1 - self.content_bottom()).max(0)
+        (rows - 1 - self.content_bottom() - Self::BOTTOM_GUTTER).max(0)
     }
 
     /// The lowest occupied visible row at the live edge: the cursor's row or the
-    /// last row carrying a printed glyph, whichever is lower (0-based screen row).
-    /// Only meaningful at display offset 0 — where a screen row equals its grid
-    /// line — which is the only state [`Self::display_shift`] calls it in.
+    /// last row carrying visible content, whichever is lower (0-based screen row).
+    /// A row counts as occupied if it holds a printed glyph *or* any cell whose
+    /// effective background differs from the palette default — a highlighted blank
+    /// line (all spaces, colored background) is still content and must not be
+    /// clipped off the bottom by the anchor. Only meaningful at display offset 0 —
+    /// where a screen row equals its grid line — which is the only state
+    /// [`Self::display_shift`] calls it in.
     fn content_bottom(&self) -> i32 {
         let grid = self.term.grid();
         let mut bottom = grid.cursor.point.line.0.max(0);
         for indexed in grid.display_iter() {
             let row = indexed.point.line.0;
-            if row > bottom && indexed.cell.c != ' ' && indexed.cell.c != '\0' {
+            if row <= bottom {
+                continue;
+            }
+            let cell = indexed.cell;
+            let has_glyph = cell.c != ' ' && cell.c != '\0';
+            // Resolve through the full color path so inverse/hidden are respected.
+            let colored_bg = self.cell_colors(cell).1 != self.palette.background;
+            if has_glyph || colored_bg {
                 bottom = row;
             }
         }
@@ -744,7 +778,8 @@ impl Terminal {
     }
 
     fn cursor_snapshot(&self, offset: i32, shift: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
-        if self.cursor_shape == CursorShape::Hidden
+        if !self.seen_output
+            || self.cursor_shape == CursorShape::Hidden
             || !self.term.mode().contains(TermMode::SHOW_CURSOR)
         {
             return None;
@@ -895,8 +930,11 @@ mod tests {
         t.process(b"$ ");
         let snap = t.snapshot();
         let cur = snap.cursor.expect("cursor visible");
-        assert_eq!(cur.row, 5, "the live prompt rests on the bottom row");
-        assert_eq!(snap.cell(0, 5).unwrap().c, '$');
+        // One blank gutter row is left below the prompt, so on a 6-row grid the
+        // prompt rests on row 4 (the last row, 5, is breathing room).
+        assert_eq!(cur.row, 4, "the live prompt rests just above the bottom gutter");
+        assert_eq!(snap.cell(0, 4).unwrap().c, '$');
+        assert!(snap.cell(0, 5).unwrap().is_blank(), "the bottom row is gutter");
         assert!(snap.cell(0, 0).unwrap().is_blank(), "rows above are blank padding");
     }
 
@@ -909,10 +947,10 @@ mod tests {
         let snap = t.snapshot();
         assert_eq!(
             snap.cursor.expect("cursor visible").row,
-            5,
-            "clear leaves the prompt anchored to the bottom"
+            4,
+            "clear leaves the prompt anchored near the bottom, above the gutter"
         );
-        assert_eq!(snap.cell(0, 5).unwrap().c, '$');
+        assert_eq!(snap.cell(0, 4).unwrap().c, '$');
     }
 
     #[test]
@@ -934,6 +972,33 @@ mod tests {
         t.process(b"x");
         let snap = t.snapshot();
         assert_eq!(snap.cell(0, 0).unwrap().c, 'x', "alt screen is not bottom-anchored");
+    }
+
+    #[test]
+    fn fresh_terminal_hides_the_cursor_until_first_output() {
+        let mut t = terminal(20, 6);
+        // Before any PTY byte arrives the bottom-anchored screen is blank; a lone
+        // cursor must not flash there.
+        assert!(t.snapshot().cursor.is_none(), "no cursor before first output");
+        t.process(b"x");
+        assert!(t.snapshot().cursor.is_some(), "cursor appears once output arrives");
+    }
+
+    #[test]
+    fn colored_blank_row_participates_in_the_anchor() {
+        // A row that is all spaces but carries a non-default background is visible
+        // content: the anchor must reserve a line for it rather than clip it.
+        let mut t = terminal(20, 6);
+        // Row 0: a printed glyph. Row 1: five spaces painted blue (index 4), then
+        // park the cursor back up on row 0 so the colored row, not the cursor, is
+        // the lowest occupied line.
+        t.process(b"top\r\n\x1b[44m     \x1b[0m\x1b[A\r");
+        let snap = t.snapshot();
+        // content_bottom == 1 -> shift = (6 - 1 - 1 - 1).max(0) = 3, so grid row 1
+        // lands on display row 4, just above the one-row bottom gutter.
+        let blue = Palette::default().indexed(4);
+        assert_eq!(snap.cell(0, 4).unwrap().bg, blue, "the colored blank row is kept");
+        assert!(snap.cell(0, 5).unwrap().is_blank(), "the bottom row stays a gutter");
     }
 
     #[test]

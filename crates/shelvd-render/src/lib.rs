@@ -18,7 +18,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use shelvd_core::{
     CellFlags, CellMetrics, CellSnapshot, CursorShape, GridSize, GridSnapshot, Overlay, Padding,
-    PixelSize, Rgba, Theme,
+    PixelSize, Rgba, RowDecor, Theme,
 };
 
 use rect::{Rect, RectRenderer};
@@ -205,10 +205,15 @@ impl Renderer {
 
     /// Draw one frame: the grid from `snap`, plus `overlay` (command palette /
     /// history search) layered on top when present.
+    ///
+    /// `grid_offset_px` shifts the grid layer down by that many physical pixels
+    /// (the app's fill-transition glide). It moves grid content only — the
+    /// sticky header and any overlay stay pinned to the top.
     pub fn render(
         &mut self,
         snap: &GridSnapshot,
         overlay: Option<&Overlay>,
+        grid_offset_px: f32,
     ) -> Result<(), RenderError> {
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -235,7 +240,7 @@ impl Renderer {
         let blank_rows =
             layout.map_or(u16::from(snap.sticky.is_some()), |l| l.panel_rows);
 
-        let mut rects = self.build_rects(snap, overlay.is_some());
+        let mut rects = self.build_rects(snap, overlay.is_some(), grid_offset_px);
         if let (Some(ov), Some(l)) = (overlay, layout) {
             self.append_overlay_rects(&mut rects, ov, l);
         }
@@ -273,13 +278,14 @@ impl Renderer {
             Resolution { width: self.config.width, height: self.config.height },
         );
         let pad = self.padding_physical();
+        let grid_pad = Padding::new(pad.x, pad.y + grid_offset_px);
         let bounds = TextBounds {
             left: 0,
             top: 0,
             right: self.config.width as i32,
             bottom: self.config.height as i32,
         };
-        let mut areas = vec![text_area(&self.buffer, to_gcolor(self.default_fg), pad, bounds)];
+        let mut areas = vec![text_area(&self.buffer, to_gcolor(self.default_fg), grid_pad, bounds)];
         if let Some(color) = sticky_color {
             areas.push(text_area(&self.sticky_buffer, to_gcolor(color), pad, bounds));
         }
@@ -350,12 +356,15 @@ impl Renderer {
         )
     }
 
-    fn build_rects(&self, snap: &GridSnapshot, overlay_open: bool) -> Vec<Rect> {
+    fn build_rects(&self, snap: &GridSnapshot, overlay_open: bool, grid_offset_px: f32) -> Vec<Rect> {
         let pad = self.padding_physical();
         let (cw, ch) = (self.cell.width, self.cell.height);
         let width = self.config.width as f32;
         let mut rects = Vec::new();
         let default_bg = snap.background;
+        // Grid content rides the fill-transition offset; the sticky band below
+        // keeps `pad.y` so it stays pinned to the top while the grid glides.
+        let grid_pad_y = pad.y + grid_offset_px;
 
         // Cell backgrounds.
         for row in 0..snap.rows {
@@ -363,7 +372,7 @@ impl Renderer {
                 if let Some(cell) = snap.cell(col, row) {
                     if cell.bg != default_bg {
                         let x = pad.x + col as f32 * cw;
-                        let y = pad.y + row as f32 * ch;
+                        let y = grid_pad_y + row as f32 * ch;
                         rects.push(Rect { x, y, w: cw, h: ch, color: cell.bg.to_linear_f32() });
                     }
                 }
@@ -371,10 +380,12 @@ impl Renderer {
         }
 
         // Failed-block background wash (translucent, over the cell backgrounds).
+        // A blank top-padding row carries no block (`block_id == 0`) and is never
+        // `failed`, so this never washes into the empty space above the prompt.
         let tint = snap.block_tint.to_linear_f32();
         for (row, decor) in snap.rows_decor.iter().enumerate() {
-            if decor.failed {
-                let y = pad.y + row as f32 * ch;
+            if decor.failed && decor.block_id != 0 {
+                let y = grid_pad_y + row as f32 * ch;
                 rects.push(Rect { x: 0.0, y, w: width, h: ch, color: tint });
             }
         }
@@ -385,7 +396,7 @@ impl Renderer {
                 if let Some(cell) = snap.cell(col, row) {
                     if cell.flags.contains(CellFlags::SELECTED) {
                         let x = pad.x + col as f32 * cw;
-                        let y = pad.y + row as f32 * ch;
+                        let y = grid_pad_y + row as f32 * ch;
                         rects.push(Rect {
                             x,
                             y,
@@ -398,19 +409,25 @@ impl Renderer {
             }
         }
 
-        // Exit-code stripe in the left gutter + a rule above each new block.
+        // Exit-code stripe in the left gutter + a hairline rule between blocks.
         let stripe = snap.block_stripe.to_linear_f32();
         let sep = snap.block_separator.to_linear_f32();
         let stripe_x = (2.0 * self.scale).min(pad.x);
         let stripe_w = (3.0 * self.scale).max(2.0);
         let sep_h = self.scale.max(1.0);
+        // Inset the divider from the window edges so it reads as a subtle rule
+        // between blocks rather than a full-bleed bar.
+        let sep_inset = pad.x.min(width * 0.5).floor();
+        let sep_w = (width - 2.0 * sep_inset).max(0.0);
         for (row, decor) in snap.rows_decor.iter().enumerate() {
-            let y = pad.y + row as f32 * ch;
-            if decor.failed {
+            let y = grid_pad_y + row as f32 * ch;
+            // A failed row always belongs to a real block, but guard on
+            // `block_id` so the intent — never stripe blank padding — is explicit.
+            if decor.failed && decor.block_id != 0 {
                 rects.push(Rect { x: stripe_x, y, w: stripe_w, h: ch, color: stripe });
             }
-            if decor.block_top && row > 0 {
-                rects.push(Rect { x: 0.0, y, w: width, h: sep_h, color: sep });
+            if separator_above(&snap.rows_decor, row) {
+                rects.push(Rect { x: sep_inset, y, w: sep_w, h: sep_h, color: sep });
             }
         }
 
@@ -427,7 +444,7 @@ impl Renderer {
 
         if let Some(cur) = snap.cursor {
             let x = pad.x + cur.col as f32 * cw;
-            let y = pad.y + cur.row as f32 * ch;
+            let y = grid_pad_y + cur.row as f32 * ch;
             let color = cur.color.to_linear_f32();
             match cur.shape {
                 CursorShape::Block => rects.push(Rect { x, y, w: cw, h: ch, color }),
@@ -689,4 +706,52 @@ fn to_gcolor(c: Rgba) -> GColor {
 fn clear_color(c: Rgba) -> wgpu::Color {
     let [r, g, b, a] = c.to_linear_f64();
     wgpu::Color { r, g, b, a }
+}
+
+/// Whether to draw a block-separator rule above `row`.
+///
+/// Only between two real blocks: `row` must start a block (`block_top`) and the
+/// row directly above it must itself belong to a block (`block_id != 0`). This
+/// keeps the rule from floating in the blank top-padding that the bottom-anchored
+/// layout leaves above the first visible block.
+fn separator_above(rows_decor: &[RowDecor], row: usize) -> bool {
+    row > 0
+        && rows_decor[row].block_top
+        && rows_decor.get(row - 1).is_some_and(|prev| prev.block_id != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RowDecor, separator_above};
+
+    fn block_top(block_id: u32) -> RowDecor {
+        RowDecor { block_id, failed: false, block_top: true }
+    }
+
+    fn body(block_id: u32) -> RowDecor {
+        RowDecor { block_id, failed: false, block_top: false }
+    }
+
+    #[test]
+    fn separator_above_only_between_real_blocks() {
+        // Layout: two blank top-padding rows, then block 1, then block 2.
+        let rows = [
+            RowDecor::default(), // 0: blank padding
+            RowDecor::default(), // 1: blank padding
+            block_top(1),        // 2: first visible block — sits below padding
+            body(1),             // 3
+            block_top(2),        // 4: next block — sits below a real block
+            body(2),             // 5
+        ];
+
+        // Row 0 can never have a separator above it.
+        assert!(!separator_above(&rows, 0));
+        // A `block_top` row whose predecessor is blank padding: no floating rule.
+        assert!(!separator_above(&rows, 2));
+        // A non-`block_top` body row: no rule.
+        assert!(!separator_above(&rows, 3));
+        // A `block_top` row directly below a real block: draw the divider.
+        assert!(separator_above(&rows, 4));
+        assert!(!separator_above(&rows, 5));
+    }
 }
