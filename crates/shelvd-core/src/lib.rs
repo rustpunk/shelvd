@@ -16,7 +16,7 @@ pub mod theme;
 pub use color::Rgba;
 pub use config::Config;
 pub use error::{Error, Result};
-pub use geometry::{CellMetrics, GridSize, Padding, PixelSize};
+pub use geometry::{CellMetrics, GridSize, Padding, PixelSize, ResizeEdge, TitlebarHit};
 pub use overlay::{Overlay, OverlayColors, OverlayItem};
 pub use palette::Palette;
 pub use snapshot::{

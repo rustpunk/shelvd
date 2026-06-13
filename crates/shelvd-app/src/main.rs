@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use shelvd_core::{Config, OverlayColors, Rgba};
+use shelvd_core::{Config, OverlayColors, ResizeEdge, Rgba, TitlebarHit};
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
 use shelvd_term::{TermEvent, Terminal};
@@ -23,7 +23,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
 use overlay::{Action, OverlayState};
 
@@ -53,6 +53,9 @@ const FILL_ANIM_MIN_ROWS: u16 = 2;
 /// answers the resize's SIGWINCH by redrawing its prompt; that echo must not be
 /// mistaken for output filling the screen and kick off a spurious downward glide.
 const GLIDE_RESIZE_COOLDOWN: Duration = Duration::from_millis(150);
+
+/// Two titlebar presses within this window count as a double-click (maximize).
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Eased remaining grid offset for the fill transition: starts at `from_px`
 /// (t = 0, content held where it was) and eases out to 0 (t >= 1, content
@@ -132,6 +135,10 @@ struct State {
     /// held off for [`GLIDE_RESIZE_COOLDOWN`] afterward so the shell's SIGWINCH
     /// prompt-redraw can't be mistaken for output and trigger a spurious glide.
     last_geometry_change: Instant,
+    /// Timestamp of the last titlebar press, for double-click-to-maximize.
+    last_titlebar_press: Option<Instant>,
+    /// Which window button the pointer is hovering (for the highlight).
+    hovered_button: Option<TitlebarHit>,
 }
 
 impl App {
@@ -148,7 +155,14 @@ impl ApplicationHandler<UserEvent> for App {
 
         let attributes = Window::default_attributes()
             .with_title("shelvd")
-            .with_inner_size(LogicalSize::new(960.0, 600.0));
+            .with_inner_size(LogicalSize::new(960.0, 600.0))
+            // winit's client-side titlebar (sctk-adwaita) mis-accounts its own
+            // height on GNOME / Pop!_OS: every interactive move round-trips a
+            // configure that subtracts the ~36px titlebar again, so the window
+            // sheds a row on each drag. Until that's fixed upstream (winit is
+            // version-locked) or shelvd draws its own titlebar, run undecorated
+            // and move via the compositor gesture (Super+drag on Pop!_OS).
+            .with_decorations(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(e) => {
@@ -230,6 +244,8 @@ impl ApplicationHandler<UserEvent> for App {
             anim_started: Instant::now(),
             prev_anchor_shift: terminal_anchor,
             last_geometry_change: Instant::now(),
+            last_titlebar_press: None,
+            hovered_button: None,
         });
     }
 
@@ -261,6 +277,8 @@ impl ApplicationHandler<UserEvent> for App {
                         log::debug!("pty write failed: {e}");
                     }
                 }
+                // The OS taskbar/overview gets the program's title; the drawn
+                // titlebar keeps shelvd's own name rather than echoing the shell.
                 TermEvent::Title(title) => state.window.set_title(&title),
                 TermEvent::ResetTitle => state.window.set_title("shelvd"),
                 TermEvent::Exit => {
@@ -378,6 +396,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x as f32, position.y as f32);
+                update_titlebar_hover(state);
                 if state.overlay.is_some() {
                     return; // overlay swallows pointer motion
                 }
@@ -413,6 +432,28 @@ impl ApplicationHandler<UserEvent> for App {
                         state.window.request_redraw();
                     }
                     return;
+                }
+                // Window chrome wins over the child and local selection: a press
+                // on a resize edge or the titlebar drives the compositor (winit
+                // decorations are off, so shelvd owns the move/resize).
+                if button == MouseButton::Left && elem_state == ElementState::Pressed {
+                    let (mx, my) = state.mouse_pos;
+                    if let Some(edge) = state.renderer.resize_edge(mx, my) {
+                        let _ = state.window.drag_resize_window(to_resize_dir(edge));
+                        return;
+                    }
+                    if let Some(hit) = state.renderer.titlebar_hit(mx, my) {
+                        match hit {
+                            TitlebarHit::Drag => handle_titlebar_press(state),
+                            TitlebarHit::Minimize => state.window.set_minimized(true),
+                            TitlebarHit::Maximize => {
+                                let maximized = state.window.is_maximized();
+                                state.window.set_maximized(!maximized);
+                            }
+                            TitlebarHit::Close => event_loop.exit(),
+                        }
+                        return;
+                    }
                 }
                 // Forward clicks to the child when it is reading the mouse; Shift
                 // forces local selection/paste instead (the standard override).
@@ -672,6 +713,51 @@ fn cancel_fill_anim(state: &mut State) {
     state.anim_from_px = 0.0;
     state.prev_anchor_shift = state.terminal.anchor_shift();
     state.last_geometry_change = Instant::now();
+}
+
+/// A left press on the titlebar: a quick second press toggles maximize,
+/// otherwise it begins a compositor-driven window move.
+fn handle_titlebar_press(state: &mut State) {
+    let now = Instant::now();
+    let double = state
+        .last_titlebar_press
+        .is_some_and(|t| now.duration_since(t) <= DOUBLE_CLICK);
+    if double {
+        state.last_titlebar_press = None;
+        let maximized = state.window.is_maximized();
+        state.window.set_maximized(!maximized);
+    } else {
+        state.last_titlebar_press = Some(now);
+        let _ = state.window.drag_window();
+    }
+}
+
+/// Map a core resize edge to winit's compositor resize direction.
+fn to_resize_dir(edge: ResizeEdge) -> ResizeDirection {
+    match edge {
+        ResizeEdge::North => ResizeDirection::North,
+        ResizeEdge::South => ResizeDirection::South,
+        ResizeEdge::East => ResizeDirection::East,
+        ResizeEdge::West => ResizeDirection::West,
+        ResizeEdge::NorthEast => ResizeDirection::NorthEast,
+        ResizeEdge::NorthWest => ResizeDirection::NorthWest,
+        ResizeEdge::SouthEast => ResizeDirection::SouthEast,
+        ResizeEdge::SouthWest => ResizeDirection::SouthWest,
+    }
+}
+
+/// Refresh the hovered window button from the pointer position, redrawing only
+/// on change so the hover highlight follows the cursor without churn.
+fn update_titlebar_hover(state: &mut State) {
+    let hit = state
+        .renderer
+        .titlebar_hit(state.mouse_pos.0, state.mouse_pos.1)
+        .filter(|h| !matches!(h, TitlebarHit::Drag));
+    if hit != state.hovered_button {
+        state.hovered_button = hit;
+        state.renderer.set_hovered_button(hit);
+        state.window.request_redraw();
+    }
 }
 
 /// Translate a key press into the byte sequence a terminal expects.

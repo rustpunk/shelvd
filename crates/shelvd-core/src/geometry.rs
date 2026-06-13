@@ -65,6 +65,31 @@ impl Default for Padding {
     }
 }
 
+/// What a pointer is over within the custom titlebar: a window button or the
+/// draggable region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TitlebarHit {
+    /// Anywhere not on a button — initiates a window move.
+    Drag,
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// Which window edge or corner the pointer is over, for interactive resize of an
+/// undecorated window. The app maps these to the compositor's resize directions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResizeEdge {
+    North,
+    South,
+    East,
+    West,
+    NorthEast,
+    NorthWest,
+    SouthEast,
+    SouthWest,
+}
+
 impl GridSize {
     /// Compute how many whole cells fit in `px` after reserving `pad` on each edge.
     /// Always returns at least a 1×1 grid so downstream math never divides by zero.
