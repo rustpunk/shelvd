@@ -235,7 +235,7 @@ impl Renderer {
         let blank_rows =
             layout.map_or(u16::from(snap.sticky.is_some()), |l| l.panel_rows);
 
-        let mut rects = self.build_rects(snap);
+        let mut rects = self.build_rects(snap, overlay.is_some());
         if let (Some(ov), Some(l)) = (overlay, layout) {
             self.append_overlay_rects(&mut rects, ov, l);
         }
@@ -279,36 +279,12 @@ impl Renderer {
             right: self.config.width as i32,
             bottom: self.config.height as i32,
         };
-        let mut areas = vec![TextArea {
-            buffer: &self.buffer,
-            left: pad.x,
-            top: pad.y,
-            scale: 1.0,
-            bounds,
-            default_color: to_gcolor(self.default_fg),
-            custom_glyphs: &[],
-        }];
+        let mut areas = vec![text_area(&self.buffer, to_gcolor(self.default_fg), pad, bounds)];
         if let Some(color) = sticky_color {
-            areas.push(TextArea {
-                buffer: &self.sticky_buffer,
-                left: pad.x,
-                top: pad.y,
-                scale: 1.0,
-                bounds,
-                default_color: to_gcolor(color),
-                custom_glyphs: &[],
-            });
+            areas.push(text_area(&self.sticky_buffer, to_gcolor(color), pad, bounds));
         }
         if let Some(ov) = overlay {
-            areas.push(TextArea {
-                buffer: &self.overlay_buffer,
-                left: pad.x,
-                top: pad.y,
-                scale: 1.0,
-                bounds,
-                default_color: to_gcolor(ov.colors.fg),
-                custom_glyphs: &[],
-            });
+            areas.push(text_area(&self.overlay_buffer, to_gcolor(ov.colors.fg), pad, bounds));
         }
         self.text_renderer.prepare(
             &self.device,
@@ -374,7 +350,7 @@ impl Renderer {
         )
     }
 
-    fn build_rects(&self, snap: &GridSnapshot) -> Vec<Rect> {
+    fn build_rects(&self, snap: &GridSnapshot, overlay_open: bool) -> Vec<Rect> {
         let pad = self.padding_physical();
         let (cw, ch) = (self.cell.width, self.cell.height);
         let width = self.config.width as f32;
@@ -439,7 +415,8 @@ impl Renderer {
         }
 
         // Sticky command header: an opaque band over row 0 with a bottom rule.
-        if let Some(sticky) = &snap.sticky {
+        // An open overlay covers the same rows, so skip it then.
+        if let Some(sticky) = snap.sticky.as_ref().filter(|_| !overlay_open) {
             let band_h = pad.y + ch;
             rects.push(Rect { x: 0.0, y: 0.0, w: width, h: band_h, color: default_bg.to_linear_f32() });
             rects.push(Rect { x: 0.0, y: band_h - sep_h, w: width, h: sep_h, color: sep });
@@ -689,6 +666,20 @@ fn measure_cell(font_system: &mut FontSystem, metrics: Metrics, family: Option<&
         metrics.font_size * 0.6
     };
     CellMetrics::new(width.max(1.0), metrics.line_height)
+}
+
+/// One full-window text area at the grid's text origin — the layout shared by
+/// the grid, sticky-header, and overlay text layers.
+fn text_area(buffer: &Buffer, color: GColor, pad: Padding, bounds: TextBounds) -> TextArea<'_> {
+    TextArea {
+        buffer,
+        left: pad.x,
+        top: pad.y,
+        scale: 1.0,
+        bounds,
+        default_color: color,
+        custom_glyphs: &[],
+    }
 }
 
 fn to_gcolor(c: Rgba) -> GColor {

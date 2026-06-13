@@ -422,6 +422,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if mods.control_key() && mods.shift_key() {
                     match &event.logical_key {
                         Key::Character(s) if s.eq_ignore_ascii_case("p") => {
+                            state.selecting = false; // drop any in-progress drag
                             state.overlay = Some(OverlayState::palette());
                             state.window.request_redraw();
                             return;
@@ -761,6 +762,9 @@ fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
         Action::SearchHistory => open_history(state),
         Action::Quit => event_loop.exit(),
         Action::InsertCommand(cmd) => {
+            // Jump to the live edge first (like normal key input) so the shell's
+            // echo of the inserted command is on-screen, not below the viewport.
+            state.terminal.scroll_to_bottom();
             if let Err(e) = state.pty.write(cmd.as_bytes()) {
                 log::debug!("history insert failed: {e}");
             }
@@ -771,6 +775,7 @@ fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
 /// Open the history overlay from this session's block command strings.
 fn open_history(state: &mut State) {
     let commands = history_commands(&state.terminal);
+    state.selecting = false; // drop any in-progress drag
     state.overlay = Some(OverlayState::history(commands));
 }
 

@@ -35,7 +35,21 @@ enum Kind {
 struct Candidate {
     label: String,
     detail: Option<String>,
+    /// Label plus detail, matched against so an action is findable by its
+    /// keybinding hint, not only its name.
+    haystack: String,
     action: Action,
+}
+
+impl Candidate {
+    fn new(label: impl Into<String>, detail: Option<&str>, action: Action) -> Self {
+        let label = label.into();
+        let haystack = match detail {
+            Some(d) => format!("{label} {d}"),
+            None => label.clone(),
+        };
+        Self { label, detail: detail.map(str::to_owned), haystack, action }
+    }
 }
 
 /// Live state of an open overlay.
@@ -54,38 +68,14 @@ impl OverlayState {
     /// The command palette: a fixed list of actions.
     pub fn palette() -> Self {
         let candidates = vec![
-            Candidate {
-                label: "Search command history".into(),
-                detail: Some("Ctrl+Shift+R".into()),
-                action: Action::SearchHistory,
-            },
-            Candidate {
-                label: "Jump to previous block".into(),
-                detail: Some("Ctrl+Shift+Up".into()),
-                action: Action::PrevBlock,
-            },
-            Candidate {
-                label: "Jump to next block".into(),
-                detail: Some("Ctrl+Shift+Down".into()),
-                action: Action::NextBlock,
-            },
-            Candidate {
-                label: "Copy current block".into(),
-                detail: Some("Ctrl+Shift+X".into()),
-                action: Action::CopyBlock,
-            },
-            Candidate {
-                label: "Copy selection".into(),
-                detail: Some("Ctrl+Shift+C".into()),
-                action: Action::CopySelection,
-            },
-            Candidate { label: "Scroll to top".into(), detail: None, action: Action::ScrollToTop },
-            Candidate {
-                label: "Scroll to bottom".into(),
-                detail: None,
-                action: Action::ScrollToBottom,
-            },
-            Candidate { label: "Quit shelvd".into(), detail: None, action: Action::Quit },
+            Candidate::new("Search command history", Some("Ctrl+Shift+R"), Action::SearchHistory),
+            Candidate::new("Jump to previous block", Some("Ctrl+Shift+Up"), Action::PrevBlock),
+            Candidate::new("Jump to next block", Some("Ctrl+Shift+Down"), Action::NextBlock),
+            Candidate::new("Copy current block", Some("Ctrl+Shift+X"), Action::CopyBlock),
+            Candidate::new("Copy selection", Some("Ctrl+Shift+C"), Action::CopySelection),
+            Candidate::new("Scroll to top", None, Action::ScrollToTop),
+            Candidate::new("Scroll to bottom", None, Action::ScrollToBottom),
+            Candidate::new("Quit shelvd", None, Action::Quit),
         ];
         Self::build(Kind::Palette, candidates)
     }
@@ -94,11 +84,7 @@ impl OverlayState {
     pub fn history(commands: Vec<String>) -> Self {
         let candidates = commands
             .into_iter()
-            .map(|cmd| Candidate {
-                label: cmd.clone(),
-                detail: None,
-                action: Action::InsertCommand(cmd),
-            })
+            .map(|cmd| Candidate::new(cmd.clone(), None, Action::InsertCommand(cmd)))
             .collect();
         Self::build(Kind::History, candidates)
     }
@@ -147,27 +133,34 @@ impl OverlayState {
     }
 
     fn refilter(&mut self) {
+        // Remember the highlighted candidate so the cursor can stay on it.
+        let previous = self.filtered.get(self.selected).copied();
+
         if self.query.is_empty() {
             self.filtered = (0..self.candidates.len()).collect();
-            self.selected = 0;
-            return;
+        } else {
+            let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+            let candidates = &self.candidates;
+            let matcher = &mut self.matcher;
+            // One scratch buffer, reused per candidate (Utf32Str::new clears it).
+            let mut buf = Vec::new();
+            let mut scored: Vec<(usize, u32)> = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    let hay = Utf32Str::new(&c.haystack, &mut buf);
+                    pattern.score(hay, matcher).map(|score| (i, score))
+                })
+                .collect();
+            // Higher score first; the sort is stable, so ties keep list order.
+            scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
-        let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
-        let candidates = &self.candidates;
-        let matcher = &mut self.matcher;
-        let mut scored: Vec<(usize, u32)> = candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
-                let mut buf = Vec::new();
-                let hay = Utf32Str::new(&c.label, &mut buf);
-                pattern.score(hay, matcher).map(|score| (i, score))
-            })
-            .collect();
-        // Higher score first; the sort is stable, so ties keep list order.
-        scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
-        self.filtered = scored.into_iter().map(|(i, _)| i).collect();
-        self.selected = 0;
+
+        // Keep the highlight on the same item if it survived; else jump to top.
+        self.selected = previous
+            .and_then(|cand| self.filtered.iter().position(|&i| i == cand))
+            .unwrap_or(0);
     }
 
     /// Build the render-ready overlay description for this frame.
@@ -247,5 +240,29 @@ mod tests {
             Some(Action::InsertCommand(cmd)) => assert_eq!(cmd, "ls -la"),
             other => panic!("expected InsertCommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn actions_are_findable_by_their_keybinding() {
+        // "Copy current block" is the only action whose hint ends in X.
+        let mut p = OverlayState::palette();
+        for c in "ctrl+shift+x".chars() {
+            p.input_char(c);
+        }
+        assert!(matches!(p.selected_action(), Some(Action::CopyBlock)));
+    }
+
+    #[test]
+    fn selection_is_preserved_across_narrowing() {
+        let mut p = OverlayState::palette();
+        for c in "scroll".chars() {
+            p.input_char(c);
+        }
+        assert_eq!(p.filtered.len(), 2, "both scroll actions match");
+        p.move_selection(1); // highlight "Scroll to bottom"
+        assert!(matches!(p.selected_action(), Some(Action::ScrollToBottom)));
+        // Both still match; the highlight must follow the item, not reset to top.
+        p.input_char('o');
+        assert!(matches!(p.selected_action(), Some(Action::ScrollToBottom)));
     }
 }
