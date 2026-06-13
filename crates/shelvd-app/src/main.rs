@@ -375,17 +375,36 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let mods = state.modifiers;
-                // Ctrl+Shift+C / Ctrl+Shift+V: clipboard. (Ctrl+C alone still sends SIGINT.)
+                // Ctrl+Shift+{C,V}: clipboard. Ctrl+Shift+X: copy the current
+                // block. Ctrl+Shift+{Up,Down}: jump between command blocks.
+                // (Ctrl+C alone still sends SIGINT.)
                 if mods.control_key() && mods.shift_key() {
-                    if let Key::Character(s) = &event.logical_key {
-                        if s.eq_ignore_ascii_case("c") {
+                    match &event.logical_key {
+                        Key::Character(s) if s.eq_ignore_ascii_case("c") => {
                             copy_selection(state);
                             return;
                         }
-                        if s.eq_ignore_ascii_case("v") {
+                        Key::Character(s) if s.eq_ignore_ascii_case("v") => {
                             paste_clipboard(state);
                             return;
                         }
+                        Key::Character(s) if s.eq_ignore_ascii_case("x") => {
+                            copy_block(state);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if state.terminal.scroll_to_prev_block() {
+                                state.window.request_redraw();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if state.terminal.scroll_to_next_block() {
+                                state.window.request_redraw();
+                            }
+                            return;
+                        }
+                        _ => {}
                     }
                 }
                 // Shift+PageUp / Shift+PageDown: scroll the viewport through history.
@@ -608,6 +627,18 @@ fn copy_selection(state: &mut State) {
     if let Some(clipboard) = state.clipboard.as_mut() {
         if let Err(e) = clipboard.set_text(text) {
             log::debug!("clipboard copy failed: {e}");
+        }
+    }
+}
+
+/// Copy the whole block at the top of the viewport to the system clipboard.
+fn copy_block(state: &mut State) {
+    let Some(text) = state.terminal.current_block_text() else {
+        return;
+    };
+    if let Some(clipboard) = state.clipboard.as_mut() {
+        if let Err(e) = clipboard.set_text(text) {
+            log::debug!("block copy failed: {e}");
         }
     }
 }
