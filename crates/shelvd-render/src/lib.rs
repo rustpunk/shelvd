@@ -203,6 +203,16 @@ impl Renderer {
         self.cell
     }
 
+    /// Current surface size in physical pixels.
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// The DPI scale factor the renderer is currently configured for.
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
     /// Draw one frame: the grid from `snap`, plus `overlay` (command palette /
     /// history search) layered on top when present.
     ///
