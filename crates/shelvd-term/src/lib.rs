@@ -201,6 +201,24 @@ impl Terminal {
         self.term.mode().intersects(TermMode::MOUSE_MODE)
     }
 
+    /// Whether mouse reports should use SGR encoding (DEC 1006) rather than the
+    /// legacy X10 byte encoding.
+    pub fn sgr_mouse(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    /// Whether the program asked for *all* pointer motion to be reported
+    /// (DEC 1003), regardless of whether a button is held.
+    pub fn mouse_report_all_motion(&self) -> bool {
+        self.term.mode().contains(TermMode::MOUSE_MOTION)
+    }
+
+    /// Whether the program asked for button-held drag motion to be reported
+    /// (DEC 1002).
+    pub fn mouse_report_drag(&self) -> bool {
+        self.term.mode().contains(TermMode::MOUSE_DRAG)
+    }
+
     /// Whether the alternate screen is active (e.g. a full-screen TUI).
     pub fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
