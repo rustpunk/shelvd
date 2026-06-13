@@ -281,6 +281,71 @@ impl Terminal {
         &self.blocks
     }
 
+    /// Scroll so the previous block's prompt sits at the top of the viewport.
+    /// Returns whether there was a previous block to jump to.
+    pub fn scroll_to_prev_block(&mut self) -> bool {
+        let top = self.viewport_top_line();
+        let target = self.blocks.iter().rev().find(|b| b.prompt_line < top).map(|b| b.prompt_line);
+        match target {
+            Some(line) => {
+                self.scroll_top_to(line);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Scroll so the next block's prompt sits at the top of the viewport.
+    pub fn scroll_to_next_block(&mut self) -> bool {
+        let top = self.viewport_top_line();
+        let target = self.blocks.iter().find(|b| b.prompt_line > top).map(|b| b.prompt_line);
+        match target {
+            Some(line) => {
+                self.scroll_top_to(line);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The full text (prompt through output) of the block currently at the top
+    /// of the viewport, for copy-block.
+    pub fn current_block_text(&self) -> Option<String> {
+        let top = self.viewport_top_line();
+        let cursor_abs = self.absolute_cursor_line();
+        let idx = self.block_row(top, cursor_abs)?;
+        let start_abs = self.blocks[idx].prompt_line;
+        let end_abs = if idx + 1 < self.blocks.len() {
+            self.blocks[idx + 1].prompt_line
+        } else {
+            self.blocks[idx].end_line.map_or(cursor_abs + 1, |e| e + 1)
+        };
+        let start = Point::new(Line(self.abs_to_grid_line(start_abs)), Column(0));
+        let last_col = self.dims.cols.saturating_sub(1) as usize;
+        let end = Point::new(Line(self.abs_to_grid_line(end_abs - 1)), Column(last_col));
+        let text = self.term.bounds_to_string(start, end).trim_end().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Absolute line currently shown at the top of the viewport.
+    fn viewport_top_line(&self) -> i64 {
+        self.abs_base - self.term.grid().display_offset() as i64
+    }
+
+    /// Scroll the display so absolute line `abs` becomes the top visible row.
+    fn scroll_top_to(&mut self, abs: i64) {
+        let d_req = (self.abs_base - abs).max(0);
+        let d0 = self.term.grid().display_offset() as i64;
+        let delta = (d_req - d0) as i32;
+        if delta != 0 {
+            self.term.scroll_display(Scroll::Delta(delta));
+        }
+    }
+
     /// Clamp an absolute line to a valid grid `Line`, so text extraction never
     /// indexes outside the retained buffer.
     fn abs_to_grid_line(&self, abs: i64) -> i32 {
@@ -886,6 +951,32 @@ mod tests {
         assert_eq!(blocks[0].command, "a");
         assert_eq!(blocks[1].command, "b");
         assert!(blocks[0].id != blocks[1].id);
+    }
+
+    #[test]
+    fn current_block_text_reads_the_top_block() {
+        let mut t = terminal(40, 10);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        let text = t.current_block_text().expect("a block is at the top");
+        assert!(text.contains("echo hi"), "includes the command: {text:?}");
+        assert!(text.contains("hi"), "includes the output: {text:?}");
+    }
+
+    #[test]
+    fn block_navigation_scrolls_between_prompts() {
+        let mut t = terminal(40, 4); // small grid so blocks scroll into history
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07d\r\ne\r\nf\r\n\x1b]133;D;0\x07");
+        assert!(!t.is_scrolled(), "starts at the live edge");
+        // Walk backward to the earliest block (each jump lands on a prompt above
+        // the current top), then confirm forward navigation returns toward it.
+        let mut jumps = 0;
+        while t.scroll_to_prev_block() {
+            jumps += 1;
+        }
+        assert!(jumps >= 1, "navigated to at least one earlier block");
+        assert!(t.is_scrolled(), "now parked in history");
+        assert!(t.scroll_to_next_block(), "can move forward to a later block");
     }
 
     #[test]

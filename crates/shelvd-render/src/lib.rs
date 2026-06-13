@@ -53,6 +53,8 @@ pub struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     buffer: Buffer,
+    /// One-line buffer for the sticky command header.
+    sticky_buffer: Buffer,
 
     rects: RectRenderer,
 
@@ -132,6 +134,9 @@ impl Renderer {
         let mut buffer = Buffer::new(&mut font_system, metrics);
         buffer.set_size(&mut font_system, None, None);
 
+        let mut sticky_buffer = Buffer::new(&mut font_system, metrics);
+        sticky_buffer.set_size(&mut font_system, None, None);
+
         let rects = RectRenderer::new(&device, format);
         rects.set_resolution(&queue, config.width as f32, config.height as f32);
 
@@ -146,6 +151,7 @@ impl Renderer {
             atlas,
             text_renderer,
             buffer,
+            sticky_buffer,
             rects,
             default_fg: theme.palette.foreground,
             padding_logical: theme.padding,
@@ -172,6 +178,7 @@ impl Renderer {
             let metrics = self.metrics();
             self.cell = measure_cell(&mut self.font_system, metrics, self.font_family.as_deref());
             self.buffer.set_metrics(&mut self.font_system, metrics);
+            self.sticky_buffer.set_metrics(&mut self.font_system, metrics);
         }
     }
 
@@ -215,32 +222,64 @@ impl Renderer {
 
         self.build_text(snap);
 
+        // Shape the sticky header line (if any) before borrowing buffers below.
+        let sticky_color = snap.sticky.as_ref().map(|s| {
+            if s.failed {
+                snap.block_stripe
+            } else {
+                self.default_fg
+            }
+        });
+        if let (Some(sticky), Some(color)) = (&snap.sticky, sticky_color) {
+            let attrs = cell_attrs(self.font_family.as_deref(), color, true, false);
+            self.sticky_buffer.set_text(
+                &mut self.font_system,
+                &sticky.command,
+                &attrs,
+                Shaping::Advanced,
+                None,
+            );
+            self.sticky_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
+
         self.viewport.update(
             &self.queue,
             Resolution { width: self.config.width, height: self.config.height },
         );
         let pad = self.padding_physical();
-        let text_area = TextArea {
+        let bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
+        let mut areas = vec![TextArea {
             buffer: &self.buffer,
             left: pad.x,
             top: pad.y,
             scale: 1.0,
-            bounds: TextBounds {
-                left: 0,
-                top: 0,
-                right: self.config.width as i32,
-                bottom: self.config.height as i32,
-            },
+            bounds,
             default_color: to_gcolor(self.default_fg),
             custom_glyphs: &[],
-        };
+        }];
+        if let Some(color) = sticky_color {
+            areas.push(TextArea {
+                buffer: &self.sticky_buffer,
+                left: pad.x,
+                top: pad.y,
+                scale: 1.0,
+                bounds,
+                default_color: to_gcolor(color),
+                custom_glyphs: &[],
+            });
+        }
         self.text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            [text_area],
+            areas,
             &mut self.swash_cache,
         )?;
 
@@ -301,18 +340,39 @@ impl Renderer {
     fn build_rects(&self, snap: &GridSnapshot) -> Vec<Rect> {
         let pad = self.padding_physical();
         let (cw, ch) = (self.cell.width, self.cell.height);
+        let width = self.config.width as f32;
         let mut rects = Vec::new();
         let default_bg = snap.background;
 
+        // Cell backgrounds.
         for row in 0..snap.rows {
             for col in 0..snap.cols {
                 if let Some(cell) = snap.cell(col, row) {
-                    let x = pad.x + col as f32 * cw;
-                    let y = pad.y + row as f32 * ch;
                     if cell.bg != default_bg {
+                        let x = pad.x + col as f32 * cw;
+                        let y = pad.y + row as f32 * ch;
                         rects.push(Rect { x, y, w: cw, h: ch, color: cell.bg.to_linear_f32() });
                     }
+                }
+            }
+        }
+
+        // Failed-block background wash (translucent, over the cell backgrounds).
+        let tint = snap.block_tint.to_linear_f32();
+        for (row, decor) in snap.rows_decor.iter().enumerate() {
+            if decor.failed {
+                let y = pad.y + row as f32 * ch;
+                rects.push(Rect { x: 0.0, y, w: width, h: ch, color: tint });
+            }
+        }
+
+        // Selection, painted over the wash.
+        for row in 0..snap.rows {
+            for col in 0..snap.cols {
+                if let Some(cell) = snap.cell(col, row) {
                     if cell.flags.contains(CellFlags::SELECTED) {
+                        let x = pad.x + col as f32 * cw;
+                        let y = pad.y + row as f32 * ch;
                         rects.push(Rect {
                             x,
                             y,
@@ -322,6 +382,32 @@ impl Renderer {
                         });
                     }
                 }
+            }
+        }
+
+        // Exit-code stripe in the left gutter + a rule above each new block.
+        let stripe = snap.block_stripe.to_linear_f32();
+        let sep = snap.block_separator.to_linear_f32();
+        let stripe_x = (2.0 * self.scale).min(pad.x);
+        let stripe_w = (3.0 * self.scale).max(2.0);
+        let sep_h = self.scale.max(1.0);
+        for (row, decor) in snap.rows_decor.iter().enumerate() {
+            let y = pad.y + row as f32 * ch;
+            if decor.failed {
+                rects.push(Rect { x: stripe_x, y, w: stripe_w, h: ch, color: stripe });
+            }
+            if decor.block_top && row > 0 {
+                rects.push(Rect { x: 0.0, y, w: width, h: sep_h, color: sep });
+            }
+        }
+
+        // Sticky command header: an opaque band over row 0 with a bottom rule.
+        if let Some(sticky) = &snap.sticky {
+            let band_h = pad.y + ch;
+            rects.push(Rect { x: 0.0, y: 0.0, w: width, h: band_h, color: default_bg.to_linear_f32() });
+            rects.push(Rect { x: 0.0, y: band_h - sep_h, w: width, h: sep_h, color: sep });
+            if sticky.failed {
+                rects.push(Rect { x: stripe_x, y: 0.0, w: stripe_w, h: band_h, color: stripe });
             }
         }
 
@@ -354,6 +440,8 @@ impl Renderer {
         }
 
         let cursor_block = snap.cursor.filter(|c| c.shape == CursorShape::Block);
+        // The sticky header overdraws row 0, so blank that row's grid glyphs.
+        let blank_top = snap.sticky.is_some();
         let mut text = String::with_capacity((snap.cols as usize + 1) * snap.rows as usize);
         let mut runs: Vec<Run> = Vec::new();
         let fallback = CellSnapshot::blank(self.default_fg, snap.background);
@@ -369,7 +457,11 @@ impl Renderer {
                 }
                 let bold = cell.flags.contains(CellFlags::BOLD);
                 let italic = cell.flags.contains(CellFlags::ITALIC);
-                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                let ch = if (blank_top && row == 0) || cell.c == '\0' {
+                    ' '
+                } else {
+                    cell.c
+                };
                 let start = text.len();
                 text.push(ch);
                 let end = text.len();
