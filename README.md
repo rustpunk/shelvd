@@ -2,11 +2,8 @@
 
 > *shelved* + *shell* — a once-advanced console, powered back up.
 
-A GPU-accelerated, block-aware terminal emulator in **pure Rust**, in the spirit
-of [Warp](https://github.com/warpdotdev/warp). First-class on **Linux, macOS, and
-Windows** — no system webview, no C font stack.
-
-![a shelvd window running a shell](docs/screenshot.png)
+A GPU-accelerated, block-aware terminal emulator in **pure Rust**. First-class on
+**Linux, macOS, and Windows** — no system webview, no C font stack.
 
 ## Status
 
@@ -72,7 +69,7 @@ xvfb-run -a -s "-screen 0 1280x800x24" \
 - **M1** — ✅ scrollback (wheel / Shift+PgUp·PgDn), ✅ mouse selection, ✅ copy/paste
   (copy-on-select, Ctrl+Shift+C/V, middle-click, bracketed-paste aware). ◻ TOML
   theme/config, ◻ configurable cursor styles, ◻ bundled font still to come.
-- **M2** — Warp-signature **command blocks** (OSC-133 prompt marking), block navigation, per-block actions.
+- **M2** — **command blocks** (OSC-133 prompt marking), block navigation, per-block actions.
 - **M3** — command palette, rich input editor, font/ligature configuration.
 
 ## License
