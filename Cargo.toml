@@ -47,6 +47,7 @@ flume = "0.12"
 unicode-width = "0.2"
 arboard = { version = "3", features = ["wayland-data-control"] }
 bitflags = "2"
+nucleo-matcher = "0.3"
 
 [profile.dev]
 opt-level = 1

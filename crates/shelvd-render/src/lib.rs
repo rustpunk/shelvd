@@ -17,8 +17,8 @@ use glyphon::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use shelvd_core::{
-    CellFlags, CellMetrics, CellSnapshot, CursorShape, GridSize, GridSnapshot, Padding, PixelSize,
-    Rgba, Theme,
+    CellFlags, CellMetrics, CellSnapshot, CursorShape, GridSize, GridSnapshot, Overlay, Padding,
+    PixelSize, Rgba, Theme,
 };
 
 use rect::{Rect, RectRenderer};
@@ -55,6 +55,8 @@ pub struct Renderer {
     buffer: Buffer,
     /// One-line buffer for the sticky command header.
     sticky_buffer: Buffer,
+    /// Multi-line buffer for the command-palette / history overlay.
+    overlay_buffer: Buffer,
 
     rects: RectRenderer,
 
@@ -137,6 +139,9 @@ impl Renderer {
         let mut sticky_buffer = Buffer::new(&mut font_system, metrics);
         sticky_buffer.set_size(&mut font_system, None, None);
 
+        let mut overlay_buffer = Buffer::new(&mut font_system, metrics);
+        overlay_buffer.set_size(&mut font_system, None, None);
+
         let rects = RectRenderer::new(&device, format);
         rects.set_resolution(&queue, config.width as f32, config.height as f32);
 
@@ -152,6 +157,7 @@ impl Renderer {
             text_renderer,
             buffer,
             sticky_buffer,
+            overlay_buffer,
             rects,
             default_fg: theme.palette.foreground,
             padding_logical: theme.padding,
@@ -179,6 +185,7 @@ impl Renderer {
             self.cell = measure_cell(&mut self.font_system, metrics, self.font_family.as_deref());
             self.buffer.set_metrics(&mut self.font_system, metrics);
             self.sticky_buffer.set_metrics(&mut self.font_system, metrics);
+            self.overlay_buffer.set_metrics(&mut self.font_system, metrics);
         }
     }
 
@@ -196,8 +203,13 @@ impl Renderer {
         self.cell
     }
 
-    /// Draw one frame from `snap`.
-    pub fn render(&mut self, snap: &GridSnapshot) -> Result<(), RenderError> {
+    /// Draw one frame: the grid from `snap`, plus `overlay` (command palette /
+    /// history search) layered on top when present.
+    pub fn render(
+        &mut self,
+        snap: &GridSnapshot,
+        overlay: Option<&Overlay>,
+    ) -> Result<(), RenderError> {
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
             Cst::Success(t) | Cst::Suboptimal(t) => t,
@@ -217,19 +229,28 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let rects = self.build_rects(snap);
+        let layout = overlay.map(|ov| self.overlay_layout(ov));
+        // The overlay panel overdraws the top rows; blank those grid glyphs (or
+        // just the single sticky-header row when there is no overlay).
+        let blank_rows =
+            layout.map_or(u16::from(snap.sticky.is_some()), |l| l.panel_rows);
+
+        let mut rects = self.build_rects(snap);
+        if let (Some(ov), Some(l)) = (overlay, layout) {
+            self.append_overlay_rects(&mut rects, ov, l);
+        }
         self.rects.upload(&self.device, &self.queue, &rects);
 
-        self.build_text(snap);
+        self.build_text(snap, blank_rows);
 
-        // Shape the sticky header line (if any) before borrowing buffers below.
-        let sticky_color = snap.sticky.as_ref().map(|s| {
-            if s.failed {
-                snap.block_stripe
-            } else {
-                self.default_fg
-            }
-        });
+        // Sticky header — suppressed while an overlay is open.
+        let sticky_color = if overlay.is_none() {
+            snap.sticky
+                .as_ref()
+                .map(|s| if s.failed { snap.block_stripe } else { self.default_fg })
+        } else {
+            None
+        };
         if let (Some(sticky), Some(color)) = (&snap.sticky, sticky_color) {
             let attrs = cell_attrs(self.font_family.as_deref(), color, true, false);
             self.sticky_buffer.set_text(
@@ -240,6 +261,11 @@ impl Renderer {
                 None,
             );
             self.sticky_buffer.shape_until_scroll(&mut self.font_system, false);
+        }
+
+        // Overlay text.
+        if let (Some(ov), Some(l)) = (overlay, layout) {
+            self.set_overlay_text(ov, l);
         }
 
         self.viewport.update(
@@ -270,6 +296,17 @@ impl Renderer {
                 scale: 1.0,
                 bounds,
                 default_color: to_gcolor(color),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some(ov) = overlay {
+            areas.push(TextArea {
+                buffer: &self.overlay_buffer,
+                left: pad.x,
+                top: pad.y,
+                scale: 1.0,
+                bounds,
+                default_color: to_gcolor(ov.colors.fg),
                 custom_glyphs: &[],
             });
         }
@@ -430,7 +467,7 @@ impl Renderer {
         rects
     }
 
-    fn build_text(&mut self, snap: &GridSnapshot) {
+    fn build_text(&mut self, snap: &GridSnapshot, blank_rows: u16) {
         struct Run {
             start: usize,
             end: usize,
@@ -440,8 +477,6 @@ impl Renderer {
         }
 
         let cursor_block = snap.cursor.filter(|c| c.shape == CursorShape::Block);
-        // The sticky header overdraws row 0, so blank that row's grid glyphs.
-        let blank_top = snap.sticky.is_some();
         let mut text = String::with_capacity((snap.cols as usize + 1) * snap.rows as usize);
         let mut runs: Vec<Run> = Vec::new();
         let fallback = CellSnapshot::blank(self.default_fg, snap.background);
@@ -457,7 +492,9 @@ impl Renderer {
                 }
                 let bold = cell.flags.contains(CellFlags::BOLD);
                 let italic = cell.flags.contains(CellFlags::ITALIC);
-                let ch = if (blank_top && row == 0) || cell.c == '\0' {
+                // Rows under the overlay panel / sticky header are blanked so
+                // their grid glyphs don't draw under the panel text.
+                let ch = if row < blank_rows || cell.c == '\0' {
                     ' '
                 } else {
                     cell.c
@@ -499,6 +536,113 @@ impl Renderer {
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
+
+    /// Compute the overlay panel's row count and which slice of items is shown.
+    fn overlay_layout(&self, ov: &Overlay) -> OverlayLayout {
+        let grid_rows = self.grid_size().rows;
+        // One query row plus a capped list; leave a little headroom at the bottom.
+        let max_visible = (grid_rows.saturating_sub(2)).min(12) as usize;
+        let visible = ov.items.len().min(max_visible);
+        // Scroll the window so the selected row stays inside it.
+        let mut first_item = 0;
+        if visible > 0 && ov.selected >= visible {
+            first_item = ov.selected + 1 - visible;
+        }
+        first_item = first_item.min(ov.items.len().saturating_sub(visible));
+        OverlayLayout { panel_rows: 1 + visible as u16, first_item, visible }
+    }
+
+    /// Append the overlay's solid quads: panel, selection highlight, query
+    /// cursor, bottom rule.
+    fn append_overlay_rects(&self, rects: &mut Vec<Rect>, ov: &Overlay, layout: OverlayLayout) {
+        let pad = self.padding_physical();
+        let (cw, ch) = (self.cell.width, self.cell.height);
+        let width = self.config.width as f32;
+        let c = &ov.colors;
+
+        let panel_h = pad.y + layout.panel_rows as f32 * ch;
+        rects.push(Rect { x: 0.0, y: 0.0, w: width, h: panel_h, color: c.panel_bg.to_linear_f32() });
+
+        if layout.visible > 0
+            && ov.selected >= layout.first_item
+            && ov.selected < layout.first_item + layout.visible
+        {
+            let row = 1 + (ov.selected - layout.first_item) as u16;
+            let y = pad.y + row as f32 * ch;
+            rects.push(Rect { x: 0.0, y, w: width, h: ch, color: c.sel_bg.to_linear_f32() });
+        }
+
+        // A thin accent bar where the next typed character will land.
+        let cursor_col = ov.prompt.chars().count() + 1 + ov.query.chars().count();
+        let cx = pad.x + cursor_col as f32 * cw;
+        rects.push(Rect { x: cx, y: pad.y, w: (2.0 * self.scale).max(1.0), h: ch, color: c.accent.to_linear_f32() });
+
+        let rule_h = self.scale.max(1.0);
+        rects.push(Rect { x: 0.0, y: panel_h - rule_h, w: width, h: rule_h, color: c.accent.to_linear_f32() });
+    }
+
+    /// Lay out the overlay's text (query line + the visible item slice) into the
+    /// overlay buffer as colored spans.
+    fn set_overlay_text(&mut self, ov: &Overlay, layout: OverlayLayout) {
+        let c = ov.colors;
+        let mut text = String::new();
+        let mut spans: Vec<(usize, usize, Rgba, bool)> = Vec::new();
+
+        push_span(&mut text, &mut spans, &ov.prompt, c.accent, true);
+        push_span(&mut text, &mut spans, " ", c.fg, false);
+        if ov.query.is_empty() {
+            push_span(&mut text, &mut spans, "type to search…", c.dim, false);
+        } else {
+            push_span(&mut text, &mut spans, &ov.query, c.fg, false);
+        }
+
+        for idx in layout.first_item..layout.first_item + layout.visible {
+            push_span(&mut text, &mut spans, "\n", c.fg, false);
+            let item = &ov.items[idx];
+            let selected = idx == ov.selected;
+            push_span(&mut text, &mut spans, "  ", c.fg, false);
+            push_span(&mut text, &mut spans, &item.label, c.fg, selected);
+            if let Some(detail) = &item.detail {
+                push_span(&mut text, &mut spans, "  ", c.dim, false);
+                push_span(&mut text, &mut spans, detail, c.dim, false);
+            }
+        }
+
+        let family = self.font_family.as_deref();
+        let default_attrs = cell_attrs(family, c.fg, false, false);
+        let spans_iter = spans
+            .iter()
+            .map(|(s, e, col, bold)| (&text[*s..*e], cell_attrs(family, *col, *bold, false)));
+        self.overlay_buffer.set_rich_text(
+            &mut self.font_system,
+            spans_iter,
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+        self.overlay_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+}
+
+/// Geometry of the overlay panel for one frame.
+#[derive(Clone, Copy)]
+struct OverlayLayout {
+    /// Grid rows the panel occupies (1 query row + visible items).
+    panel_rows: u16,
+    /// Index of the first item shown (scroll offset into the list).
+    first_item: usize,
+    /// Number of items shown.
+    visible: usize,
+}
+
+/// Append a styled run to `text`/`spans`, skipping empty segments.
+fn push_span(text: &mut String, spans: &mut Vec<(usize, usize, Rgba, bool)>, s: &str, color: Rgba, bold: bool) {
+    if s.is_empty() {
+        return;
+    }
+    let start = text.len();
+    text.push_str(s);
+    spans.push((start, text.len(), color, bold));
 }
 
 fn metrics_for(font_size_logical: f32, line_height_factor: f32, scale: f32) -> Metrics {

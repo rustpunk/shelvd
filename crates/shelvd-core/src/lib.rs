@@ -8,6 +8,7 @@ pub mod color;
 pub mod config;
 pub mod error;
 pub mod geometry;
+pub mod overlay;
 pub mod palette;
 pub mod snapshot;
 pub mod theme;
@@ -16,6 +17,7 @@ pub use color::Rgba;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use geometry::{CellMetrics, GridSize, Padding, PixelSize};
+pub use overlay::{Overlay, OverlayColors, OverlayItem};
 pub use palette::Palette;
 pub use snapshot::{
     CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, RowDecor, StickyHeader,
