@@ -7,8 +7,9 @@
 //! channel for the event-loop owner to act on.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::Point;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
@@ -152,13 +153,97 @@ impl Terminal {
         self.palette = palette;
     }
 
+    // --- scrollback ----------------------------------------------------------
+
+    /// Scroll the viewport by `delta` lines (positive scrolls up, into history).
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Scroll up one screen.
+    pub fn scroll_page_up(&mut self) {
+        self.term.scroll_display(Scroll::PageUp);
+    }
+
+    /// Scroll down one screen.
+    pub fn scroll_page_down(&mut self) {
+        self.term.scroll_display(Scroll::PageDown);
+    }
+
+    /// Jump to the oldest line in history.
+    pub fn scroll_to_top(&mut self) {
+        self.term.scroll_display(Scroll::Top);
+    }
+
+    /// Jump back to the live edge (display offset 0).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Whether the viewport is scrolled away from the live edge.
+    pub fn is_scrolled(&self) -> bool {
+        self.term.grid().display_offset() != 0
+    }
+
+    // --- terminal modes ------------------------------------------------------
+
+    /// Whether the program enabled bracketed paste (DEC 2004).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Whether the program is reading mouse events.
+    pub fn mouse_mode(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Whether the alternate screen is active (e.g. a full-screen TUI).
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    // --- selection -----------------------------------------------------------
+
+    /// Begin a simple (linear) selection at a viewport cell.
+    pub fn selection_start(&mut self, col: u16, row: u16, right_half: bool) {
+        let point = self.viewport_to_point(col, row);
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, side(right_half)));
+    }
+
+    /// Extend the in-progress selection to a viewport cell.
+    pub fn selection_update(&mut self, col: u16, row: u16, right_half: bool) {
+        let point = self.viewport_to_point(col, row);
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, side(right_half));
+        }
+    }
+
+    /// Clear any active selection.
+    pub fn selection_clear(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The selected text, if the selection is non-empty.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
+    /// Map a viewport cell (accounting for scrollback offset) to a grid point.
+    fn viewport_to_point(&self, col: u16, row: u16) -> Point {
+        let offset = self.term.grid().display_offset() as i32;
+        let max_col = self.dims.cols.saturating_sub(1) as usize;
+        Point::new(Line(row as i32 - offset), Column((col as usize).min(max_col)))
+    }
+
     /// Build a render-ready snapshot of the visible grid.
     pub fn snapshot(&self) -> GridSnapshot {
         let cols = self.dims.cols;
         let rows = self.dims.rows;
         let mut snap =
             GridSnapshot::filled(cols, rows, self.palette.foreground, self.palette.background);
+        snap.selection_color = self.palette.selection;
 
+        let selection = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
 
@@ -173,6 +258,9 @@ impl Terminal {
             }
             let cell = indexed.cell;
             let dst = row * cols as usize + col;
+            let selected = selection
+                .as_ref()
+                .is_some_and(|range| point_in_range(indexed.point, range));
 
             // Trailing/leading spacers of a wide glyph paint background only.
             if cell
@@ -180,12 +268,11 @@ impl Terminal {
                 .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 let (_, bg) = self.cell_colors(cell);
-                snap.cells[dst] = CellSnapshot {
-                    c: ' ',
-                    fg: bg,
-                    bg,
-                    flags: CellFlags::WIDE_SPACER,
-                };
+                let mut flags = CellFlags::WIDE_SPACER;
+                if selected {
+                    flags |= CellFlags::SELECTED;
+                }
+                snap.cells[dst] = CellSnapshot { c: ' ', fg: bg, bg, flags };
                 continue;
             }
 
@@ -205,6 +292,9 @@ impl Terminal {
             }
             if cell.flags.contains(Flags::WIDE_CHAR) {
                 flags |= CellFlags::WIDE;
+            }
+            if selected {
+                flags |= CellFlags::SELECTED;
             }
 
             let c = if cell.c == '\0' { ' ' } else { cell.c };
@@ -274,5 +364,86 @@ impl Terminal {
                 self.palette.indexed(idx as u8)
             }
         }
+    }
+}
+
+/// Which half of a cell a pixel fell on, as an alacritty selection side.
+fn side(right_half: bool) -> Side {
+    if right_half {
+        Side::Right
+    } else {
+        Side::Left
+    }
+}
+
+/// Whether a grid point lies within a selection range (linear or block).
+fn point_in_range(p: Point, range: &SelectionRange) -> bool {
+    if range.is_block {
+        p.line >= range.start.line
+            && p.line <= range.end.line
+            && p.column >= range.start.column
+            && p.column <= range.end.column
+    } else {
+        let after_start = p.line > range.start.line
+            || (p.line == range.start.line && p.column >= range.start.column);
+        let before_end = p.line < range.end.line
+            || (p.line == range.end.line && p.column <= range.end.column);
+        after_start && before_end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shelvd_core::Palette;
+
+    fn terminal(cols: u16, rows: u16) -> Terminal {
+        Terminal::new(cols, rows, 1000, Palette::default(), CursorShape::Block)
+    }
+
+    #[test]
+    fn scrolls_into_history_and_back() {
+        let mut t = terminal(10, 3);
+        for i in 0..20 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(!t.is_scrolled(), "starts at the live edge");
+        t.scroll_lines(5);
+        assert!(t.is_scrolled(), "wheel-up moves into history");
+        t.scroll_to_bottom();
+        assert!(!t.is_scrolled(), "scroll-to-bottom returns to the live edge");
+    }
+
+    #[test]
+    fn selection_yields_text() {
+        let mut t = terminal(20, 3);
+        t.process(b"hello world");
+        t.selection_start(0, 0, false);
+        t.selection_update(4, 0, true); // through the right half of column 4
+        assert_eq!(t.selection_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn snapshot_flags_selected_cells() {
+        let mut t = terminal(20, 3);
+        t.process(b"hello");
+        t.selection_start(0, 0, false);
+        t.selection_update(4, 0, true);
+        let snap = t.snapshot();
+        assert!(snap.cell(0, 0).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(snap.cell(4, 0).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(!snap.cell(6, 0).unwrap().flags.contains(CellFlags::SELECTED));
+        assert_eq!(snap.selection_color, Palette::default().selection);
+    }
+
+    #[test]
+    fn clearing_selection_drops_text() {
+        let mut t = terminal(20, 3);
+        t.process(b"hello");
+        t.selection_start(0, 0, false);
+        t.selection_update(4, 0, true);
+        assert!(t.selection_text().is_some());
+        t.selection_clear();
+        assert!(t.selection_text().is_none());
     }
 }

@@ -45,6 +45,7 @@ toml = "1"
 dirs = "6"
 flume = "0.12"
 unicode-width = "0.2"
+arboard = { version = "3", features = ["wayland-data-control"] }
 bitflags = "2"
 
 [profile.dev]

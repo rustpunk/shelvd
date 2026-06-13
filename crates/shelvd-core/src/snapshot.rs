@@ -18,6 +18,8 @@ bitflags::bitflags! {
         const WIDE       = 1 << 4;
         /// Trailing placeholder cell that follows a [`CellFlags::WIDE`] cell.
         const WIDE_SPACER = 1 << 5;
+        /// Cell covered by the active selection.
+        const SELECTED   = 1 << 6;
     }
 }
 
@@ -71,6 +73,8 @@ pub struct GridSnapshot {
     pub cursor: Option<CursorSnapshot>,
     /// Default background, used to clear the surface.
     pub background: Rgba,
+    /// Background painted over cells flagged [`CellFlags::SELECTED`].
+    pub selection_color: Rgba,
 }
 
 impl GridSnapshot {
@@ -83,6 +87,7 @@ impl GridSnapshot {
             cells: vec![blank; cols as usize * rows as usize],
             cursor: None,
             background: bg,
+            selection_color: bg,
         }
     }
 
