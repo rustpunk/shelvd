@@ -47,6 +47,13 @@ no FreeType/HarfBuzz) · `alacritty_terminal` 0.26 (→ `vte` 0.15) · `portable
   glyphon. `to_linear_f32`/`to_linear_f64` exist for this.
 - Renderer is event-driven: `ControlFlow::Wait` + `request_redraw()` on PTY output,
   input, and resize. No busy 60fps loop.
+- Live prompt is **bottom-anchored** (Warp-style): `shelvd-term::display_shift`
+  reserves blank rows atop the snapshot so the prompt rests on the last row until
+  output fills the grid (so a fresh shell and `clear` both sit at the bottom). The
+  shift is a display-coordinate transform computed in `shelvd-term` (the renderer
+  stays a dumb painter) and is suppressed on the alternate screen and in scrolled
+  history. Mouse→grid mapping (`viewport_to_point`) subtracts the same shift —
+  keep the two in lockstep.
 - Prefer fixing clippy findings over `#[allow]` (rustpunk rigor policy).
 
 ## Build / Test / Lint (the gauntlet)
