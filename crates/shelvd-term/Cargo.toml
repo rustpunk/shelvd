@@ -1,0 +1,16 @@
+[package]
+name = "shelvd-term"
+description = "Terminal emulation state for shelvd: VT/ANSI parsing and grid model (alacritty_terminal)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+shelvd-core.workspace = true
+alacritty_terminal.workspace = true
+thiserror.workspace = true
+log.workspace = true
+flume.workspace = true

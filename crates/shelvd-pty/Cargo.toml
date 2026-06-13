@@ -1,0 +1,16 @@
+[package]
+name = "shelvd-pty"
+description = "Pseudo-terminal lifecycle for shelvd: spawn shell, read/write, resize (portable-pty)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+log.workspace = true
+flume.workspace = true

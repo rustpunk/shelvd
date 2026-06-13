@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/shelvd-core",
+    "crates/shelvd-pty",
+    "crates/shelvd-term",
+    "crates/shelvd-render",
+    "crates/shelvd-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["shelvd Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rustpunk/shelvd"
+
+[workspace.dependencies]
+# Internal crates
+shelvd-core = { path = "crates/shelvd-core" }
+shelvd-pty = { path = "crates/shelvd-pty" }
+shelvd-term = { path = "crates/shelvd-term" }
+shelvd-render = { path = "crates/shelvd-render" }
+
+# Terminal stack
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+
+# GPU / windowing (mutually compatible: glyphon 0.11 -> wgpu ^29; winit 0.30; raw-window-handle 0.6)
+wgpu = "29"
+glyphon = "0.11"
+winit = "0.30"
+raw-window-handle = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+# Shared infra
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dirs = "6"
+flume = "0.12"
+unicode-width = "0.2"
+bitflags = "2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

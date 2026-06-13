@@ -1,0 +1,17 @@
+[package]
+name = "shelvd-core"
+description = "Shared types for shelvd: color, theme, config, geometry, errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+log.workspace = true
+bitflags.workspace = true
