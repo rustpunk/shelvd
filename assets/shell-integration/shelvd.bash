@@ -65,6 +65,13 @@ PROMPT_COMMAND=__shelvd_prompt
 
 # B marks the end of the prompt (start of command input). Embed it at the end of
 # PS1, wrapped in \[ \] so bash keeps the prompt's display width correct.
-__shelvd_b="$(printf '\033]133;B\033\\')"
+#
+# Terminate this one with BEL, not ST. The other markers use ST (ESC \), but
+# this marker is the only one that lives inside PS1: bash's prompt decoder runs
+# backslash processing over PS1, and ST's trailing backslash would pair with the
+# leading backslash of the \] non-print marker as \\ (one literal backslash),
+# destroying the \] and leaking a stray ']' onto the prompt. BEL ends the OSC
+# with no trailing backslash, so \[ \] stay intact.
+__shelvd_b="$(printf '\033]133;B\007')"
 PS1="${PS1}\[${__shelvd_b}\]"
 unset __shelvd_b
