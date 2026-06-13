@@ -49,6 +49,11 @@ const FILL_ANIM_TICK: Duration = Duration::from_millis(16);
 /// scrolls (Δ == 1) stay instant so ordinary typing feels snappy.
 const FILL_ANIM_MIN_ROWS: u16 = 2;
 
+/// After a resize / scale change, suppress the fill glide for this long. The shell
+/// answers the resize's SIGWINCH by redrawing its prompt; that echo must not be
+/// mistaken for output filling the screen and kick off a spurious downward glide.
+const GLIDE_RESIZE_COOLDOWN: Duration = Duration::from_millis(150);
+
 /// Eased remaining grid offset for the fill transition: starts at `from_px`
 /// (t = 0, content held where it was) and eases out to 0 (t >= 1, content
 /// settled at the anchored position). Cubic ease-out keeps it snappy.
@@ -123,6 +128,10 @@ struct State {
     /// Anchor shift (top-reserved blank rows) observed after the last PTY chunk,
     /// used to detect the burst-shrink that triggers a glide.
     prev_anchor_shift: u16,
+    /// When the window geometry (size / scale) last changed. The fill glide is
+    /// held off for [`GLIDE_RESIZE_COOLDOWN`] afterward so the shell's SIGWINCH
+    /// prompt-redraw can't be mistaken for output and trigger a spurious glide.
+    last_geometry_change: Instant,
 }
 
 impl App {
@@ -220,6 +229,7 @@ impl ApplicationHandler<UserEvent> for App {
             anim_from_px: 0.0,
             anim_started: Instant::now(),
             prev_anchor_shift: terminal_anchor,
+            last_geometry_change: Instant::now(),
         });
     }
 
@@ -273,15 +283,20 @@ impl ApplicationHandler<UserEvent> for App {
         if dirty {
             // Fill transition: if a burst of output shrank the bottom-anchor
             // reserve by several rows at once, glide the grid up instead of
-            // letting it jump. Only at the live edge of the main screen.
+            // letting it jump. Only at the live edge of the main screen, and not
+            // within the cooldown right after a resize (there the shrink would be
+            // the shell's SIGWINCH prompt-redraw, not genuine output filling in).
             let shift = state.terminal.anchor_shift();
-            if shift < state.prev_anchor_shift
+            let now = Instant::now();
+            let cooled =
+                now.duration_since(state.last_geometry_change) >= GLIDE_RESIZE_COOLDOWN;
+            if cooled
+                && shift < state.prev_anchor_shift
                 && !state.terminal.alt_screen()
                 && !state.terminal.is_scrolled()
             {
                 let delta = state.prev_anchor_shift - shift;
                 if delta >= FILL_ANIM_MIN_ROWS {
-                    let now = Instant::now();
                     let cell_h = state.renderer.cell_metrics().height;
                     // Accumulate onto any offset still in flight so back-to-back
                     // bursts compound smoothly rather than snapping.
@@ -321,6 +336,16 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::Resized(size) => {
                 let scale = state.window.scale_factor() as f32;
+                // Wayland delivers a redundant same-size configure when the window
+                // is *moved* (drag-and-drop). Re-running the resize would fire a
+                // needless pty SIGWINCH whose prompt-redraw echo can spuriously
+                // start the fill glide — the grid slides down ("the bottom grows")
+                // then eases back. Ignore configures that change nothing.
+                if (size.width, size.height) == state.renderer.surface_size()
+                    && (scale - state.renderer.scale()).abs() <= f32::EPSILON
+                {
+                    return;
+                }
                 state.renderer.resize(size.width, size.height, scale);
                 let grid = state.renderer.grid_size();
                 state.terminal.resize(grid.cols, grid.rows);
@@ -646,6 +671,7 @@ fn cancel_fill_anim(state: &mut State) {
     state.anim_offset_px = 0.0;
     state.anim_from_px = 0.0;
     state.prev_anchor_shift = state.terminal.anchor_shift();
+    state.last_geometry_change = Instant::now();
 }
 
 /// Translate a key press into the byte sequence a terminal expects.
