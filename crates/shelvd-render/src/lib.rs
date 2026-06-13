@@ -274,6 +274,19 @@ impl Renderer {
         Ok(())
     }
 
+    /// Map a physical pixel position to a grid cell plus which half was hit
+    /// (`true` = right half), clamped to the grid.
+    pub fn pixel_to_cell(&self, x: f32, y: f32) -> (u16, u16, bool) {
+        let pad = self.padding_physical();
+        let cw = self.cell.width.max(1.0);
+        let ch = self.cell.height.max(1.0);
+        let grid = self.grid_size();
+        let col = (((x - pad.x) / cw).floor()).clamp(0.0, (grid.cols - 1) as f32) as u16;
+        let row = (((y - pad.y) / ch).floor()).clamp(0.0, (grid.rows - 1) as f32) as u16;
+        let right_half = (x - (pad.x + col as f32 * cw)) > cw * 0.5;
+        (col, row, right_half)
+    }
+
     fn metrics(&self) -> Metrics {
         metrics_for(self.font_size_logical, self.line_height_factor, self.scale)
     }
@@ -294,13 +307,18 @@ impl Renderer {
         for row in 0..snap.rows {
             for col in 0..snap.cols {
                 if let Some(cell) = snap.cell(col, row) {
+                    let x = pad.x + col as f32 * cw;
+                    let y = pad.y + row as f32 * ch;
                     if cell.bg != default_bg {
+                        rects.push(Rect { x, y, w: cw, h: ch, color: cell.bg.to_linear_f32() });
+                    }
+                    if cell.flags.contains(CellFlags::SELECTED) {
                         rects.push(Rect {
-                            x: pad.x + col as f32 * cw,
-                            y: pad.y + row as f32 * ch,
+                            x,
+                            y,
                             w: cw,
                             h: ch,
-                            color: cell.bg.to_linear_f32(),
+                            color: snap.selection_color.to_linear_f32(),
                         });
                     }
                 }

@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use arboard::Clipboard;
 use shelvd_core::Config;
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
@@ -15,7 +16,7 @@ use shelvd_term::{TermEvent, Terminal};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -51,6 +52,12 @@ struct State {
     terminal: Terminal,
     pty: Pty,
     modifiers: ModifiersState,
+    /// System clipboard handle (`None` if it failed to initialize).
+    clipboard: Option<Clipboard>,
+    /// Last known pointer position in physical pixels.
+    mouse_pos: (f32, f32),
+    /// Whether the left button is down and a selection is being dragged.
+    selecting: bool,
 }
 
 impl App {
@@ -133,6 +140,9 @@ impl ApplicationHandler<UserEvent> for App {
             terminal,
             pty,
             modifiers: ModifiersState::empty(),
+            clipboard: Clipboard::new().ok(),
+            mouse_pos: (0.0, 0.0),
+            selecting: false,
         });
     }
 
@@ -225,12 +235,98 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let Some(bytes) = key_to_bytes(&event, state.modifiers) {
-                        if let Err(e) = state.pty.write(&bytes) {
-                            log::debug!("pty write failed: {e}");
+            WindowEvent::CursorMoved { position, .. } => {
+                state.mouse_pos = (position.x as f32, position.y as f32);
+                if state.selecting {
+                    let (col, row, right) =
+                        state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
+                    state.terminal.selection_update(col, row, right);
+                    state.window.request_redraw();
+                }
+            }
+
+            WindowEvent::MouseInput { state: elem_state, button, .. } => {
+                match (button, elem_state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        let (col, row, right) =
+                            state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
+                        state.terminal.selection_start(col, row, right);
+                        state.selecting = true;
+                        state.window.request_redraw();
+                    }
+                    (MouseButton::Left, ElementState::Released) => {
+                        state.selecting = false;
+                        copy_selection(state); // copy-on-select
+                    }
+                    (MouseButton::Middle, ElementState::Pressed) => paste_clipboard(state),
+                    _ => {}
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let ch = state.renderer.cell_metrics().height.max(1.0);
+                        (p.y as f32 / ch).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    if state.terminal.alt_screen() && !state.terminal.mouse_mode() {
+                        // No scrollback on the alt screen: drive the app with arrows.
+                        let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                        for _ in 0..lines.unsigned_abs() {
+                            let _ = state.pty.write(seq);
                         }
+                    } else {
+                        state.terminal.scroll_lines(lines);
+                        state.window.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                let mods = state.modifiers;
+                // Ctrl+Shift+C / Ctrl+Shift+V: clipboard. (Ctrl+C alone still sends SIGINT.)
+                if mods.control_key() && mods.shift_key() {
+                    if let Key::Character(s) = &event.logical_key {
+                        if s.eq_ignore_ascii_case("c") {
+                            copy_selection(state);
+                            return;
+                        }
+                        if s.eq_ignore_ascii_case("v") {
+                            paste_clipboard(state);
+                            return;
+                        }
+                    }
+                }
+                // Shift+PageUp / Shift+PageDown: scroll the viewport through history.
+                if mods.shift_key() {
+                    if let Key::Named(named) = &event.logical_key {
+                        match named {
+                            NamedKey::PageUp => {
+                                state.terminal.scroll_page_up();
+                                state.window.request_redraw();
+                                return;
+                            }
+                            NamedKey::PageDown => {
+                                state.terminal.scroll_page_down();
+                                state.window.request_redraw();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Normal input: jump back to the live edge, then send the bytes.
+                if let Some(bytes) = key_to_bytes(&event, mods) {
+                    state.terminal.scroll_to_bottom();
+                    state.window.request_redraw();
+                    if let Err(e) = state.pty.write(&bytes) {
+                        log::debug!("pty write failed: {e}");
                     }
                 }
             }
@@ -315,5 +411,45 @@ fn control_byte(c: char) -> Option<u8> {
         '^' => Some(0x1e),
         '_' | '?' => Some(0x1f),
         _ => None,
+    }
+}
+
+/// Copy the current selection to the system clipboard, if it is non-empty.
+fn copy_selection(state: &mut State) {
+    let Some(text) = state.terminal.selection_text() else {
+        return;
+    };
+    if let Some(clipboard) = state.clipboard.as_mut() {
+        if let Err(e) = clipboard.set_text(text) {
+            log::debug!("clipboard copy failed: {e}");
+        }
+    }
+}
+
+/// Paste clipboard text into the PTY.
+fn paste_clipboard(state: &mut State) {
+    let text = state
+        .clipboard
+        .as_mut()
+        .and_then(|clipboard| clipboard.get_text().ok());
+    if let Some(text) = text {
+        paste_to_pty(state, &text);
+    }
+}
+
+/// Write pasted text to the PTY, wrapping it in bracketed-paste markers when the
+/// program has enabled that mode.
+fn paste_to_pty(state: &mut State, text: &str) {
+    let payload = if state.terminal.bracketed_paste() {
+        let mut buf = Vec::with_capacity(text.len() + 12);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~");
+        buf
+    } else {
+        text.as_bytes().to_vec()
+    };
+    if let Err(e) = state.pty.write(&payload) {
+        log::debug!("paste write failed: {e}");
     }
 }

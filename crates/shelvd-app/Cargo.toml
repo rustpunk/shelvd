@@ -18,6 +18,7 @@ shelvd-pty.workspace = true
 shelvd-term.workspace = true
 shelvd-render.workspace = true
 winit.workspace = true
+arboard.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true

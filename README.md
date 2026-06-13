@@ -69,7 +69,9 @@ xvfb-run -a -s "-screen 0 1280x800x24" \
 
 ## Roadmap
 
-- **M1** — scrollback + mouse selection + copy/paste; TOML theme/config; cursor styles; bundled font.
+- **M1** — ✅ scrollback (wheel / Shift+PgUp·PgDn), ✅ mouse selection, ✅ copy/paste
+  (copy-on-select, Ctrl+Shift+C/V, middle-click, bracketed-paste aware). ◻ TOML
+  theme/config, ◻ configurable cursor styles, ◻ bundled font still to come.
 - **M2** — Warp-signature **command blocks** (OSC-133 prompt marking), block navigation, per-block actions.
 - **M3** — command palette, rich input editor, font/ligature configuration.
 
