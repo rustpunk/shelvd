@@ -62,6 +62,12 @@ struct State {
     mouse_pos: (f32, f32),
     /// Whether the left button is down and a selection is being dragged.
     selecting: bool,
+    /// Base button code (0/1/2) held while the program is reading mouse events,
+    /// used to report drag motion and to anchor the matching release report.
+    mouse_held: Option<u8>,
+    /// Last grid cell a motion report was emitted for, so per-pixel motion
+    /// collapses to one report per cell crossed.
+    last_report_cell: (u16, u16),
     /// Whether the window currently has focus (the cursor only blinks focused).
     focused: bool,
     /// Current blink phase — `true` shows the cursor, `false` hides it.
@@ -153,6 +159,8 @@ impl ApplicationHandler<UserEvent> for App {
             clipboard: Clipboard::new().ok(),
             mouse_pos: (0.0, 0.0),
             selecting: false,
+            mouse_held: None,
+            last_report_cell: (u16::MAX, u16::MAX),
             focused: true,
             blink_on: true,
             last_blink: Instant::now(),
@@ -256,6 +264,22 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x as f32, position.y as f32);
+                // Forward motion to the child when it is reading the mouse (and
+                // Shift, the local-selection override, is not held).
+                if state.terminal.mouse_mode() && !state.modifiers.shift_key() {
+                    let held = state.mouse_held;
+                    let report = state.terminal.mouse_report_all_motion()
+                        || (held.is_some() && state.terminal.mouse_report_drag());
+                    if report {
+                        let (col, row, _) =
+                            state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
+                        if (col, row) != state.last_report_cell {
+                            state.last_report_cell = (col, row);
+                            report_mouse(state, MouseAction::Motion(held.unwrap_or(3)), col, row);
+                        }
+                    }
+                    return;
+                }
                 if state.selecting {
                     let (col, row, right) =
                         state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
@@ -265,6 +289,26 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: elem_state, button, .. } => {
+                // Forward clicks to the child when it is reading the mouse; Shift
+                // forces local selection/paste instead (the standard override).
+                if state.terminal.mouse_mode() && !state.modifiers.shift_key() {
+                    if let Some(base) = mouse_button_code(button) {
+                        let (col, row, _) =
+                            state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
+                        let action = match elem_state {
+                            ElementState::Pressed => {
+                                state.mouse_held = Some(base);
+                                MouseAction::Press(base)
+                            }
+                            ElementState::Released => {
+                                state.mouse_held = None;
+                                MouseAction::Release(base)
+                            }
+                        };
+                        report_mouse(state, action, col, row);
+                    }
+                    return;
+                }
                 match (button, elem_state) {
                     (MouseButton::Left, ElementState::Pressed) => {
                         let (col, row, right) =
@@ -283,6 +327,26 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // While the child reads the mouse, report wheel notches to it
+                // (one report per notch). Shift falls through to local scrolling.
+                if state.terminal.mouse_mode() && !state.modifiers.shift_key() {
+                    let notches = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                        MouseScrollDelta::PixelDelta(p) => {
+                            let ch = state.renderer.cell_metrics().height.max(1.0);
+                            (p.y as f32 / ch).round() as i32
+                        }
+                    };
+                    if notches != 0 {
+                        let (col, row, _) =
+                            state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
+                        let up = notches > 0;
+                        for _ in 0..notches.unsigned_abs() {
+                            report_mouse(state, MouseAction::Wheel(up), col, row);
+                        }
+                    }
+                    return;
+                }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
                     MouseScrollDelta::PixelDelta(p) => {
@@ -472,6 +536,68 @@ fn control_byte(c: char) -> Option<u8> {
     }
 }
 
+/// A pointer action to report to a program that is reading the mouse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseAction {
+    /// Button pressed; carries the base button code (0 left, 1 middle, 2 right).
+    Press(u8),
+    /// Button released; carries the base button code.
+    Release(u8),
+    /// Pointer moved; carries the held button code, or 3 when no button is down.
+    Motion(u8),
+    /// Wheel turned; `true` is a scroll-up notch.
+    Wheel(bool),
+}
+
+/// Map a winit mouse button to its base report code, or `None` for buttons the
+/// X11 mouse protocol cannot encode.
+fn mouse_button_code(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        _ => None,
+    }
+}
+
+/// Encode a mouse action as the escape sequence a program expects: SGR
+/// (DEC 1006) when `sgr` is set, otherwise the legacy X10 byte encoding.
+/// `col`/`row` are 0-based grid cells; the wire protocol is 1-based.
+fn mouse_report(sgr: bool, action: MouseAction, col: u16, row: u16, mods: ModifiersState) -> Vec<u8> {
+    let mod_bits = (if mods.shift_key() { 4 } else { 0 })
+        + (if mods.alt_key() { 8 } else { 0 })
+        + (if mods.control_key() { 16 } else { 0 });
+    let (base, motion, released) = match action {
+        MouseAction::Press(b) => (b as u32, false, false),
+        MouseAction::Release(b) => (b as u32, false, true),
+        MouseAction::Motion(b) => (b as u32, true, false),
+        MouseAction::Wheel(up) => (if up { 64 } else { 65 }, false, false),
+    };
+    let col1 = col as u32 + 1;
+    let row1 = row as u32 + 1;
+
+    if sgr {
+        let cb = base + mod_bits + if motion { 32 } else { 0 };
+        let last = if released { 'm' } else { 'M' };
+        format!("\x1b[<{cb};{col1};{row1}{last}").into_bytes()
+    } else {
+        // Legacy encoding cannot say which button was released, so it reports 3.
+        let base = if released { 3 } else { base };
+        let cb = base + mod_bits + if motion { 32 } else { 0 };
+        // Each field is offset by 32; values past 223 are unencodable, so clamp.
+        let enc = |v: u32| (v + 32).min(255) as u8;
+        vec![0x1b, b'[', b'M', enc(cb), enc(col1), enc(row1)]
+    }
+}
+
+/// Encode `action` for the active mouse mode and write it to the child.
+fn report_mouse(state: &mut State, action: MouseAction, col: u16, row: u16) {
+    let bytes = mouse_report(state.terminal.sgr_mouse(), action, col, row, state.modifiers);
+    if let Err(e) = state.pty.write(&bytes) {
+        log::debug!("mouse report write failed: {e}");
+    }
+}
+
 /// Copy the current selection to the system clipboard, if it is non-empty.
 fn copy_selection(state: &mut State) {
     let Some(text) = state.terminal.selection_text() else {
@@ -509,5 +635,47 @@ fn paste_to_pty(state: &mut State, text: &str) {
     };
     if let Err(e) = state.pty.write(&payload) {
         log::debug!("paste write failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mouse_report, MouseAction};
+    use winit::keyboard::ModifiersState;
+
+    fn none() -> ModifiersState {
+        ModifiersState::empty()
+    }
+
+    #[test]
+    fn sgr_press_and_release_keep_the_button() {
+        assert_eq!(mouse_report(true, MouseAction::Press(0), 0, 0, none()), b"\x1b[<0;1;1M".to_vec());
+        // Release uses a lowercase final byte but reports the same button.
+        assert_eq!(mouse_report(true, MouseAction::Release(0), 0, 0, none()), b"\x1b[<0;1;1m".to_vec());
+    }
+
+    #[test]
+    fn sgr_wheel_and_motion_set_their_bits() {
+        // Wheel-up is button 64; coordinates are 1-based.
+        assert_eq!(mouse_report(true, MouseAction::Wheel(true), 5, 2, none()), b"\x1b[<64;6;3M".to_vec());
+        // Motion adds the 32 motion bit to the held button (0 -> 32).
+        assert_eq!(mouse_report(true, MouseAction::Motion(0), 3, 1, none()), b"\x1b[<32;4;2M".to_vec());
+    }
+
+    #[test]
+    fn legacy_offsets_every_field_by_32() {
+        // Press left at the origin: button 0 -> 32 (space), col/row 1 -> 33 ('!').
+        assert_eq!(mouse_report(false, MouseAction::Press(0), 0, 0, none()), vec![0x1b, b'[', b'M', 32, 33, 33]);
+        // Legacy release cannot name the button, so it reports 3 (32 + 3 = 35).
+        assert_eq!(mouse_report(false, MouseAction::Release(0), 0, 0, none()), vec![0x1b, b'[', b'M', 35, 33, 33]);
+    }
+
+    #[test]
+    fn ctrl_modifier_sets_the_control_bit() {
+        // Ctrl adds 16, so a left press becomes button 16 in SGR.
+        assert_eq!(
+            mouse_report(true, MouseAction::Press(0), 0, 0, ModifiersState::CONTROL),
+            b"\x1b[<16;1;1M".to_vec()
+        );
     }
 }
