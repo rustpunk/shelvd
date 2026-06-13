@@ -57,11 +57,6 @@ const GLIDE_RESIZE_COOLDOWN: Duration = Duration::from_millis(150);
 /// Two titlebar presses within this window count as a double-click (maximize).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
-/// How long after the last resize event to wait before reflowing the grid and
-/// notifying the pty. Long enough to coalesce a fast drag, short enough to feel
-/// immediate on release.
-const RESIZE_SETTLE: Duration = Duration::from_millis(90);
-
 /// Eased remaining grid offset for the fill transition: starts at `from_px`
 /// (t = 0, content held where it was) and eases out to 0 (t >= 1, content
 /// settled at the anchored position). Cubic ease-out keeps it snappy.
@@ -144,11 +139,6 @@ struct State {
     last_titlebar_press: Option<Instant>,
     /// Which window button the pointer is hovering (for the highlight).
     hovered_button: Option<TitlebarHit>,
-    /// Latest physical size from an in-progress interactive resize. The surface
-    /// is resized immediately; the grid reflow + pty SIGWINCH are deferred until
-    /// [`RESIZE_SETTLE`] after the last event so a fast drag doesn't stutter.
-    pending_resize: Option<(u32, u32)>,
-    resize_settle_at: Option<Instant>,
 }
 
 impl App {
@@ -256,8 +246,6 @@ impl ApplicationHandler<UserEvent> for App {
             last_geometry_change: Instant::now(),
             last_titlebar_press: None,
             hovered_button: None,
-            pending_resize: None,
-            resize_settle_at: None,
         });
     }
 
@@ -376,14 +364,17 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     return;
                 }
-                // Reconfigure the surface every event so the window tracks the
-                // drag smoothly, but defer the expensive grid reflow + pty
-                // SIGWINCH until the drag settles — doing them per pixel makes a
-                // fast resize micro-stutter (reflow churn plus the shell redrawing
-                // its prompt on every SIGWINCH).
                 state.renderer.resize(size.width, size.height, scale);
-                state.pending_resize = Some((size.width, size.height));
-                state.resize_settle_at = Some(Instant::now() + RESIZE_SETTLE);
+                let grid = state.renderer.grid_size();
+                state.terminal.resize(grid.cols, grid.rows);
+                let _ = state.pty.resize(PtySize {
+                    rows: grid.rows,
+                    cols: grid.cols,
+                    pixel_width: size.width as u16,
+                    pixel_height: size.height as u16,
+                });
+                // A resize re-lays-out the grid; cancel any glide and re-baseline
+                // the anchor so the new layout never triggers a spurious one.
                 cancel_fill_anim(state);
                 state.window.request_redraw();
             }
@@ -682,17 +673,6 @@ impl ApplicationHandler<UserEvent> for App {
         // — it only ticks while something is actively animating.
         let mut wake: Option<Instant> = None;
 
-        // --- deferred resize settle --------------------------------------------
-        // The surface already tracked the drag; once it pauses, reflow the grid
-        // and notify the pty exactly once.
-        if let Some(at) = state.resize_settle_at {
-            if now >= at {
-                apply_pending_resize(state);
-            } else {
-                wake = Some(at);
-            }
-        }
-
         // --- fill transition ---------------------------------------------------
         if state.anim_offset_px != 0.0 {
             let t = elapsed_t(state.anim_started, now);
@@ -733,25 +713,6 @@ fn cancel_fill_anim(state: &mut State) {
     state.anim_from_px = 0.0;
     state.prev_anchor_shift = state.terminal.anchor_shift();
     state.last_geometry_change = Instant::now();
-}
-
-/// Apply a resize deferred during an interactive drag: reflow the grid to the
-/// settled size and tell the pty, now that the dragging has paused.
-fn apply_pending_resize(state: &mut State) {
-    state.resize_settle_at = None;
-    let Some((w, h)) = state.pending_resize.take() else {
-        return;
-    };
-    let grid = state.renderer.grid_size();
-    state.terminal.resize(grid.cols, grid.rows);
-    let _ = state.pty.resize(PtySize {
-        rows: grid.rows,
-        cols: grid.cols,
-        pixel_width: w as u16,
-        pixel_height: h as u16,
-    });
-    cancel_fill_anim(state);
-    state.window.request_redraw();
 }
 
 /// A left press on the titlebar: a quick second press toggles maximize,
