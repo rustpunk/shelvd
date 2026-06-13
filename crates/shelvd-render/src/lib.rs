@@ -18,10 +18,16 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use shelvd_core::{
     CellFlags, CellMetrics, CellSnapshot, CursorShape, GridSize, GridSnapshot, Overlay, Padding,
-    PixelSize, Rgba, RowDecor, Theme,
+    PixelSize, ResizeEdge, Rgba, RowDecor, Theme, TitlebarHit,
 };
 
 use rect::{Rect, RectRenderer};
+
+/// Height of shelvd's custom titlebar strip, in logical pixels.
+const TITLEBAR_LOGICAL_H: f32 = 30.0;
+
+/// Hit margin around the window edges for interactive resize, in logical pixels.
+const RESIZE_MARGIN_LOGICAL: f32 = 8.0;
 
 /// Errors from creating or driving the renderer.
 #[derive(Debug, thiserror::Error)]
@@ -57,10 +63,22 @@ pub struct Renderer {
     sticky_buffer: Buffer,
     /// Multi-line buffer for the command-palette / history overlay.
     overlay_buffer: Buffer,
+    /// One-line buffer for the custom titlebar's window title.
+    titlebar_buffer: Buffer,
+    /// One-glyph buffer for the close button's `×`.
+    close_buffer: Buffer,
 
     rects: RectRenderer,
 
     default_fg: Rgba,
+    /// Titlebar background and (slightly dimmed) title-text colors.
+    titlebar_bg: Rgba,
+    titlebar_fg: Rgba,
+    /// Which window button is hovered (highlighted), if any.
+    hovered_button: Option<TitlebarHit>,
+    /// Hover-highlight colors for ordinary buttons and the close button.
+    titlebar_btn_hover: Rgba,
+    titlebar_close_hover: Rgba,
     padding_logical: Padding,
     font_size_logical: f32,
     line_height_factor: f32,
@@ -142,6 +160,33 @@ impl Renderer {
         let mut overlay_buffer = Buffer::new(&mut font_system, metrics);
         overlay_buffer.set_size(&mut font_system, None, None);
 
+        let mut titlebar_buffer = Buffer::new(&mut font_system, metrics);
+        titlebar_buffer.set_size(&mut font_system, None, None);
+        titlebar_buffer.set_text(
+            &mut font_system,
+            "shelvd",
+            &base_attrs(font_family.as_deref()),
+            Shaping::Advanced,
+            None,
+        );
+        titlebar_buffer.shape_until_scroll(&mut font_system, false);
+
+        let mut close_buffer = Buffer::new(&mut font_system, metrics);
+        close_buffer.set_size(&mut font_system, None, None);
+        close_buffer.set_text(
+            &mut font_system,
+            "×",
+            &base_attrs(font_family.as_deref()),
+            Shaping::Advanced,
+            None,
+        );
+        close_buffer.shape_until_scroll(&mut font_system, false);
+
+        let titlebar_bg = lift(theme.palette.foreground, theme.palette.background, 16);
+        let titlebar_fg = lift(theme.palette.foreground, theme.palette.background, 205);
+        let titlebar_btn_hover = lift(theme.palette.foreground, theme.palette.background, 36);
+        let titlebar_close_hover = theme.palette.indexed(1);
+
         let rects = RectRenderer::new(&device, format);
         rects.set_resolution(&queue, config.width as f32, config.height as f32);
 
@@ -158,8 +203,15 @@ impl Renderer {
             buffer,
             sticky_buffer,
             overlay_buffer,
+            titlebar_buffer,
+            close_buffer,
             rects,
             default_fg: theme.palette.foreground,
+            titlebar_bg,
+            titlebar_fg,
+            hovered_button: None,
+            titlebar_btn_hover,
+            titlebar_close_hover,
             padding_logical: theme.padding,
             font_size_logical,
             line_height_factor,
@@ -186,13 +238,18 @@ impl Renderer {
             self.buffer.set_metrics(&mut self.font_system, metrics);
             self.sticky_buffer.set_metrics(&mut self.font_system, metrics);
             self.overlay_buffer.set_metrics(&mut self.font_system, metrics);
+            self.titlebar_buffer.set_metrics(&mut self.font_system, metrics);
+            self.close_buffer.set_metrics(&mut self.font_system, metrics);
         }
     }
 
     /// The grid size (in cells) that fits the current surface.
     pub fn grid_size(&self) -> GridSize {
+        // The titlebar eats into the usable height; the grid fills what is left
+        // below it, minus the usual symmetric padding.
+        let usable_h = (self.config.height as f32 - self.titlebar_height()).max(0.0) as u32;
         GridSize::from_pixels(
-            PixelSize::new(self.config.width, self.config.height),
+            PixelSize::new(self.config.width, usable_h),
             self.cell,
             self.padding_physical(),
         )
@@ -211,6 +268,91 @@ impl Renderer {
     /// The DPI scale factor the renderer is currently configured for.
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Physical height of the custom titlebar strip.
+    pub fn titlebar_height(&self) -> f32 {
+        TITLEBAR_LOGICAL_H * self.scale
+    }
+
+    /// Vertical origin (physical px) of the grid's top row: below the titlebar
+    /// strip and the top padding.
+    fn grid_origin_y(&self) -> f32 {
+        self.titlebar_height() + self.padding_physical().y
+    }
+
+    /// What the pointer is over within the titlebar: a window button, the
+    /// draggable region, or `None` below the titlebar strip. Buttons are square,
+    /// right-aligned: minimize, maximize, close (close at the far right).
+    pub fn titlebar_hit(&self, x: f32, y: f32) -> Option<TitlebarHit> {
+        if y >= self.titlebar_height() {
+            return None;
+        }
+        let bw = self.titlebar_height();
+        let w = self.config.width as f32;
+        Some(if x >= w - bw {
+            TitlebarHit::Close
+        } else if x >= w - 2.0 * bw {
+            TitlebarHit::Maximize
+        } else if x >= w - 3.0 * bw {
+            TitlebarHit::Minimize
+        } else {
+            TitlebarHit::Drag
+        })
+    }
+
+    /// Set which window button is highlighted (hover feedback).
+    pub fn set_hovered_button(&mut self, hit: Option<TitlebarHit>) {
+        self.hovered_button = hit;
+    }
+
+    /// Window buttons at the right of the titlebar: a hover highlight plus a
+    /// geometric icon (the close `×` glyph is drawn as text in `render`).
+    fn push_titlebar_buttons(&self, rects: &mut Vec<Rect>, width: f32, tb: f32) {
+        let bw = tb; // square buttons
+        let min_x = width - 3.0 * bw;
+        let max_x = width - 2.0 * bw;
+        let close_x = width - bw;
+
+        if let Some(h) = self.hovered_button {
+            let cell = match h {
+                TitlebarHit::Minimize => Some((min_x, self.titlebar_btn_hover)),
+                TitlebarHit::Maximize => Some((max_x, self.titlebar_btn_hover)),
+                TitlebarHit::Close => Some((close_x, self.titlebar_close_hover)),
+                TitlebarHit::Drag => None,
+            };
+            if let Some((hx, color)) = cell {
+                rects.push(Rect { x: hx, y: 0.0, w: bw, h: tb, color: color.to_linear_f32() });
+            }
+        }
+
+        let icon = self.titlebar_fg.to_linear_f32();
+        let thick = (1.5 * self.scale).max(1.0);
+        let cy = tb * 0.5;
+        // Minimize: a centered horizontal bar.
+        let iw = bw * 0.32;
+        rects.push(Rect { x: min_x + (bw - iw) * 0.5, y: cy - thick * 0.5, w: iw, h: thick, color: icon });
+        // Maximize: a small square outline (four thin sides).
+        let s = bw * 0.30;
+        let sx = max_x + (bw - s) * 0.5;
+        let sy = cy - s * 0.5;
+        rects.push(Rect { x: sx, y: sy, w: s, h: thick, color: icon });
+        rects.push(Rect { x: sx, y: sy + s - thick, w: s, h: thick, color: icon });
+        rects.push(Rect { x: sx, y: sy, w: thick, h: s, color: icon });
+        rects.push(Rect { x: sx + s - thick, y: sy, w: thick, h: s, color: icon });
+        // Close `×` is drawn as a glyph in `render`.
+    }
+
+    /// Which window edge/corner the pointer is over for interactive resize, or
+    /// `None` in the interior. A small margin hugs each edge; corners win.
+    pub fn resize_edge(&self, x: f32, y: f32) -> Option<ResizeEdge> {
+        edge_at(
+            x,
+            y,
+            self.config.width as f32,
+            self.config.height as f32,
+            RESIZE_MARGIN_LOGICAL * self.scale,
+        )
     }
 
     /// Draw one frame: the grid from `snap`, plus `overlay` (command palette /
@@ -288,7 +430,10 @@ impl Renderer {
             Resolution { width: self.config.width, height: self.config.height },
         );
         let pad = self.padding_physical();
-        let grid_pad = Padding::new(pad.x, pad.y + grid_offset_px);
+        let tb = self.titlebar_height();
+        let grid_pad = Padding::new(pad.x, self.grid_origin_y() + grid_offset_px);
+        // Sticky header and overlay text sit just below the titlebar strip.
+        let below_bar = Padding::new(pad.x, tb + pad.y);
         let bounds = TextBounds {
             left: 0,
             top: 0,
@@ -296,11 +441,21 @@ impl Renderer {
             bottom: self.config.height as i32,
         };
         let mut areas = vec![text_area(&self.buffer, to_gcolor(self.default_fg), grid_pad, bounds)];
+        // Window title, vertically centered in the titlebar strip.
+        let title_pad = Padding::new(pad.x, ((tb - self.cell.height) * 0.5).max(0.0));
+        areas.push(text_area(&self.titlebar_buffer, to_gcolor(self.titlebar_fg), title_pad, bounds));
+        // Close-button glyph (×), centered in the rightmost titlebar button.
+        let close_x = self.config.width as f32 - tb;
+        let close_pad = Padding::new(
+            close_x + (tb - self.cell.width) * 0.5,
+            ((tb - self.cell.height) * 0.5).max(0.0),
+        );
+        areas.push(text_area(&self.close_buffer, to_gcolor(self.titlebar_fg), close_pad, bounds));
         if let Some(color) = sticky_color {
-            areas.push(text_area(&self.sticky_buffer, to_gcolor(color), pad, bounds));
+            areas.push(text_area(&self.sticky_buffer, to_gcolor(color), below_bar, bounds));
         }
         if let Some(ov) = overlay {
-            areas.push(text_area(&self.overlay_buffer, to_gcolor(ov.colors.fg), pad, bounds));
+            areas.push(text_area(&self.overlay_buffer, to_gcolor(ov.colors.fg), below_bar, bounds));
         }
         self.text_renderer.prepare(
             &self.device,
@@ -350,7 +505,7 @@ impl Renderer {
         let ch = self.cell.height.max(1.0);
         let grid = self.grid_size();
         let col = (((x - pad.x) / cw).floor()).clamp(0.0, (grid.cols - 1) as f32) as u16;
-        let row = (((y - pad.y) / ch).floor()).clamp(0.0, (grid.rows - 1) as f32) as u16;
+        let row = (((y - self.grid_origin_y()) / ch).floor()).clamp(0.0, (grid.rows - 1) as f32) as u16;
         let right_half = (x - (pad.x + col as f32 * cw)) > cw * 0.5;
         (col, row, right_half)
     }
@@ -372,9 +527,9 @@ impl Renderer {
         let width = self.config.width as f32;
         let mut rects = Vec::new();
         let default_bg = snap.background;
-        // Grid content rides the fill-transition offset; the sticky band below
-        // keeps `pad.y` so it stays pinned to the top while the grid glides.
-        let grid_pad_y = pad.y + grid_offset_px;
+        // Grid content starts below the titlebar and rides the fill-transition
+        // offset; the titlebar and sticky band stay pinned while the grid glides.
+        let grid_pad_y = self.grid_origin_y() + grid_offset_px;
 
         // Cell backgrounds.
         for row in 0..snap.rows {
@@ -444,11 +599,12 @@ impl Renderer {
         // Sticky command header: an opaque band over row 0 with a bottom rule.
         // An open overlay covers the same rows, so skip it then.
         if let Some(sticky) = snap.sticky.as_ref().filter(|_| !overlay_open) {
+            let tb = self.titlebar_height();
             let band_h = pad.y + ch;
-            rects.push(Rect { x: 0.0, y: 0.0, w: width, h: band_h, color: default_bg.to_linear_f32() });
-            rects.push(Rect { x: 0.0, y: band_h - sep_h, w: width, h: sep_h, color: sep });
+            rects.push(Rect { x: 0.0, y: tb, w: width, h: band_h, color: default_bg.to_linear_f32() });
+            rects.push(Rect { x: 0.0, y: tb + band_h - sep_h, w: width, h: sep_h, color: sep });
             if sticky.failed {
-                rects.push(Rect { x: stripe_x, y: 0.0, w: stripe_w, h: band_h, color: stripe });
+                rects.push(Rect { x: stripe_x, y: tb, w: stripe_w, h: band_h, color: stripe });
             }
         }
 
@@ -468,6 +624,14 @@ impl Renderer {
                 CursorShape::Hidden => {}
             }
         }
+
+        // Custom titlebar strip drawn on top (winit decorations are disabled, so
+        // this is shelvd's own window chrome); the grid is inset below it.
+        let tb = self.titlebar_height();
+        rects.push(Rect { x: 0.0, y: 0.0, w: width, h: tb, color: self.titlebar_bg.to_linear_f32() });
+        rects.push(Rect { x: 0.0, y: tb - sep_h, w: width, h: sep_h, color: sep });
+        self.push_titlebar_buttons(&mut rects, width, tb);
+
         rects
     }
 
@@ -564,25 +728,26 @@ impl Renderer {
         let width = self.config.width as f32;
         let c = &ov.colors;
 
+        let tb = self.titlebar_height();
         let panel_h = pad.y + layout.panel_rows as f32 * ch;
-        rects.push(Rect { x: 0.0, y: 0.0, w: width, h: panel_h, color: c.panel_bg.to_linear_f32() });
+        rects.push(Rect { x: 0.0, y: tb, w: width, h: panel_h, color: c.panel_bg.to_linear_f32() });
 
         if layout.visible > 0
             && ov.selected >= layout.first_item
             && ov.selected < layout.first_item + layout.visible
         {
             let row = 1 + (ov.selected - layout.first_item) as u16;
-            let y = pad.y + row as f32 * ch;
+            let y = tb + pad.y + row as f32 * ch;
             rects.push(Rect { x: 0.0, y, w: width, h: ch, color: c.sel_bg.to_linear_f32() });
         }
 
         // A thin accent bar where the next typed character will land.
         let cursor_col = ov.prompt.chars().count() + 1 + ov.query.chars().count();
         let cx = pad.x + cursor_col as f32 * cw;
-        rects.push(Rect { x: cx, y: pad.y, w: (2.0 * self.scale).max(1.0), h: ch, color: c.accent.to_linear_f32() });
+        rects.push(Rect { x: cx, y: tb + pad.y, w: (2.0 * self.scale).max(1.0), h: ch, color: c.accent.to_linear_f32() });
 
         let rule_h = self.scale.max(1.0);
-        rects.push(Rect { x: 0.0, y: panel_h - rule_h, w: width, h: rule_h, color: c.accent.to_linear_f32() });
+        rects.push(Rect { x: 0.0, y: tb + panel_h - rule_h, w: width, h: rule_h, color: c.accent.to_linear_f32() });
     }
 
     /// Lay out the overlay's text (query line + the visible item slice) into the
@@ -709,6 +874,30 @@ fn text_area(buffer: &Buffer, color: GColor, pad: Padding, bounds: TextBounds) -
     }
 }
 
+/// `top` at `alpha`/255 composited over `bottom` — a quick opaque blend, used for
+/// the titlebar tints.
+fn lift(top: Rgba, bottom: Rgba, alpha: u8) -> Rgba {
+    Rgba::new(top.r, top.g, top.b, alpha).over(bottom)
+}
+
+/// Which window edge/corner a pixel falls in, given a hit margin `m`. Corners
+/// take precedence over edges; the interior is `None`.
+fn edge_at(x: f32, y: f32, w: f32, h: f32, m: f32) -> Option<ResizeEdge> {
+    let (left, right) = (x <= m, x >= w - m);
+    let (top, bottom) = (y <= m, y >= h - m);
+    Some(match (top, bottom, left, right) {
+        (true, _, true, _) => ResizeEdge::NorthWest,
+        (true, _, _, true) => ResizeEdge::NorthEast,
+        (_, true, true, _) => ResizeEdge::SouthWest,
+        (_, true, _, true) => ResizeEdge::SouthEast,
+        (true, _, _, _) => ResizeEdge::North,
+        (_, true, _, _) => ResizeEdge::South,
+        (_, _, true, _) => ResizeEdge::West,
+        (_, _, _, true) => ResizeEdge::East,
+        _ => return None,
+    })
+}
+
 fn to_gcolor(c: Rgba) -> GColor {
     GColor::rgba(c.r, c.g, c.b, c.a)
 }
@@ -731,7 +920,7 @@ fn separator_above(rows_decor: &[RowDecor], row: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RowDecor, separator_above};
+    use super::{edge_at, separator_above, ResizeEdge, RowDecor};
 
     fn block_top(block_id: u32) -> RowDecor {
         RowDecor { block_id, failed: false, block_top: true }
@@ -763,5 +952,20 @@ mod tests {
         // A later block's top is delimited from the block above it.
         assert!(separator_above(&rows, 4));
         assert!(!separator_above(&rows, 5));
+    }
+
+    #[test]
+    fn resize_edges_hit_corners_then_sides_then_interior() {
+        // 100x80 window, 6px hit margin.
+        let e = |x, y| edge_at(x, y, 100.0, 80.0, 6.0);
+        assert_eq!(e(1.0, 1.0), Some(ResizeEdge::NorthWest));
+        assert_eq!(e(99.0, 1.0), Some(ResizeEdge::NorthEast));
+        assert_eq!(e(1.0, 79.0), Some(ResizeEdge::SouthWest));
+        assert_eq!(e(99.0, 79.0), Some(ResizeEdge::SouthEast));
+        assert_eq!(e(50.0, 1.0), Some(ResizeEdge::North));
+        assert_eq!(e(50.0, 79.0), Some(ResizeEdge::South));
+        assert_eq!(e(1.0, 40.0), Some(ResizeEdge::West));
+        assert_eq!(e(99.0, 40.0), Some(ResizeEdge::East));
+        assert_eq!(e(50.0, 40.0), None);
     }
 }
