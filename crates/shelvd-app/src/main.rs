@@ -207,8 +207,10 @@ impl ApplicationHandler<UserEvent> for App {
                     state.last_blink = Instant::now();
                     dirty = true;
                 }
+                // A command-block boundary moved; redraw so block visuals follow.
+                TermEvent::SemanticPrompt { .. } => dirty = true,
                 TermEvent::Bell | TermEvent::ClipboardStore(_) | TermEvent::Wakeup
-                | TermEvent::MouseCursorDirty => {}
+                | TermEvent::MouseCursorDirty | TermEvent::WorkingDirectory(_) => {}
             }
         }
 
