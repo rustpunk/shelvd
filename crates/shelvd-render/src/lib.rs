@@ -710,14 +710,13 @@ fn clear_color(c: Rgba) -> wgpu::Color {
 
 /// Whether to draw a block-separator rule above `row`.
 ///
-/// Only between two real blocks: `row` must start a block (`block_top`) and the
-/// row directly above it must itself belong to a block (`block_id != 0`). This
-/// keeps the rule from floating in the blank top-padding that the bottom-anchored
-/// layout leaves above the first visible block.
+/// Drawn at the top of every command block (a `block_top` row), so each block —
+/// including the live prompt's, which sits below the bottom-anchor padding — has
+/// a consistent top delimiter from the moment its prompt appears, rather than the
+/// rule popping in only once a second block exists. Skipped on row 0, where there
+/// is nothing above to divide it from.
 fn separator_above(rows_decor: &[RowDecor], row: usize) -> bool {
-    row > 0
-        && rows_decor[row].block_top
-        && rows_decor.get(row - 1).is_some_and(|prev| prev.block_id != 0)
+    row > 0 && rows_decor[row].block_top
 }
 
 #[cfg(test)]
@@ -733,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn separator_above_only_between_real_blocks() {
+    fn separator_tops_every_block_below_row_zero() {
         // Layout: two blank top-padding rows, then block 1, then block 2.
         let rows = [
             RowDecor::default(), // 0: blank padding
@@ -746,11 +745,12 @@ mod tests {
 
         // Row 0 can never have a separator above it.
         assert!(!separator_above(&rows, 0));
-        // A `block_top` row whose predecessor is blank padding: no floating rule.
-        assert!(!separator_above(&rows, 2));
+        // The first/current block is delimited even though only blank padding
+        // sits above it, so a fresh prompt carries its top rule from the start.
+        assert!(separator_above(&rows, 2));
         // A non-`block_top` body row: no rule.
         assert!(!separator_above(&rows, 3));
-        // A `block_top` row directly below a real block: draw the divider.
+        // A later block's top is delimited from the block above it.
         assert!(separator_above(&rows, 4));
         assert!(!separator_above(&rows, 5));
     }
