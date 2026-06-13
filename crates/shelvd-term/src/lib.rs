@@ -15,12 +15,17 @@ use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use alacritty_terminal::Term;
 
+use std::time::Instant;
+
 use shelvd_core::{
-    CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba,
+    CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba, RowDecor,
+    StickyHeader,
 };
 
+mod block;
 mod osc133;
 
+pub use block::{Block, BlockState};
 pub use osc133::SemanticKind;
 use osc133::{Marker, Scanner};
 
@@ -124,6 +129,12 @@ pub struct Terminal {
     prev_history: usize,
     /// Last observed alt-screen state, to resync across buffer swaps.
     prev_alt: bool,
+    /// Command blocks, oldest first, delimited by semantic-prompt markers.
+    blocks: Vec<Block>,
+    /// Next block id to hand out (ids are never 0).
+    next_block_id: u32,
+    /// Working directory reported (OSC 7) since the last block opened.
+    pending_cwd: Option<String>,
     palette: Palette,
     cursor_shape: CursorShape,
     dims: TermDimensions,
@@ -152,6 +163,9 @@ impl Terminal {
             abs_base: 0,
             prev_history: 0,
             prev_alt: false,
+            blocks: Vec::new(),
+            next_block_id: 1,
+            pending_cwd: None,
             palette,
             cursor_shape,
             dims,
@@ -188,16 +202,202 @@ impl Terminal {
         self.sync_abs_base();
     }
 
-    /// Act on a recognized shell-integration marker: emit it on the event
-    /// channel, anchored (for semantic prompts) to the current cursor line.
+    /// Act on a recognized shell-integration marker: update the block model and
+    /// emit the marker on the event channel.
     fn on_marker(&mut self, marker: Marker) {
-        let event = match marker {
+        match marker {
             Marker::Semantic(kind) => {
-                TermEvent::SemanticPrompt { kind, line: self.absolute_cursor_line() }
+                let line = self.absolute_cursor_line();
+                let col = self.term.grid().cursor.point.column.0;
+                self.apply_semantic(&kind, line, col);
+                let _ = self.tx.send(TermEvent::SemanticPrompt { kind, line });
             }
-            Marker::Cwd(path) => TermEvent::WorkingDirectory(path),
+            Marker::Cwd(path) => {
+                // Attach to the current block if it lacks one; stash for the next.
+                if let Some(b) = self.blocks.last_mut() {
+                    if b.cwd.is_none() {
+                        b.cwd = Some(path.clone());
+                    }
+                }
+                self.pending_cwd = Some(path.clone());
+                let _ = self.tx.send(TermEvent::WorkingDirectory(path));
+            }
+        }
+    }
+
+    /// Fold one semantic-prompt marker into the block model.
+    fn apply_semantic(&mut self, kind: &SemanticKind, line: i64, col: usize) {
+        match kind {
+            SemanticKind::PromptStart => {
+                self.prune_blocks();
+                let id = self.next_block_id;
+                self.next_block_id += 1;
+                let cwd = self.pending_cwd.take();
+                self.blocks.push(Block::new(id, line, cwd));
+            }
+            SemanticKind::PromptEnd => {
+                if let Some(b) = self.blocks.last_mut() {
+                    b.command_line = line;
+                    b.command_col = col;
+                }
+            }
+            SemanticKind::OutputStart => {
+                // Capture the typed command (B..C) exactly once.
+                let pending = self
+                    .blocks
+                    .last()
+                    .filter(|b| b.output_line.is_none())
+                    .map(|b| (b.command_line, b.command_col));
+                if let Some((cmd_line, cmd_col)) = pending {
+                    let command = self.capture_command(cmd_line, cmd_col, line);
+                    let started = Instant::now();
+                    if let Some(b) = self.blocks.last_mut() {
+                        b.output_line = Some(line);
+                        b.command = command;
+                        b.started_at = Some(started);
+                    }
+                }
+            }
+            SemanticKind::CommandFinished(exit) => {
+                let out_line = self.blocks.last().and_then(|b| b.output_line);
+                let excerpt = out_line.map(|out| self.capture_excerpt(out, line));
+                if let Some(b) = self.blocks.last_mut() {
+                    b.end_line = Some(line);
+                    b.exit_code = *exit;
+                    b.state = match exit {
+                        Some(0) | None => BlockState::Success,
+                        Some(_) => BlockState::Failed,
+                    };
+                    if let Some(e) = excerpt {
+                        b.output_excerpt = e;
+                    }
+                }
+            }
+        }
+    }
+
+    /// All command blocks, oldest first.
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    /// Clamp an absolute line to a valid grid `Line`, so text extraction never
+    /// indexes outside the retained buffer.
+    fn abs_to_grid_line(&self, abs: i64) -> i32 {
+        let g = abs - self.abs_base;
+        let top = -(self.term.grid().history_size() as i64);
+        let bottom = self.dims.rows.saturating_sub(1) as i64;
+        g.clamp(top, bottom) as i32
+    }
+
+    /// Read the typed command text spanning `B`..`C`.
+    fn capture_command(&self, cmd_line: i64, cmd_col: usize, out_line: i64) -> String {
+        let last = out_line - 1; // output begins on out_line; command ends before it
+        if last < cmd_line {
+            return String::new();
+        }
+        let start = Point::new(Line(self.abs_to_grid_line(cmd_line)), Column(cmd_col));
+        let end_col = self.dims.cols.saturating_sub(1) as usize;
+        let end = Point::new(Line(self.abs_to_grid_line(last)), Column(end_col));
+        if end.line < start.line {
+            return String::new();
+        }
+        self.term.bounds_to_string(start, end).trim().to_string()
+    }
+
+    /// Read a trailing slice of a block's output, for later suggested actions.
+    fn capture_excerpt(&self, out_line: i64, end_line: i64) -> String {
+        const EXCERPT_LINES: i64 = 5;
+        if end_line <= out_line {
+            return String::new();
+        }
+        let last = end_line - 1;
+        let first = (end_line - EXCERPT_LINES).max(out_line);
+        let start = Point::new(Line(self.abs_to_grid_line(first)), Column(0));
+        let end_col = self.dims.cols.saturating_sub(1) as usize;
+        let end = Point::new(Line(self.abs_to_grid_line(last)), Column(end_col));
+        self.term.bounds_to_string(start, end).trim_end().to_string()
+    }
+
+    /// Drop blocks whose whole range has scrolled out of retained history, plus
+    /// a hard cap so a long-lived session can't grow the list without bound.
+    fn prune_blocks(&mut self) {
+        const MAX_BLOCKS: usize = 2000;
+        let oldest = self.abs_base - self.term.grid().history_size() as i64;
+        let mut keep_from = 0;
+        for i in 0..self.blocks.len() {
+            let end = self.blocks.get(i + 1).map_or(i64::MAX, |b| b.prompt_line);
+            if end <= oldest {
+                keep_from = i + 1;
+            } else {
+                break;
+            }
+        }
+        if keep_from > 0 {
+            self.blocks.drain(0..keep_from);
+        }
+        if self.blocks.len() > MAX_BLOCKS {
+            let excess = self.blocks.len() - MAX_BLOCKS;
+            self.blocks.drain(0..excess);
+        }
+    }
+
+    /// The index of the block covering absolute line `abs`, if any. Blocks are
+    /// contiguous: a block runs until the next block's prompt; the open block
+    /// runs to its recorded end or the cursor.
+    fn block_row(&self, abs: i64, cursor_abs: i64) -> Option<usize> {
+        let count = self.blocks.partition_point(|b| b.prompt_line <= abs);
+        if count == 0 {
+            return None;
+        }
+        let idx = count - 1;
+        let end = if idx + 1 < self.blocks.len() {
+            self.blocks[idx + 1].prompt_line
+        } else {
+            self.blocks[idx].end_line.map_or(cursor_abs + 1, |e| e + 1)
         };
-        let _ = self.tx.send(event);
+        if abs < end {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Fill in per-row block decoration, the sticky header, and resolve the
+    /// block colors from the palette (color resolution stays in this crate).
+    fn decorate(&self, snap: &mut GridSnapshot, offset: i32) {
+        snap.block_stripe = self.palette.indexed(9); // bright red
+        let red = self.palette.indexed(1);
+        snap.block_tint = Rgba::new(red.r, red.g, red.b, 30); // subtle wash
+        snap.block_separator = self.palette.indexed(8); // ash
+
+        if self.blocks.is_empty() {
+            return;
+        }
+        let cursor_abs = self.absolute_cursor_line();
+        for r in 0..snap.rows as i64 {
+            let abs = self.abs_base + r - offset as i64;
+            if let Some(idx) = self.block_row(abs, cursor_abs) {
+                let b = &self.blocks[idx];
+                snap.rows_decor[r as usize] = RowDecor {
+                    block_id: b.id,
+                    failed: b.state == BlockState::Failed,
+                    block_top: abs == b.prompt_line,
+                };
+            }
+        }
+
+        // Sticky header: the top visible row's block, if its prompt scrolled off.
+        let top_abs = self.abs_base - offset as i64;
+        if let Some(idx) = self.block_row(top_abs, cursor_abs) {
+            let b = &self.blocks[idx];
+            if b.prompt_line < top_abs && !b.command.is_empty() {
+                snap.sticky = Some(StickyHeader {
+                    command: b.command.clone(),
+                    failed: b.state == BlockState::Failed,
+                });
+            }
+        }
     }
 
     /// Advance [`Self::abs_base`] by however many lines just scrolled into
@@ -219,6 +419,7 @@ impl Terminal {
             } else {
                 // History shrank (a clear): every existing anchor is meaningless.
                 self.abs_base = 0;
+                self.blocks.clear();
             }
         }
         self.prev_history = hist;
@@ -234,9 +435,13 @@ impl Terminal {
         self.dims = TermDimensions::new(cols, rows);
         self.term.resize(self.dims);
         // Reflow renumbers lines; rebase the scroll baseline to the new history
-        // depth so the next chunk's delta is measured from solid ground.
+        // depth so the next chunk's delta is measured from solid ground. Block
+        // anchors don't survive reflow (we keep a single grid, not Warp's
+        // per-block grids), so drop them and let new commands re-establish them.
         self.prev_history = self.term.grid().history_size();
         self.prev_alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        self.blocks.clear();
+        self.pending_cwd = None;
     }
 
     /// Channel of terminal-generated side effects.
@@ -426,6 +631,7 @@ impl Terminal {
         }
 
         snap.cursor = self.cursor_snapshot(offset, cols, rows);
+        self.decorate(&mut snap, offset);
         snap
     }
 
@@ -634,5 +840,65 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec![SemanticKind::PromptEnd]);
+    }
+
+    #[test]
+    fn builds_block_from_markers() {
+        let mut t = terminal(40, 10);
+        t.process(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07file1\r\nfile2\r\n\x1b]133;D;0\x07",
+        );
+        let blocks = t.blocks();
+        assert_eq!(blocks.len(), 1);
+        let b = &blocks[0];
+        assert_eq!(b.command, "ls");
+        assert_eq!(b.exit_code, Some(0));
+        assert_eq!(b.state, BlockState::Success);
+        assert!(b.output_excerpt.contains("file2"));
+    }
+
+    #[test]
+    fn failed_block_decorates_rows() {
+        let mut t = terminal(40, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07boom\r\n\x1b]133;C\x07err\r\n\x1b]133;D;1\x07");
+        let b = &t.blocks()[0];
+        assert_eq!(b.state, BlockState::Failed);
+        assert_eq!(b.exit_code, Some(1));
+
+        let snap = t.snapshot();
+        let id = snap.rows_decor[0].block_id;
+        assert_ne!(id, 0);
+        assert!(snap.rows_decor[0].failed);
+        assert!(snap.rows_decor[0].block_top, "prompt row is the block top");
+        assert!(snap.rows_decor[1].failed);
+        assert!(!snap.rows_decor[1].block_top);
+        // Rows past the block's end carry no decoration.
+        assert_eq!(snap.rows_decor[5].block_id, 0);
+    }
+
+    #[test]
+    fn second_prompt_closes_the_first_block() {
+        let mut t = terminal(40, 12);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07a\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07b\r\n\x1b]133;C\x07");
+        let blocks = t.blocks();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].command, "a");
+        assert_eq!(blocks[1].command, "b");
+        assert!(blocks[0].id != blocks[1].id);
+    }
+
+    #[test]
+    fn sticky_header_appears_when_prompt_scrolls_off() {
+        let mut t = terminal(20, 3);
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        for i in 0..10 {
+            input.extend_from_slice(format!("out{i}\r\n").as_bytes());
+        }
+        t.process(&input);
+        let snap = t.snapshot();
+        let sticky = snap.sticky.expect("prompt scrolled off the top -> sticky header");
+        assert_eq!(sticky.command, "make");
     }
 }
