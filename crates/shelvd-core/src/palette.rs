@@ -33,6 +33,39 @@ impl Palette {
         self.colors[idx as usize]
     }
 
+    /// Build a palette from the 16 base ANSI colors plus the special slots,
+    /// generating the standard xterm 6×6×6 color cube (indices 16..232) and the
+    /// 24-step grayscale ramp (232..256). This is the constructor both the
+    /// built-in theme and TOML-loaded themes go through.
+    pub fn from_base16(
+        base16: [Rgba; 16],
+        foreground: Rgba,
+        background: Rgba,
+        cursor: Rgba,
+        cursor_text: Rgba,
+        selection: Rgba,
+    ) -> Self {
+        let mut colors = [Rgba::rgb(0, 0, 0); 256];
+        colors[..16].copy_from_slice(&base16);
+        // 16..232: 6×6×6 color cube.
+        let levels = [0u8, 95, 135, 175, 215, 255];
+        let mut idx = 16;
+        for r in 0..6 {
+            for g in 0..6 {
+                for b in 0..6 {
+                    colors[idx] = Rgba::rgb(levels[r], levels[g], levels[b]);
+                    idx += 1;
+                }
+            }
+        }
+        // 232..256: 24-step grayscale ramp.
+        for i in 0..24 {
+            let v = 8 + i as u8 * 10;
+            colors[232 + i] = Rgba::rgb(v, v, v);
+        }
+        Self { colors, foreground, background, cursor, cursor_text, selection }
+    }
+
     /// The shelvd default: a warm, low-glow dark theme — old phosphor on
     /// shelved hardware that someone powered back up.
     pub fn shelvd_dark() -> Self {
@@ -56,36 +89,14 @@ impl Palette {
             0x8fd0c8, // 14 bright cyan
             0xf0e6d6, // 15 bright white
         ];
-
-        let mut colors = [Rgba::rgb(0, 0, 0); 256];
-        for (i, &hex) in BASE16.iter().enumerate() {
-            colors[i] = Rgba::hex(hex);
-        }
-        // 16..232: 6×6×6 color cube.
-        let levels = [0u8, 95, 135, 175, 215, 255];
-        let mut idx = 16;
-        for r in 0..6 {
-            for g in 0..6 {
-                for b in 0..6 {
-                    colors[idx] = Rgba::rgb(levels[r], levels[g], levels[b]);
-                    idx += 1;
-                }
-            }
-        }
-        // 232..256: 24-step grayscale ramp.
-        for i in 0..24 {
-            let v = 8 + i as u8 * 10;
-            colors[232 + i] = Rgba::rgb(v, v, v);
-        }
-
-        Self {
-            colors,
-            foreground: Rgba::hex(0xcfc4b4),
-            background: Rgba::hex(0x14110f),
-            cursor: Rgba::hex(0xe6a86c),
-            cursor_text: Rgba::hex(0x14110f),
-            selection: Rgba::hex(0x3a3228),
-        }
+        Self::from_base16(
+            BASE16.map(Rgba::hex),
+            Rgba::hex(0xcfc4b4),
+            Rgba::hex(0x14110f),
+            Rgba::hex(0xe6a86c),
+            Rgba::hex(0x14110f),
+            Rgba::hex(0x3a3228),
+        )
     }
 }
 
