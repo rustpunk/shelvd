@@ -6,11 +6,14 @@
 //! back to the PTY. The PTY reader thread wakes the loop through an
 //! [`EventLoopProxy`].
 
+mod overlay;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use shelvd_core::Config;
+use shelvd_core::{Config, OverlayColors, Rgba};
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
 use shelvd_term::{TermEvent, Terminal};
@@ -21,6 +24,8 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
+
+use overlay::{Action, OverlayState};
 
 /// Events delivered to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +79,11 @@ struct State {
     blink_on: bool,
     /// When the blink phase last toggled.
     last_blink: Instant,
+    /// The open command palette / history overlay, if any. While present, the
+    /// keyboard drives the overlay instead of the PTY.
+    overlay: Option<OverlayState>,
+    /// Overlay colors resolved from the theme at startup.
+    overlay_colors: OverlayColors,
 }
 
 impl App {
@@ -164,6 +174,8 @@ impl ApplicationHandler<UserEvent> for App {
             focused: true,
             blink_on: true,
             last_blink: Instant::now(),
+            overlay: None,
+            overlay_colors: overlay_colors(&self.config),
         });
     }
 
@@ -266,6 +278,9 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x as f32, position.y as f32);
+                if state.overlay.is_some() {
+                    return; // overlay swallows pointer motion
+                }
                 // Forward motion to the child when it is reading the mouse (and
                 // Shift, the local-selection override, is not held).
                 if state.terminal.mouse_mode() && !state.modifiers.shift_key() {
@@ -291,6 +306,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state: elem_state, button, .. } => {
+                // A click anywhere dismisses an open overlay.
+                if state.overlay.is_some() {
+                    if elem_state == ElementState::Pressed {
+                        state.overlay = None;
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
                 // Forward clicks to the child when it is reading the mouse; Shift
                 // forces local selection/paste instead (the standard override).
                 if state.terminal.mouse_mode() && !state.modifiers.shift_key() {
@@ -329,6 +352,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.overlay.is_some() {
+                    // Scroll the overlay list instead of the terminal.
+                    let down = matches!(
+                        delta,
+                        MouseScrollDelta::LineDelta(_, y) if y < 0.0
+                    ) || matches!(delta, MouseScrollDelta::PixelDelta(p) if p.y < 0.0);
+                    if let Some(ov) = state.overlay.as_mut() {
+                        ov.move_selection(if down { 1 } else { -1 });
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
                 // While the child reads the mouse, report wheel notches to it
                 // (one report per notch). Shift falls through to local scrolling.
                 if state.terminal.mouse_mode() && !state.modifiers.shift_key() {
@@ -374,12 +409,28 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // While an overlay is open the keyboard drives it, not the PTY.
+                if state.overlay.is_some() {
+                    handle_overlay_key(state, event_loop, &event);
+                    return;
+                }
                 let mods = state.modifiers;
                 // Ctrl+Shift+{C,V}: clipboard. Ctrl+Shift+X: copy the current
                 // block. Ctrl+Shift+{Up,Down}: jump between command blocks.
+                // Ctrl+Shift+P: command palette. Ctrl+Shift+R: history search.
                 // (Ctrl+C alone still sends SIGINT.)
                 if mods.control_key() && mods.shift_key() {
                     match &event.logical_key {
+                        Key::Character(s) if s.eq_ignore_ascii_case("p") => {
+                            state.overlay = Some(OverlayState::palette());
+                            state.window.request_redraw();
+                            return;
+                        }
+                        Key::Character(s) if s.eq_ignore_ascii_case("r") => {
+                            open_history(state);
+                            state.window.request_redraw();
+                            return;
+                        }
                         Key::Character(s) if s.eq_ignore_ascii_case("c") => {
                             copy_selection(state);
                             return;
@@ -450,7 +501,15 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.focused && state.terminal.cursor_blinking() && !state.blink_on {
                     snapshot.cursor = None;
                 }
-                if let Err(e) = state.renderer.render(&snapshot) {
+                // With an overlay open, focus is on it — hide the grid cursor.
+                if state.overlay.is_some() {
+                    snapshot.cursor = None;
+                }
+                let overlay = state
+                    .overlay
+                    .as_ref()
+                    .map(|ov| ov.to_overlay(state.overlay_colors));
+                if let Err(e) = state.renderer.render(&snapshot, overlay.as_ref()) {
                     log::error!("render error: {e}");
                 }
             }
@@ -641,6 +700,108 @@ fn copy_block(state: &mut State) {
             log::debug!("block copy failed: {e}");
         }
     }
+}
+
+/// Route a key press to the open overlay: query edits, navigation, accept/cancel.
+fn handle_overlay_key(state: &mut State, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+    match &event.logical_key {
+        Key::Named(NamedKey::Escape) => state.overlay = None,
+        Key::Named(NamedKey::Enter) => {
+            let action = state.overlay.as_ref().and_then(|o| o.selected_action());
+            state.overlay = None;
+            if let Some(action) = action {
+                run_action(state, event_loop, action);
+            }
+        }
+        Key::Named(NamedKey::ArrowUp) => {
+            if let Some(o) = state.overlay.as_mut() {
+                o.move_selection(-1);
+            }
+        }
+        Key::Named(NamedKey::ArrowDown) => {
+            if let Some(o) = state.overlay.as_mut() {
+                o.move_selection(1);
+            }
+        }
+        Key::Named(NamedKey::Backspace) => {
+            if let Some(o) = state.overlay.as_mut() {
+                o.backspace();
+            }
+        }
+        Key::Named(NamedKey::Space) => {
+            if let Some(o) = state.overlay.as_mut() {
+                o.input_char(' ');
+            }
+        }
+        Key::Character(s) => {
+            if let Some(o) = state.overlay.as_mut() {
+                for c in s.chars() {
+                    o.input_char(c);
+                }
+            }
+        }
+        _ => {}
+    }
+    state.window.request_redraw();
+}
+
+/// Execute an overlay [`Action`] against the live subsystems.
+fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
+    match action {
+        Action::ScrollToTop => state.terminal.scroll_to_top(),
+        Action::ScrollToBottom => state.terminal.scroll_to_bottom(),
+        Action::CopySelection => copy_selection(state),
+        Action::CopyBlock => copy_block(state),
+        Action::PrevBlock => {
+            state.terminal.scroll_to_prev_block();
+        }
+        Action::NextBlock => {
+            state.terminal.scroll_to_next_block();
+        }
+        Action::SearchHistory => open_history(state),
+        Action::Quit => event_loop.exit(),
+        Action::InsertCommand(cmd) => {
+            if let Err(e) = state.pty.write(cmd.as_bytes()) {
+                log::debug!("history insert failed: {e}");
+            }
+        }
+    }
+}
+
+/// Open the history overlay from this session's block command strings.
+fn open_history(state: &mut State) {
+    let commands = history_commands(&state.terminal);
+    state.overlay = Some(OverlayState::history(commands));
+}
+
+/// Recent command strings, most recent first, deduplicated.
+fn history_commands(terminal: &Terminal) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for block in terminal.blocks().iter().rev() {
+        if !block.command.is_empty() && seen.insert(block.command.as_str()) {
+            out.push(block.command.clone());
+        }
+    }
+    out
+}
+
+/// Resolve the overlay's colors from the active theme.
+fn overlay_colors(config: &Config) -> OverlayColors {
+    let pal = &config.theme.palette;
+    let (bg, fg) = (pal.background, pal.foreground);
+    OverlayColors {
+        panel_bg: mix(fg, bg, 22),       // a subtle lift above the terminal background
+        fg,
+        dim: mix(fg, bg, 120),           // muted text for details / placeholder
+        sel_bg: mix(pal.cursor, bg, 64), // warm highlight on the selected row
+        accent: pal.cursor,
+    }
+}
+
+/// `top` composited over `bottom` at `alpha`/255 — a quick opaque blend.
+fn mix(top: Rgba, bottom: Rgba, alpha: u8) -> Rgba {
+    Rgba::new(top.r, top.g, top.b, alpha).over(bottom)
 }
 
 /// Paste clipboard text into the PTY.
