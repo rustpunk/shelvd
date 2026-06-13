@@ -19,6 +19,11 @@ use shelvd_core::{
     CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba,
 };
 
+mod osc133;
+
+pub use osc133::SemanticKind;
+use osc133::{Marker, Scanner};
+
 /// A side effect produced by the terminal while parsing.
 #[derive(Debug, Clone)]
 pub enum TermEvent {
@@ -41,6 +46,11 @@ pub enum TermEvent {
     /// The cursor's blink configuration changed (DECSCUSR); the event loop
     /// should refresh its blink scheduling.
     CursorBlink,
+    /// A shell-integration semantic-prompt marker (OSC 133), anchored to the
+    /// absolute grid line where the cursor sat when it arrived.
+    SemanticPrompt { kind: SemanticKind, line: i64 },
+    /// The shell reported its working directory (OSC 7).
+    WorkingDirectory(String),
     /// The child process exited.
     Exit,
 }
@@ -102,6 +112,18 @@ pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
     events: flume::Receiver<TermEvent>,
+    /// Sender shared with [`EventProxy`], so OSC-133 markers detected by the tee
+    /// reach the same channel as alacritty's own side effects.
+    tx: flume::Sender<TermEvent>,
+    /// Tees the byte stream for shell-integration markers `alacritty` drops.
+    scanner: Scanner,
+    /// Absolute grid-line index of active line 0, advanced as content scrolls
+    /// into history. Anchors semantic-prompt markers to a stable line number.
+    abs_base: i64,
+    /// Last observed scrollback depth, to derive the scroll delta each chunk.
+    prev_history: usize,
+    /// Last observed alt-screen state, to resync across buffer swaps.
+    prev_alt: bool,
     palette: Palette,
     cursor_shape: CursorShape,
     dims: TermDimensions,
@@ -120,11 +142,16 @@ impl Terminal {
         let (tx, rx) = flume::unbounded();
         let config = Config { scrolling_history: scrollback, ..Config::default() };
         let dims = TermDimensions::new(cols, rows);
-        let term = Term::new(config, &dims, EventProxy(tx));
+        let term = Term::new(config, &dims, EventProxy(tx.clone()));
         Self {
             term,
             parser: Processor::new(),
             events: rx,
+            tx,
+            scanner: Scanner::new(),
+            abs_base: 0,
+            prev_history: 0,
+            prev_alt: false,
             palette,
             cursor_shape,
             dims,
@@ -132,14 +159,84 @@ impl Terminal {
     }
 
     /// Feed bytes read from the PTY into the parser.
+    ///
+    /// The bytes are teed for OSC-133 shell-integration markers *before* they
+    /// reach alacritty (which silently drops them). To anchor each marker to the
+    /// grid line where it occurred, the stream is fed to alacritty in segments
+    /// split at every marker terminator, reading the cursor in between.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        let hits = self.scanner.scan(bytes);
+        if hits.is_empty() {
+            self.advance_segment(bytes);
+            return;
+        }
+        let mut start = 0;
+        for (end, marker) in hits {
+            self.advance_segment(&bytes[start..end]);
+            start = end;
+            self.on_marker(marker);
+        }
+        self.advance_segment(&bytes[start..]);
+    }
+
+    /// Feed one segment to alacritty and refresh the absolute-line origin.
+    fn advance_segment(&mut self, seg: &[u8]) {
+        if seg.is_empty() {
+            return;
+        }
+        self.parser.advance(&mut self.term, seg);
+        self.sync_abs_base();
+    }
+
+    /// Act on a recognized shell-integration marker: emit it on the event
+    /// channel, anchored (for semantic prompts) to the current cursor line.
+    fn on_marker(&mut self, marker: Marker) {
+        let event = match marker {
+            Marker::Semantic(kind) => {
+                TermEvent::SemanticPrompt { kind, line: self.absolute_cursor_line() }
+            }
+            Marker::Cwd(path) => TermEvent::WorkingDirectory(path),
+        };
+        let _ = self.tx.send(event);
+    }
+
+    /// Advance [`Self::abs_base`] by however many lines just scrolled into
+    /// history. Exact until the scrollback buffer saturates; frozen while the
+    /// alt screen is active (its content never enters the main history).
+    fn sync_abs_base(&mut self) {
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        let hist = self.term.grid().history_size();
+        if alt != self.prev_alt {
+            // The active grid swapped buffers; the main-screen origin is
+            // preserved across the swap, so only rebase the history baseline.
+            self.prev_alt = alt;
+            self.prev_history = hist;
+            return;
+        }
+        if !alt {
+            if hist >= self.prev_history {
+                self.abs_base += (hist - self.prev_history) as i64;
+            } else {
+                // History shrank (a clear): every existing anchor is meaningless.
+                self.abs_base = 0;
+            }
+        }
+        self.prev_history = hist;
+    }
+
+    /// Absolute grid line of the cursor right now.
+    fn absolute_cursor_line(&self) -> i64 {
+        self.abs_base + self.term.grid().cursor.point.line.0 as i64
     }
 
     /// Resize the grid to `cols` × `rows` cells.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.dims = TermDimensions::new(cols, rows);
         self.term.resize(self.dims);
+        // Reflow renumbers lines; rebase the scroll baseline to the new history
+        // depth so the next chunk's delta is measured from solid ground.
+        self.prev_history = self.term.grid().history_size();
+        self.prev_alt = self.term.mode().contains(TermMode::ALT_SCREEN);
     }
 
     /// Channel of terminal-generated side effects.
@@ -482,5 +579,60 @@ mod tests {
         assert!(t.cursor_blinking(), "DECSCUSR 1 enables blinking");
         t.process(b"\x1b[2 q"); // DECSCUSR: steady block
         assert!(!t.cursor_blinking(), "DECSCUSR 2 is steady");
+    }
+
+    /// Collect the absolute line of the first semantic-prompt event, if any.
+    fn first_prompt_line(t: &Terminal) -> Option<i64> {
+        t.events().try_iter().find_map(|e| match e {
+            TermEvent::SemanticPrompt { line, .. } => Some(line),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn semantic_prompt_anchors_to_cursor_line() {
+        let mut t = terminal(20, 5);
+        t.process(b"a\r\nb\r\nc\r\n\x1b]133;A\x07");
+        // Three newlines on a 5-row grid leave the cursor on line 3, unscrolled.
+        assert_eq!(first_prompt_line(&t), Some(3));
+    }
+
+    #[test]
+    fn semantic_prompt_line_tracks_scrollback() {
+        let mut t = terminal(20, 3);
+        for i in 0..6 {
+            t.process(format!("L{i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b]133;A\x07");
+        // Six lines on a 3-row grid scroll four into history (abs_base 4); the
+        // cursor sits on the bottom visible row (2) -> absolute line 6.
+        assert_eq!(first_prompt_line(&t), Some(6));
+    }
+
+    #[test]
+    fn working_directory_event_surfaces() {
+        let mut t = terminal(20, 3);
+        t.process(b"\x1b]7;file://host/tmp/x\x07");
+        let cwd = t.events().try_iter().find_map(|e| match e {
+            TermEvent::WorkingDirectory(p) => Some(p),
+            _ => None,
+        });
+        assert_eq!(cwd.as_deref(), Some("/tmp/x"));
+    }
+
+    #[test]
+    fn marker_split_across_process_calls() {
+        let mut t = terminal(20, 3);
+        t.process(b"x\x1b]133;");
+        t.process(b"B\x07y");
+        let kinds: Vec<_> = t
+            .events()
+            .try_iter()
+            .filter_map(|e| match e {
+                TermEvent::SemanticPrompt { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec![SemanticKind::PromptEnd]);
     }
 }
