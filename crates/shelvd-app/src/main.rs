@@ -7,6 +7,7 @@
 //! [`EventLoopProxy`].
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use shelvd_core::Config;
@@ -27,6 +28,9 @@ enum UserEvent {
     /// The PTY reader thread has new output (or the child exited).
     PtyReadable,
 }
+
+/// How long each cursor blink phase (visible, then hidden) lasts.
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -58,6 +62,12 @@ struct State {
     mouse_pos: (f32, f32),
     /// Whether the left button is down and a selection is being dragged.
     selecting: bool,
+    /// Whether the window currently has focus (the cursor only blinks focused).
+    focused: bool,
+    /// Current blink phase — `true` shows the cursor, `false` hides it.
+    blink_on: bool,
+    /// When the blink phase last toggled.
+    last_blink: Instant,
 }
 
 impl App {
@@ -143,6 +153,9 @@ impl ApplicationHandler<UserEvent> for App {
             clipboard: Clipboard::new().ok(),
             mouse_pos: (0.0, 0.0),
             selecting: false,
+            focused: true,
+            blink_on: true,
+            last_blink: Instant::now(),
         });
     }
 
@@ -179,6 +192,12 @@ impl ApplicationHandler<UserEvent> for App {
                 TermEvent::Exit => {
                     event_loop.exit();
                     return;
+                }
+                TermEvent::CursorBlink => {
+                    // Blink config changed: show the cursor and restart the phase.
+                    state.blink_on = true;
+                    state.last_blink = Instant::now();
+                    dirty = true;
                 }
                 TermEvent::Bell | TermEvent::ClipboardStore(_) | TermEvent::Wakeup
                 | TermEvent::MouseCursorDirty => {}
@@ -331,14 +350,53 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::Focused(focused) => {
+                state.focused = focused;
+                // Reset to a solid, visible cursor whenever focus changes.
+                state.blink_on = true;
+                state.last_blink = Instant::now();
+                state.window.request_redraw();
+            }
+
             WindowEvent::RedrawRequested => {
-                let snapshot = state.terminal.snapshot();
+                let mut snapshot = state.terminal.snapshot();
+                // Honor the blink phase: while focused and the program asked for
+                // a blinking cursor, drop the cursor on the "off" phase.
+                if state.focused && state.terminal.cursor_blinking() && !state.blink_on {
+                    snapshot.cursor = None;
+                }
                 if let Err(e) = state.renderer.render(&snapshot) {
                     log::error!("render error: {e}");
                 }
             }
 
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if state.focused && state.terminal.cursor_blinking() {
+            let now = Instant::now();
+            if now.duration_since(state.last_blink) >= CURSOR_BLINK_INTERVAL {
+                state.blink_on = !state.blink_on;
+                state.last_blink = now;
+                state.window.request_redraw();
+            }
+            // Wake again at the next toggle; this is the only thing that turns
+            // the otherwise event-driven loop into a ~2 Hz tick, and only while
+            // a blinking cursor is focused.
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(state.last_blink + CURSOR_BLINK_INTERVAL));
+        } else {
+            // Not blinking: make sure the cursor is solid, then idle the loop.
+            if !state.blink_on {
+                state.blink_on = true;
+                state.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }

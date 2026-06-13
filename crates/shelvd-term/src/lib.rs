@@ -38,6 +38,9 @@ pub enum TermEvent {
     Wakeup,
     /// The mouse cursor shape may need updating.
     MouseCursorDirty,
+    /// The cursor's blink configuration changed (DECSCUSR); the event loop
+    /// should refresh its blink scheduling.
+    CursorBlink,
     /// The child process exited.
     Exit,
 }
@@ -82,6 +85,7 @@ impl EventListener for EventProxy {
             Event::Bell => Some(TermEvent::Bell),
             Event::Wakeup => Some(TermEvent::Wakeup),
             Event::MouseCursorDirty => Some(TermEvent::MouseCursorDirty),
+            Event::CursorBlinkingChange => Some(TermEvent::CursorBlink),
             Event::Exit => Some(TermEvent::Exit),
             // Callback-carrying queries (color/text-area/clipboard-load) are
             // ignored for now; they land in a later milestone.
@@ -200,6 +204,11 @@ impl Terminal {
     /// Whether the alternate screen is active (e.g. a full-screen TUI).
     pub fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether the program has requested a blinking cursor (DECSCUSR).
+    pub fn cursor_blinking(&self) -> bool {
+        self.term.cursor_style().blinking
     }
 
     // --- selection -----------------------------------------------------------
@@ -445,5 +454,15 @@ mod tests {
         assert!(t.selection_text().is_some());
         t.selection_clear();
         assert!(t.selection_text().is_none());
+    }
+
+    #[test]
+    fn cursor_blink_follows_decscusr() {
+        let mut t = terminal(10, 3);
+        assert!(!t.cursor_blinking(), "default cursor is steady");
+        t.process(b"\x1b[1 q"); // DECSCUSR: blinking block
+        assert!(t.cursor_blinking(), "DECSCUSR 1 enables blinking");
+        t.process(b"\x1b[2 q"); // DECSCUSR: steady block
+        assert!(!t.cursor_blinking(), "DECSCUSR 2 is steady");
     }
 }
