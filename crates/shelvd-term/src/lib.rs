@@ -430,7 +430,7 @@ impl Terminal {
 
     /// Fill in per-row block decoration, the sticky header, and resolve the
     /// block colors from the palette (color resolution stays in this crate).
-    fn decorate(&self, snap: &mut GridSnapshot, offset: i32) {
+    fn decorate(&self, snap: &mut GridSnapshot, offset: i32, shift: i32) {
         snap.block_stripe = self.palette.indexed(9); // bright red
         let red = self.palette.indexed(1);
         snap.block_tint = Rgba::new(red.r, red.g, red.b, 30); // subtle wash
@@ -441,7 +441,11 @@ impl Terminal {
         }
         let cursor_abs = self.absolute_cursor_line();
         for r in 0..snap.rows as i64 {
-            let abs = self.abs_base + r - offset as i64;
+            // The bottom-anchor padding rows above the content map to no grid line.
+            if r < shift as i64 {
+                continue;
+            }
+            let abs = self.abs_base + (r - shift as i64) - offset as i64;
             if let Some(idx) = self.block_row(abs, cursor_abs) {
                 let b = &self.blocks[idx];
                 snap.rows_decor[r as usize] = RowDecor {
@@ -453,14 +457,17 @@ impl Terminal {
         }
 
         // Sticky header: the top visible row's block, if its prompt scrolled off.
-        let top_abs = self.abs_base - offset as i64;
-        if let Some(idx) = self.block_row(top_abs, cursor_abs) {
-            let b = &self.blocks[idx];
-            if b.prompt_line < top_abs && !b.command.is_empty() {
-                snap.sticky = Some(StickyHeader {
-                    command: b.command.clone(),
-                    failed: b.state == BlockState::Failed,
-                });
+        // Only when content fills the grid (no bottom-anchor padding above it).
+        if shift == 0 {
+            let top_abs = self.abs_base - offset as i64;
+            if let Some(idx) = self.block_row(top_abs, cursor_abs) {
+                let b = &self.blocks[idx];
+                if b.prompt_line < top_abs && !b.command.is_empty() {
+                    snap.sticky = Some(StickyHeader {
+                        command: b.command.clone(),
+                        failed: b.state == BlockState::Failed,
+                    });
+                }
             }
         }
     }
@@ -625,8 +632,43 @@ impl Terminal {
     /// Map a viewport cell (accounting for scrollback offset) to a grid point.
     fn viewport_to_point(&self, col: u16, row: u16) -> Point {
         let offset = self.term.grid().display_offset() as i32;
+        let shift = self.display_shift();
         let max_col = self.dims.cols.saturating_sub(1) as usize;
-        Point::new(Line(row as i32 - offset), Column((col as usize).min(max_col)))
+        Point::new(Line(row as i32 - shift - offset), Column((col as usize).min(max_col)))
+    }
+
+    /// Blank rows to reserve above the grid so the live prompt rests on the
+    /// bottom of the window (Warp-style) instead of climbing down from the top.
+    /// Active only at the live edge of the main screen, and only until output
+    /// grows tall enough to fill the grid; scrolled history and full-screen apps
+    /// (the alternate screen) are laid out top-to-bottom as usual, so it returns
+    /// 0 there and the snapshot matches a conventional terminal.
+    fn display_shift(&self) -> i32 {
+        let grid = self.term.grid();
+        if grid.display_offset() != 0 || self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return 0;
+        }
+        let rows = self.dims.rows as i32;
+        if rows <= 1 {
+            return 0;
+        }
+        (rows - 1 - self.content_bottom()).max(0)
+    }
+
+    /// The lowest occupied visible row at the live edge: the cursor's row or the
+    /// last row carrying a printed glyph, whichever is lower (0-based screen row).
+    /// Only meaningful at display offset 0 — where a screen row equals its grid
+    /// line — which is the only state [`Self::display_shift`] calls it in.
+    fn content_bottom(&self) -> i32 {
+        let grid = self.term.grid();
+        let mut bottom = grid.cursor.point.line.0.max(0);
+        for indexed in grid.display_iter() {
+            let row = indexed.point.line.0;
+            if row > bottom && indexed.cell.c != ' ' && indexed.cell.c != '\0' {
+                bottom = row;
+            }
+        }
+        bottom
     }
 
     /// Build a render-ready snapshot of the visible grid.
@@ -637,12 +679,13 @@ impl Terminal {
             GridSnapshot::filled(cols, rows, self.palette.foreground, self.palette.background);
         snap.selection_color = self.palette.selection;
 
+        let shift = self.display_shift();
         let selection = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
 
         for indexed in grid.display_iter() {
-            let row_i = indexed.point.line.0 + offset;
+            let row_i = indexed.point.line.0 + offset + shift;
             if row_i < 0 {
                 continue;
             }
@@ -695,19 +738,19 @@ impl Terminal {
             snap.cells[dst] = CellSnapshot { c, fg, bg, flags };
         }
 
-        snap.cursor = self.cursor_snapshot(offset, cols, rows);
-        self.decorate(&mut snap, offset);
+        snap.cursor = self.cursor_snapshot(offset, shift, cols, rows);
+        self.decorate(&mut snap, offset, shift);
         snap
     }
 
-    fn cursor_snapshot(&self, offset: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
+    fn cursor_snapshot(&self, offset: i32, shift: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
         if self.cursor_shape == CursorShape::Hidden
             || !self.term.mode().contains(TermMode::SHOW_CURSOR)
         {
             return None;
         }
         let Point { line, column } = self.term.grid().cursor.point;
-        let row_i = line.0 + offset;
+        let row_i = line.0 + offset + shift;
         if row_i < 0 || row_i as usize >= rows as usize || column.0 >= cols as usize {
             return None;
         }
@@ -813,8 +856,10 @@ mod tests {
     fn selection_yields_text() {
         let mut t = terminal(20, 3);
         t.process(b"hello world");
-        t.selection_start(0, 0, false);
-        t.selection_update(4, 0, true); // through the right half of column 4
+        // The line is bottom-anchored; select on the row the cursor landed on.
+        let row = t.snapshot().cursor.expect("cursor visible").row;
+        t.selection_start(0, row, false);
+        t.selection_update(4, row, true); // through the right half of column 4
         assert_eq!(t.selection_text().as_deref(), Some("hello"));
     }
 
@@ -822,12 +867,13 @@ mod tests {
     fn snapshot_flags_selected_cells() {
         let mut t = terminal(20, 3);
         t.process(b"hello");
-        t.selection_start(0, 0, false);
-        t.selection_update(4, 0, true);
+        let row = t.snapshot().cursor.expect("cursor visible").row;
+        t.selection_start(0, row, false);
+        t.selection_update(4, row, true);
         let snap = t.snapshot();
-        assert!(snap.cell(0, 0).unwrap().flags.contains(CellFlags::SELECTED));
-        assert!(snap.cell(4, 0).unwrap().flags.contains(CellFlags::SELECTED));
-        assert!(!snap.cell(6, 0).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(snap.cell(0, row).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(snap.cell(4, row).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(!snap.cell(6, row).unwrap().flags.contains(CellFlags::SELECTED));
         assert_eq!(snap.selection_color, Palette::default().selection);
     }
 
@@ -835,11 +881,59 @@ mod tests {
     fn clearing_selection_drops_text() {
         let mut t = terminal(20, 3);
         t.process(b"hello");
-        t.selection_start(0, 0, false);
-        t.selection_update(4, 0, true);
+        let row = t.snapshot().cursor.expect("cursor visible").row;
+        t.selection_start(0, row, false);
+        t.selection_update(4, row, true);
         assert!(t.selection_text().is_some());
         t.selection_clear();
         assert!(t.selection_text().is_none());
+    }
+
+    #[test]
+    fn live_prompt_anchors_to_the_bottom() {
+        let mut t = terminal(20, 6);
+        t.process(b"$ ");
+        let snap = t.snapshot();
+        let cur = snap.cursor.expect("cursor visible");
+        assert_eq!(cur.row, 5, "the live prompt rests on the bottom row");
+        assert_eq!(snap.cell(0, 5).unwrap().c, '$');
+        assert!(snap.cell(0, 0).unwrap().is_blank(), "rows above are blank padding");
+    }
+
+    #[test]
+    fn clear_keeps_the_prompt_at_the_bottom() {
+        let mut t = terminal(20, 6);
+        t.process(b"one\r\ntwo\r\n$ ");
+        // What `clear` emits: home the cursor and erase the screen + scrollback.
+        t.process(b"\x1b[H\x1b[2J\x1b[3J$ ");
+        let snap = t.snapshot();
+        assert_eq!(
+            snap.cursor.expect("cursor visible").row,
+            5,
+            "clear leaves the prompt anchored to the bottom"
+        );
+        assert_eq!(snap.cell(0, 5).unwrap().c, '$');
+    }
+
+    #[test]
+    fn full_screen_output_is_not_shifted() {
+        // Once content fills the grid there is no padding: the first line sits on
+        // the top row and the last on the bottom, exactly like a normal terminal.
+        let mut t = terminal(20, 3);
+        t.process(b"a\r\nb\r\nc");
+        let snap = t.snapshot();
+        assert_eq!(snap.cell(0, 0).unwrap().c, 'a');
+        assert_eq!(snap.cell(0, 2).unwrap().c, 'c');
+        assert_eq!(snap.cursor.expect("cursor visible").row, 2);
+    }
+
+    #[test]
+    fn alt_screen_fills_from_the_top() {
+        let mut t = terminal(20, 4);
+        t.process(b"\x1b[?1049h"); // enter the alternate screen (full-screen apps)
+        t.process(b"x");
+        let snap = t.snapshot();
+        assert_eq!(snap.cell(0, 0).unwrap().c, 'x', "alt screen is not bottom-anchored");
     }
 
     #[test]
@@ -931,14 +1025,20 @@ mod tests {
         assert_eq!(b.exit_code, Some(1));
 
         let snap = t.snapshot();
-        let id = snap.rows_decor[0].block_id;
+        // The block is anchored to the bottom, so its prompt row is the first
+        // non-padding row; the blank rows above it carry no decoration.
+        let top = snap
+            .rows_decor
+            .iter()
+            .position(|d| d.block_top)
+            .expect("a block-top row");
+        let id = snap.rows_decor[top].block_id;
         assert_ne!(id, 0);
-        assert!(snap.rows_decor[0].failed);
-        assert!(snap.rows_decor[0].block_top, "prompt row is the block top");
-        assert!(snap.rows_decor[1].failed);
-        assert!(!snap.rows_decor[1].block_top);
-        // Rows past the block's end carry no decoration.
-        assert_eq!(snap.rows_decor[5].block_id, 0);
+        assert!(snap.rows_decor[top].failed);
+        assert!(snap.rows_decor[top].block_top, "prompt row is the block top");
+        assert!(snap.rows_decor[top + 1].failed);
+        assert!(!snap.rows_decor[top + 1].block_top);
+        assert_eq!(snap.rows_decor[0].block_id, 0);
     }
 
     #[test]
