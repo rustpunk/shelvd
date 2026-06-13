@@ -1,0 +1,35 @@
+# shelvd configuration — copy to ~/.config/shelvd/config.toml and edit.
+#
+# Every key is optional and overrides only itself; omitted keys keep shelvd's
+# built-in defaults (the warm "shelvd_dark" theme). Point shelvd at a different
+# file with the SHELVD_CONFIG environment variable.
+
+# Shell to launch. Omit to use $SHELL / the platform default.
+# shell = "/usr/bin/zsh"
+
+# Scrollback lines to retain.
+# scrollback = 10000
+
+[theme]
+# font_family = "JetBrains Mono"   # omit for a system monospace
+# font_size = 15.0                 # logical pixels
+# line_height = 1.25               # multiplier applied to font_size
+# cursor_shape = "block"           # block | beam | underline | hidden
+# padding = { x = 8.0, y = 8.0 }   # inner padding in logical pixels
+
+[theme.palette]
+# Special slots (CSS hex: #rgb, #rrggbb, or #rrggbbaa).
+# foreground  = "#cfc4b4"
+# background  = "#14110f"
+# cursor      = "#e6a86c"
+# cursor_text = "#14110f"   # glyph under a block cursor
+# selection   = "#3a3228"
+
+# The 16 base ANSI colors (indices 0..16). Must be exactly 16 if present; the
+# 256-color cube and grayscale ramp are regenerated from these.
+# ansi = [
+#   "#14110f", "#c25f5f", "#7f9a6a", "#c9a45b",  # black red green yellow
+#   "#6f8aa6", "#9a7aa6", "#6fa6a0", "#cfc4b4",  # blue magenta cyan white
+#   "#4a4137", "#e07a6f", "#9ec27e", "#e6c178",  # bright black..yellow
+#   "#8fb0d0", "#c0a0cc", "#8fd0c8", "#f0e6d6",  # bright blue..white
+# ]

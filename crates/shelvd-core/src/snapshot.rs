@@ -43,8 +43,10 @@ impl CellSnapshot {
     }
 }
 
-/// How the cursor is drawn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How the cursor is drawn. Deserializes from `"block"`/`"beam"`/`"underline"`/
+/// `"hidden"` in config files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CursorShape {
     Block,
     Beam,

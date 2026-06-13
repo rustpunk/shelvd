@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app = App::new(proxy, Config::default());
+    let mut app = App::new(proxy, Config::load_default());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
