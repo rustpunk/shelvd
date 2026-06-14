@@ -495,14 +495,23 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if state.overlay.is_some() {
-                    // Scroll the overlay list instead of the terminal.
-                    let down = matches!(
-                        delta,
-                        MouseScrollDelta::LineDelta(_, y) if y < 0.0
-                    ) || matches!(delta, MouseScrollDelta::PixelDelta(p) if p.y < 0.0);
-                    if let Some(ov) = state.overlay.as_mut() {
-                        ov.move_selection(if down { 1 } else { -1 });
-                        state.window.request_redraw();
+                    // Scroll the overlay list instead of the terminal, honoring
+                    // the delta magnitude the same way the terminal-scroll path
+                    // below does (so a fast flick moves several rows, not one).
+                    // Positive `notches` means scrolling up, which moves the
+                    // highlight up — hence the negated step.
+                    let notches = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
+                        MouseScrollDelta::PixelDelta(p) => {
+                            let ch = state.renderer.cell_metrics().height.max(1.0);
+                            (p.y as f32 / ch).round() as i32
+                        }
+                    };
+                    if notches != 0 {
+                        if let Some(ov) = state.overlay.as_mut() {
+                            ov.move_selection(-notches);
+                            state.window.request_redraw();
+                        }
                     }
                     return;
                 }
@@ -868,40 +877,37 @@ fn copy_block(state: &mut State) {
 
 /// Route a key press to the open overlay: query edits, navigation, accept/cancel.
 fn handle_overlay_key(state: &mut State, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+    // Escape and Enter act on the overlay slot itself (clear it / take it, then
+    // run the chosen action), so they're handled before the shared binding.
     match &event.logical_key {
-        Key::Named(NamedKey::Escape) => state.overlay = None,
-        Key::Named(NamedKey::Enter) => {
-            let action = state.overlay.as_ref().and_then(|o| o.selected_action());
+        Key::Named(NamedKey::Escape) => {
             state.overlay = None;
+            state.window.request_redraw();
+            return;
+        }
+        Key::Named(NamedKey::Enter) => {
+            let action = state.overlay.take().and_then(|o| o.selected_action());
             if let Some(action) = action {
                 run_action(state, event_loop, action);
             }
+            state.window.request_redraw();
+            return;
         }
-        Key::Named(NamedKey::ArrowUp) => {
-            if let Some(o) = state.overlay.as_mut() {
-                o.move_selection(-1);
-            }
-        }
-        Key::Named(NamedKey::ArrowDown) => {
-            if let Some(o) = state.overlay.as_mut() {
-                o.move_selection(1);
-            }
-        }
-        Key::Named(NamedKey::Backspace) => {
-            if let Some(o) = state.overlay.as_mut() {
-                o.backspace();
-            }
-        }
-        Key::Named(NamedKey::Space) => {
-            if let Some(o) = state.overlay.as_mut() {
-                o.input_char(' ');
-            }
-        }
+        _ => {}
+    }
+
+    // Everything else edits the live overlay; bind it mutably just once.
+    let Some(o) = state.overlay.as_mut() else {
+        return;
+    };
+    match &event.logical_key {
+        Key::Named(NamedKey::ArrowUp) => o.move_selection(-1),
+        Key::Named(NamedKey::ArrowDown) => o.move_selection(1),
+        Key::Named(NamedKey::Backspace) => o.backspace(),
+        Key::Named(NamedKey::Space) => o.input_char(' '),
         Key::Character(s) => {
-            if let Some(o) = state.overlay.as_mut() {
-                for c in s.chars() {
-                    o.input_char(c);
-                }
+            for c in s.chars() {
+                o.input_char(c);
             }
         }
         _ => {}

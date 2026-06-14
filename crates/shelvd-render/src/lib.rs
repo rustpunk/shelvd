@@ -714,9 +714,12 @@ impl Renderer {
 
     /// Compute the overlay panel's row count. The app has already windowed the
     /// items to what fits ([`overlay_capacity`](Self::overlay_capacity)), so the
-    /// panel is simply the query row plus the visible items.
+    /// panel is simply the query row plus the visible items — or, when nothing
+    /// matched, the query row plus the single "no matches" row so it isn't
+    /// clipped off the bottom of the panel.
     fn overlay_layout(&self, ov: &Overlay) -> OverlayLayout {
-        OverlayLayout { panel_rows: 1 + ov.items.len() as u16 }
+        let list_rows = if ov.no_matches { 1 } else { ov.items.len() };
+        OverlayLayout { panel_rows: 1 + list_rows as u16 }
     }
 
     /// Append the overlay's solid quads: panel, selection highlight, query
@@ -737,10 +740,14 @@ impl Renderer {
             rects.push(Rect { x: 0.0, y, w: width, h: ch, color: c.sel_bg.to_linear_f32() });
         }
 
-        // A thin accent bar where the next typed character will land.
-        let cursor_col = ov.prompt.chars().count() + 1 + ov.query.chars().count();
-        let cx = pad.x + cursor_col as f32 * cw;
-        rects.push(Rect { x: cx, y: tb + pad.y, w: (2.0 * self.scale).max(1.0), h: ch, color: c.accent.to_linear_f32() });
+        // A thin accent bar where the next typed character will land. The column
+        // comes from the app (display-width aware, so wide glyphs don't drift
+        // it). Suppressed while the query is empty so it doesn't overdraw the
+        // "type to search…" placeholder that occupies the same cells.
+        if !ov.query.is_empty() {
+            let cx = pad.x + ov.query_caret_col as f32 * cw;
+            rects.push(Rect { x: cx, y: tb + pad.y, w: (2.0 * self.scale).max(1.0), h: ch, color: c.accent.to_linear_f32() });
+        }
 
         let rule_h = self.scale.max(1.0);
         rects.push(Rect { x: 0.0, y: tb + panel_h - rule_h, w: width, h: rule_h, color: c.accent.to_linear_f32() });
@@ -761,6 +768,13 @@ impl Renderer {
             push_span(&mut text, &mut spans, &ov.query, c.fg, false);
         }
 
+        if ov.no_matches {
+            // A single dim row so an empty filter gives feedback rather than a
+            // blank panel where Enter is a silent no-op.
+            push_span(&mut text, &mut spans, "\n", c.fg, false);
+            push_span(&mut text, &mut spans, "  ", c.dim, false);
+            push_span(&mut text, &mut spans, "no matches", c.dim, false);
+        }
         for (idx, item) in ov.items.iter().enumerate() {
             push_span(&mut text, &mut spans, "\n", c.fg, false);
             let selected = Some(idx) == ov.selected_visible;

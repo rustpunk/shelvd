@@ -2305,6 +2305,7 @@ dependencies = [
  "shelvd-pty",
  "shelvd-render",
  "shelvd-term",
+ "unicode-width",
  "winit",
 ]
 
