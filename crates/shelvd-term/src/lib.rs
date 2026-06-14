@@ -409,14 +409,20 @@ impl Terminal {
         self.scroll_top_abs.unwrap_or(self.abs_base)
     }
 
-    /// Oldest absolute line the composite can render: the older of the live grid's
-    /// retained-history floor and the first block's prompt. Frozen buffers can
-    /// outlive the grid's own scrollback, so the first block may sit below the
-    /// grid floor. Always `<= abs_base`, so it is a safe clamp lower bound.
+    /// Oldest absolute line the composite can render. With command blocks the
+    /// first block's prompt is the floor: the frozen buffers are authoritative for
+    /// finished output (and outlive the grid's own scrollback, so the first block
+    /// may sit below the grid floor), and after a reflow the raw grid history below
+    /// the re-anchored stack holds the same blocks at stale positions — so it must
+    /// not be reachable. Without blocks the live grid's retained-history floor
+    /// applies. Always `<= abs_base`, so it is a safe clamp lower bound.
     fn composite_oldest_abs(&self) -> i64 {
-        let grid_oldest = self.abs_base - self.term.grid().history_size() as i64;
-        let frozen_oldest = self.blocks.first().map_or(i64::MAX, |b| b.prompt_line);
-        grid_oldest.min(frozen_oldest)
+        match self.blocks.first() {
+            // Clamp to `abs_base`: a block whose prompt sits inside the active
+            // region (everything fits on one screen) leaves nothing to scroll up to.
+            Some(b) => b.prompt_line.min(self.abs_base),
+            None => self.abs_base - self.term.grid().history_size() as i64,
+        }
     }
 
     /// Park the composite so absolute line `abs` is the top visible row, clamped to
@@ -560,18 +566,25 @@ impl Terminal {
             cols: self.dims.cols,
             cells,
             logical_lines,
+            blank: CellSnapshot::blank(self.palette.foreground, self.palette.background),
         })
     }
 
-    /// Drop blocks whose whole range has scrolled out of retained history, plus
-    /// a hard cap so a long-lived session can't grow the list without bound.
+    /// Drop blocks whose whole range has scrolled out of retained history *and*
+    /// have no frozen buffer to render them from, plus a hard cap so a long-lived
+    /// session can't grow the list without bound. Frozen blocks are authoritative
+    /// for finished output and outlive the grid's own scrollback, so they survive
+    /// the history floor and are bounded only by `MAX_BLOCKS`.
     fn prune_blocks(&mut self) {
         const MAX_BLOCKS: usize = 2000;
         let oldest = self.abs_base - self.term.grid().history_size() as i64;
         let mut keep_from = 0;
         for i in 0..self.blocks.len() {
             let end = self.blocks.get(i + 1).map_or(i64::MAX, |b| b.prompt_line);
-            if end <= oldest {
+            // A frozen-backed block (index-aligned by id) can still render once its
+            // rows leave the grid, so the history floor doesn't evict it.
+            let frozen_backed = self.frozen.get(i).is_some_and(|f| f.id == self.blocks[i].id);
+            if end <= oldest && !frozen_backed {
                 keep_from = i + 1;
             } else {
                 break;
@@ -695,16 +708,82 @@ impl Terminal {
         self.dims = TermDimensions::new(cols, rows);
         self.term.resize(self.dims);
         // Reflow renumbers lines; rebase the scroll baseline to the new history
-        // depth so the next chunk's delta is measured from solid ground. Block
-        // anchors don't survive reflow (we keep a single grid, not Warp's
-        // per-block grids), so drop them — and the frozen buffers captured at the
-        // old width with them — and let new commands re-establish them. (Reflowing
-        // the frozen buffers to the new width instead is the per-block-reflow step.)
+        // depth so the next chunk's delta is measured from solid ground.
         self.prev_history = self.term.grid().history_size();
         self.prev_alt = self.term.mode().contains(TermMode::ALT_SCREEN);
-        self.blocks.clear();
-        self.frozen.clear();
         self.pending_cwd = None;
+        // Re-wrap each frozen block's logical lines to the new width and re-anchor
+        // the block stack against the reflowed grid, so command-block scrollback
+        // survives the resize (per-block reflow) instead of being discarded.
+        self.reanchor_blocks_for_reflow(cols);
+    }
+
+    /// Reflow the frozen buffers to `cols` and rebuild the block anchors against
+    /// the reflowed live grid. alacritty's reflow renumbers the grid (and so
+    /// invalidates the absolute anchors the composite addresses blocks by), and
+    /// there's no way to recover where the old OSC marks landed — so re-derive the
+    /// anchors: stack the (reflowed) frozen blocks contiguously, ending just above
+    /// the open block's prompt, so finished output renders from the frozen buffers
+    /// and the live grid only backs the active region. Falls back to clearing the
+    /// whole block model if the `blocks`/`frozen` index-alignment invariant is
+    /// somehow broken (the safe pre-reflow behavior).
+    fn reanchor_blocks_for_reflow(&mut self, cols: u16) {
+        if self.blocks.is_empty() {
+            // Nothing anchored (e.g. no shell integration); the live grid alone
+            // backs scrollback and alacritty has already reflowed it.
+            self.frozen.clear();
+            return;
+        }
+        // The open (unfinished) block, if any, is always the last one; every
+        // finished block ahead of it has an index-aligned frozen buffer.
+        let has_open = matches!(self.blocks.last(), Some(b) if b.end_line.is_none());
+        let finished = self.blocks.len() - usize::from(has_open);
+        if finished != self.frozen.len()
+            || self.blocks.iter().zip(&self.frozen).any(|(b, f)| b.id != f.id)
+        {
+            self.blocks.clear();
+            self.frozen.clear();
+            return;
+        }
+
+        for fb in &mut self.frozen {
+            fb.reflow(cols);
+        }
+
+        // Where the open block's content begins in the reflowed active region.
+        // At a resting prompt the prompt sits on the cursor's line, so the frozen
+        // stack ends just above it (and covers the on-screen finished tails, which
+        // therefore render from frozen — no double-draw). While a command runs (or
+        // in the brief gap with no open block) the prompt position is unrecoverable,
+        // so anchor at the active-region top.
+        let base = if has_open && !self.command_running() && !self.alt_screen() {
+            self.abs_base + i64::from(self.term.grid().cursor.point.line.0.max(0))
+        } else {
+            self.abs_base
+        };
+
+        // Stack the finished blocks upward from `base - 1`, newest first.
+        let mut end = base - 1;
+        for i in (0..self.frozen.len()).rev() {
+            let height = self.frozen[i].rows().max(1) as i64;
+            let start = end - (height - 1);
+            let out_off = self.blocks[i]
+                .output_line
+                .map(|o| (o - self.blocks[i].prompt_line).clamp(0, height - 1));
+            self.blocks[i].prompt_line = start;
+            self.blocks[i].output_line = out_off.map(|off| start + off);
+            self.blocks[i].end_line = Some(end);
+            end = start - 1;
+        }
+
+        // Pin the open block (if any) to the active-region boundary it now owns.
+        if has_open {
+            if let Some(b) = self.blocks.last_mut() {
+                let out_off = b.output_line.map(|o| (o - b.prompt_line).max(0));
+                b.prompt_line = base;
+                b.output_line = out_off.map(|off| base + off);
+            }
+        }
     }
 
     /// Channel of terminal-generated side effects.
@@ -1909,15 +1988,64 @@ mod tests {
     }
 
     #[test]
-    fn resize_drops_frozen_blocks_in_lockstep() {
-        let mut t = terminal(20, 4);
-        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07a\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+    fn resize_reflows_frozen_blocks() {
+        let mut t = terminal(20, 6);
+        // One finished block whose 12-char output fits on a single 20-wide row.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07echo\r\n\x1b]133;C\x07hello world!\r\n\x1b]133;D;0\x07");
         assert_eq!(t.frozen_blocks().len(), 1);
-        // Reflow renumbers lines, so block anchors — and the buffers tied to them —
-        // are dropped together.
-        t.resize(30, 6);
-        assert!(t.blocks().is_empty(), "blocks dropped on resize");
-        assert!(t.frozen_blocks().is_empty(), "frozen dropped in lockstep");
+        assert_eq!(t.frozen_blocks()[0].cols, 20);
+
+        // Narrow to 8 columns: the block survives, re-wrapped to the new width.
+        t.resize(8, 6);
+        let f = t.frozen_blocks();
+        assert_eq!(f.len(), 1, "frozen block survives the resize");
+        assert_eq!(f[0].cols, 8, "re-wrapped to the new width");
+        // The unwrapped text is the untouched source of truth across the reflow.
+        let logical: String = f[0]
+            .logical_lines
+            .iter()
+            .map(|l| l.iter().map(|c| c.c).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(logical.contains("hello world!"), "output text preserved: {logical:?}");
+        // The 12-char line now spans more than one 8-wide visual row.
+        assert!(f[0].rows() >= 2, "the long line re-wrapped onto multiple rows");
+    }
+
+    #[test]
+    fn frozen_history_survives_resize_at_a_resting_prompt() {
+        let mut t = terminal(20, 4);
+        // Two finished blocks with distinctive output, then a freshly drawn prompt
+        // we sit at (resting — no running command).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07AAA\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07BBB\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(!t.command_running(), "resting at a prompt");
+        assert_eq!(t.frozen_blocks().len(), 2);
+
+        // Resize narrower: the block history survives and re-wraps to the new width.
+        t.resize(10, 4);
+        assert_eq!(t.frozen_blocks().len(), 2, "history survives the resize");
+        assert!(t.frozen_blocks().iter().all(|f| f.cols == 10), "each block re-wrapped");
+
+        // Scrolled to the top, the oldest block's output still renders — sourced
+        // from its reflowed frozen buffer, not the (renumbered) live grid.
+        t.scroll_to_top();
+        assert!(t.is_scrolled(), "parked in history after the resize");
+        let hist: String = t.snapshot().cells.iter().map(|c| c.c).collect();
+        assert!(hist.contains("AAA"), "oldest block survives resize + reflow: {hist:?}");
+    }
+
+    #[test]
+    fn resize_with_no_blocks_clears_cleanly() {
+        // No shell integration: the live grid alone backs scrollback, and resize
+        // must not leave a stale frozen list behind.
+        let mut t = terminal(20, 4);
+        t.process(b"plain output\r\nno markers here\r\n");
+        assert!(t.blocks().is_empty());
+        t.resize(10, 6);
+        assert!(t.blocks().is_empty());
+        assert!(t.frozen_blocks().is_empty());
     }
 
     #[test]
