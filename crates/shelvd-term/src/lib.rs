@@ -17,7 +17,7 @@ use alacritty_terminal::Term;
 
 use std::time::Instant;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use shelvd_core::{
     CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba, RowDecor,
@@ -60,6 +60,20 @@ pub enum TermEvent {
     WorkingDirectory(String),
     /// The child process exited.
     Exit,
+}
+
+/// What the editable compose band should display this frame: the command being
+/// typed ahead and how many commands are already queued behind it. The event
+/// loop pushes this with [`Terminal::set_compose`] while compose-next mode is
+/// engaged; `None` is the resting state, where the band (if any) mirrors the
+/// running command instead. The caret column is derived here from `text` (the
+/// line is end-anchored), keeping all band layout inside this crate.
+#[derive(Clone, Debug, Default)]
+pub struct ComposeBand {
+    /// The command composed so far.
+    pub text: String,
+    /// Commands queued ahead of this one, surfaced as an "N queued" hint.
+    pub queued: usize,
 }
 
 /// Grid dimensions handed to alacritty. `total_lines == screen_lines`; the grid
@@ -144,6 +158,10 @@ pub struct Terminal {
     /// byte the grid is empty; suppressing the cursor until then avoids a lone
     /// cursor flashing at the bottom of an otherwise blank, bottom-anchored screen.
     seen_output: bool,
+    /// Compose-next mode payload, pushed by the app. While set, the input band is
+    /// forced (even at a prompt) and rendered as the editable compose line rather
+    /// than the locked running-command mirror. `None` is the resting state.
+    compose: Option<ComposeBand>,
 }
 
 impl Terminal {
@@ -176,6 +194,7 @@ impl Terminal {
             cursor_shape,
             dims,
             seen_output: false,
+            compose: None,
         }
     }
 
@@ -585,6 +604,27 @@ impl Terminal {
         self.display_shift().max(0) as u16
     }
 
+    // --- compose-next mode ---------------------------------------------------
+
+    /// Engage / update / exit compose-next mode. While `Some`, the terminal
+    /// reserves a bottom band even at a prompt and renders the editable buffer
+    /// (with a caret and an "N queued" hint) in place of the locked
+    /// running-command mirror; `None` returns the band to its resting state. The
+    /// app owns the authoritative edit state and pushes a fresh view here on
+    /// every change, so layout ([`Self::display_shift`]) and rendering
+    /// ([`Self::fill_input_band`]) stay derived from one source.
+    pub fn set_compose(&mut self, compose: Option<ComposeBand>) {
+        self.compose = compose;
+    }
+
+    /// Whether a command is running at the live edge: shell integration reported
+    /// its output start (OSC 133;C) but not yet its finish (133;D). Compose-next
+    /// mode only engages while this holds — there must be a running command to
+    /// type ahead of — so the app gates the keybinding on it.
+    pub fn command_running(&self) -> bool {
+        matches!(self.blocks.last(), Some(b) if b.output_line.is_some() && b.end_line.is_none())
+    }
+
     // --- terminal modes ------------------------------------------------------
 
     /// Whether the program enabled bracketed paste (DEC 2004).
@@ -698,19 +738,21 @@ impl Terminal {
 
     /// Rows to reserve at the bottom for the pinned input band. One while a shell
     /// command is running at the live edge of the main screen — so its output
-    /// scrolls above a fixed strip — and zero everywhere else: at a prompt the
-    /// prompt *is* the bottom line (today's anchor, [`Self::BOTTOM_GUTTER`]), and
-    /// the band is ruled out without shell integration, on the alt screen, and in
-    /// scrolled-back history.
+    /// scrolls above a fixed strip — or while compose-next mode is engaged (so the
+    /// editable line persists across the brief prompt between queued commands), and
+    /// zero everywhere else: at a resting prompt the prompt *is* the bottom line
+    /// (today's anchor, [`Self::BOTTOM_GUTTER`]), and the band is ruled out without
+    /// shell integration, on the alt screen, and in scrolled-back history.
     fn input_band_rows(&self) -> i32 {
         // Need at least one row above the band; on a degenerate 1-row grid
         // `display_shift_with` also bails, so keep the two in agreement.
         if self.dims.rows <= 1 || self.is_scrolled() || self.alt_screen() {
             return 0;
         }
-        match self.blocks.last() {
-            Some(b) if b.output_line.is_some() && b.end_line.is_none() => 1,
-            _ => 0,
+        if self.compose.is_some() || self.command_running() {
+            1
+        } else {
+            0
         }
     }
 
@@ -815,12 +857,13 @@ impl Terminal {
         snap
     }
 
-    /// Paint the running-command band and flag it on the snapshot. The band
-    /// exists only while a command is running (see [`Self::input_band_rows`]); at
-    /// a prompt the bottom row is the live prompt itself, so this is a no-op and
-    /// the snapshot keeps its plain bottom-anchor. The label mirrors the executed
-    /// prompt line from the block above, dimmed to read as a locked, non-editable
-    /// strip while the command holds the input.
+    /// Paint the input band and flag it on the snapshot. The band exists while a
+    /// command is running (see [`Self::input_band_rows`]) or while compose-next
+    /// mode is engaged; at a resting prompt the bottom row is the live prompt
+    /// itself, so this is a no-op and the snapshot keeps its plain bottom-anchor.
+    /// At rest the band mirrors the executed prompt line from the block above,
+    /// dimmed to read as a locked, non-editable strip; while composing it shows
+    /// the editable buffer instead (see [`Self::fill_compose_band`]).
     fn fill_input_band(&self, snap: &mut GridSnapshot, band: i32) {
         if band <= 0 {
             return;
@@ -839,14 +882,63 @@ impl Terminal {
             }
             snap.rows_decor[row] = RowDecor::default();
         }
-        // The executed prompt line (prompt prefix + command), mirroring the block
-        // above; fall back to a generic marker if it wasn't captured.
+        snap.input_band_rows = band as u16;
+        if self.compose.is_some() {
+            self.fill_compose_band(snap, band_top);
+            return;
+        }
+        // Resting band: the executed prompt line (prompt prefix + command),
+        // mirroring the block above; fall back to a generic marker if it wasn't
+        // captured.
         let label = match self.blocks.last() {
             Some(b) if !b.prompt_command.is_empty() => b.prompt_command.as_str(),
             _ => "running…",
         };
         write_row(&mut snap.cells[band_top * cols..(band_top + 1) * cols], label, blank);
-        snap.input_band_rows = band as u16;
+    }
+
+    /// Render the editable compose-next line into the band's top row: the typed
+    /// command in the normal foreground (so it reads as live input, not the dim
+    /// locked mirror), a beam caret at its end, and a right-aligned dim "N queued"
+    /// hint when commands wait behind it. The line is end-anchored: if it grows
+    /// wider than the band, only its tail (where the caret sits) is shown.
+    fn fill_compose_band(&self, snap: &mut GridSnapshot, band_top: usize) {
+        let Some(compose) = self.compose.as_ref() else {
+            return;
+        };
+        let cols = snap.cols as usize;
+        let bg = self.palette.background;
+        let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
+        let dim_blank = CellSnapshot::blank(self.palette.indexed(8), bg);
+
+        // A right-aligned hint of how many commands are queued behind this one.
+        let hint = (compose.queued > 0).then(|| format!("{} queued", compose.queued));
+        let hint_w = hint.as_deref().map_or(0, UnicodeWidthStr::width);
+        // Reserve the hint's columns plus a gap, and always a trailing column for
+        // the caret, so the editable text never collides with either.
+        let gap = if hint_w > 0 { hint_w + 2 } else { 1 };
+        let text_cols = cols.saturating_sub(gap);
+
+        let shown = visible_tail(&compose.text, text_cols);
+        let row = &mut snap.cells[band_top * cols..(band_top + 1) * cols];
+        write_row(row, shown, fg_blank);
+        if let Some(hint) = hint {
+            if hint_w < cols {
+                write_row(&mut row[cols - hint_w..], &hint, dim_blank);
+            }
+        }
+
+        // A beam caret reads as a text-insertion point, distinct from the block
+        // cursor the shell draws; place it just past the shown text. This runs
+        // after `cursor_snapshot` set the grid cursor, so it takes precedence.
+        let caret = UnicodeWidthStr::width(shown).min(text_cols) as u16;
+        snap.cursor = Some(CursorSnapshot {
+            col: caret,
+            row: band_top as u16,
+            shape: CursorShape::Beam,
+            color: self.palette.cursor,
+            text_color: self.palette.cursor_text,
+        });
     }
 
     fn cursor_snapshot(&self, offset: i32, shift: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
@@ -934,6 +1026,24 @@ fn write_row(cells: &mut [CellSnapshot], text: &str, blank: CellSnapshot) {
         }
         col += w;
     }
+}
+
+/// The trailing slice of `text` whose display width fits in `max` columns, so an
+/// end-anchored caret stays visible once the composed line outgrows the band. A
+/// wide glyph that would straddle the boundary is dropped whole (its two columns
+/// don't fit), never split.
+fn visible_tail(text: &str, max: usize) -> &str {
+    let mut width = 0;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + w > max {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    &text[start..]
 }
 
 /// Which half of a cell a pixel fell on, as an alacritty selection side.
@@ -1326,5 +1436,72 @@ mod tests {
         assert_eq!(snap.input_band_rows, 0, "a prompt keeps the plain bottom-anchor");
         let cur = snap.cursor.expect("cursor visible");
         assert_eq!(snap.cell(0, cur.row).unwrap().c, '$');
+    }
+
+    #[test]
+    fn command_running_tracks_output_to_finish() {
+        let mut t = terminal(20, 6);
+        assert!(!t.command_running(), "idle before any command");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07go\r\n\x1b]133;C\x07");
+        assert!(t.command_running(), "output started, not yet finished");
+        t.process(b"out\r\n\x1b]133;D;0\x07");
+        assert!(!t.command_running(), "command finished");
+    }
+
+    #[test]
+    fn compose_band_shows_the_editable_buffer_and_caret() {
+        let mut t = terminal(20, 6);
+        t.process(b"$ "); // a resting prompt — no running command
+        t.set_compose(Some(ComposeBand { text: "ls -la".into(), queued: 0 }));
+        let snap = t.snapshot();
+        // Composing forces a band even at a prompt, so the keybinding always has a
+        // visible surface to edit.
+        assert_eq!(snap.input_band_rows, 1, "compose forces a band");
+        let last = snap.rows - 1;
+        assert!(row_text(&snap, last).starts_with("ls -la"), "band shows the composed text");
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last, "the caret sits on the band row");
+        assert_eq!(cur.col, 6, "the caret rests just past the composed text");
+        assert_eq!(cur.shape, CursorShape::Beam, "a beam reads as a text-insertion point");
+    }
+
+    #[test]
+    fn compose_band_overrides_the_locked_mirror_and_counts_the_queue() {
+        let mut t = terminal(30, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        // While running and not composing, the band mirrors the executed command.
+        assert!(row_text(&t.snapshot(), 5).contains("sleep 9"), "resting band mirrors the command");
+        t.set_compose(Some(ComposeBand { text: "next".into(), queued: 2 }));
+        let line = row_text(&t.snapshot(), 5);
+        assert!(line.contains("next"), "editable buffer replaces the mirror: {line:?}");
+        assert!(!line.contains("sleep"), "the locked mirror is gone while composing: {line:?}");
+        assert!(line.contains("2 queued"), "the queue depth is surfaced: {line:?}");
+    }
+
+    #[test]
+    fn compose_band_yields_to_scrollback() {
+        let mut t = terminal(20, 3);
+        for i in 0..10 {
+            t.process(format!("l{i}\r\n").as_bytes());
+        }
+        t.set_compose(Some(ComposeBand { text: "x".into(), queued: 0 }));
+        t.scroll_lines(3);
+        // Scrolled history lays out top-to-bottom like a normal terminal; the band
+        // (and its forced reserve) yields, matching `viewport_to_point`.
+        assert_eq!(t.snapshot().input_band_rows, 0, "no band in scrolled history");
+    }
+
+    #[test]
+    fn compose_band_shows_the_caret_tail_when_it_overflows() {
+        // A composed line wider than the grid keeps its end (where the caret is)
+        // visible, dropping the head — the caret never leaves the band.
+        let mut t = terminal(8, 4);
+        t.set_compose(Some(ComposeBand { text: "abcdefghij".into(), queued: 0 }));
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let line = row_text(&snap, last);
+        assert!(line.trim_end().ends_with('j'), "the tail of the line is shown: {line:?}");
+        let cur = snap.cursor.expect("a caret in the band");
+        assert!(cur.col < snap.cols, "the caret stays within the band: {}", cur.col);
     }
 }
