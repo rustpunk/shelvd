@@ -58,6 +58,20 @@ today's idle look).
 **Recommendation: Approach P** as the foundation; revisit O's richer editor under
 #19 once the pinned-band layout is solid.
 
+## CORRECTION (2026-06-14, after first review)
+
+The first cut **top-anchored** the output region (clamped `display_shift <= 0`),
+which removed the climb but left a **gap**: short at-rest output floated at the top
+with empty space down to the pinned prompt. The owner wants it to "work like a
+traditional terminal — fill bottom→up then scroll as it grows." The fix:
+**keep the bottom-anchor** for the output (`display_shift_with` uses `.max(-band)`)
+and rely on the **input-line relocation alone** to satisfy #7's "prompt holds
+still." The relocated input sits in the pinned band; the output below hugs the
+band, fills upward, and scrolls — exactly traditional behavior, no gap, and the
+*input* never moves (the committed command line scrolls like any output, which the
+owner confirmed is what they want). The fill-glide stays live (bottom-anchor is
+back), so follow-up #27 is moot.
+
 ## Increment plan (Approach P) — each a gated PR
 
 1. **Top-anchor the output region + always-present empty band.** Remove the

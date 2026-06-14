@@ -757,11 +757,10 @@ impl Terminal {
         self.scroll_top_abs.is_some()
     }
 
-    /// Blank rows currently reserved *above* the output region. Under the
-    /// persistent input line the output is top-anchored and never reserves rows
-    /// above itself ([`Self::display_shift`] is clamped `<= 0`), so this is always
-    /// `0` now — the app's fill-transition glide it once fed has gone dormant
-    /// (tracked for removal). Kept as a stable accessor while that lands.
+    /// Blank rows currently reserved above the output region by the bottom-anchor
+    /// layout. The app watches this for the smooth fill transition: when a burst of
+    /// output makes it shrink, the output glides up by that many cell-heights in one
+    /// frame. (The pinned input band is unaffected; only the output region moves.)
     pub fn anchor_shift(&self) -> u16 {
         self.display_shift().max(0) as u16
     }
@@ -875,16 +874,14 @@ impl Terminal {
     /// collapse into a "+N more" line, so a long queue can't swallow the screen.
     const MAX_QUEUE_ROWS: i32 = 6;
 
-    /// Vertical offset of the output region at the live edge, in rows. The live
-    /// input line is relocated into the bottom band (see [`Self::fill_input_band`]),
-    /// so the grid above it is laid out **top-to-bottom like a conventional
-    /// terminal** and only ever shifts *up* to keep the newest output just above
-    /// the band: the offset is clamped to `<= 0`, so output never reserves blank
-    /// rows above itself and the prompt can't climb as a command streams. While
-    /// output is short the offset is 0 (content sits at the top, the pinned band
-    /// rests at the bottom); once output fills past the band it goes negative,
-    /// scrolling the oldest visible row off the top into scrollback. Scrolled
-    /// history and the alternate screen are laid out plainly, so it returns 0 there.
+    /// Blank rows to reserve above the output region so it rests just above the
+    /// pinned input band (Warp-style). The live input line is relocated into the
+    /// band ([`Self::fill_input_band`]) and holds still there, so the output below
+    /// is laid out **like a conventional terminal**: it hugs the band, fills
+    /// upward, and scrolls the oldest visible row off the top once it grows past
+    /// the grid. The reserve shrinks (then the offset goes negative) as output
+    /// fills, clamped at `-band`. Scrolled history and the alternate screen are laid
+    /// out plainly, so it returns 0 there.
     fn display_shift(&self) -> i32 {
         self.display_shift_with(self.input_band_rows())
     }
@@ -899,17 +896,15 @@ impl Terminal {
         if rows <= 1 {
             return 0;
         }
-        // Reserve the band at the bottom and clamp the offset to `<= 0`: the output
-        // region is top-anchored (no blank rows reserved above it, so no climb),
-        // shifting up only as far as needed to keep the newest line just above the
-        // band. The `-band` floor is the natural limit once alacritty itself scrolls
-        // (content_bottom saturates at `rows - 1`). At a resting prompt the cursor
+        // Bottom-anchor the output region just above the band; it fills upward and
+        // then scrolls (the `-band` floor is hit once alacritty itself scrolls,
+        // content_bottom saturating at `rows - 1`). At a resting prompt the cursor
         // line is relocated into the band ([`Self::fill_resting_input`]), so it does
         // not count toward the output's lowest line — subtract it, or the output
-        // would scroll up a needless row.
+        // would sit a needless row higher.
         let reserve = Self::BOTTOM_GUTTER.max(band);
         let out_bottom = self.content_bottom() - i32::from(!self.command_running());
-        (rows - 1 - reserve - out_bottom).clamp(-band, 0)
+        (rows - 1 - reserve - out_bottom).max(-band)
     }
 
     /// Rows to reserve at the bottom for the pinned input band: the input line plus
@@ -964,9 +959,10 @@ impl Terminal {
 
     /// Build a render-ready snapshot of the visible grid.
     ///
-    /// At the live edge the output region is painted top-to-bottom with the live
-    /// input line relocated into the pinned bottom band ([`Self::fill_input_band`]),
-    /// so output scrolls above a fixed prompt; scrolled back, it paints the
+    /// At the live edge the live input line is relocated into the pinned bottom band
+    /// ([`Self::fill_input_band`]) and the output region above it is bottom-anchored
+    /// (hugs the band, fills upward, then scrolls) — so the input holds still while
+    /// output behaves like a conventional terminal; scrolled back, it paints the
     /// composite — frozen block buffers above the live grid's active region — via
     /// [`Self::composite_snapshot`].
     pub fn snapshot(&self) -> GridSnapshot {
@@ -1487,10 +1483,11 @@ mod tests {
     fn selection_yields_text() {
         let mut t = terminal(20, 3);
         // The live input line is relocated into the band, so select committed
-        // output: "hello world" lands on output row 0, the prompt rests in the band.
+        // output: "hello world" is bottom-anchored on row 1 (just above the band),
+        // the prompt rests in the band on row 2.
         t.process(b"hello world\r\n$ ");
-        t.selection_start(0, 0, false);
-        t.selection_update(4, 0, true); // through the right half of column 4
+        t.selection_start(0, 1, false);
+        t.selection_update(4, 1, true); // through the right half of column 4
         assert_eq!(t.selection_text().as_deref(), Some("hello"));
     }
 
@@ -1498,12 +1495,12 @@ mod tests {
     fn snapshot_flags_selected_cells() {
         let mut t = terminal(20, 3);
         t.process(b"hello\r\n$ ");
-        t.selection_start(0, 0, false);
-        t.selection_update(4, 0, true);
+        t.selection_start(0, 1, false);
+        t.selection_update(4, 1, true);
         let snap = t.snapshot();
-        assert!(snap.cell(0, 0).unwrap().flags.contains(CellFlags::SELECTED));
-        assert!(snap.cell(4, 0).unwrap().flags.contains(CellFlags::SELECTED));
-        assert!(!snap.cell(6, 0).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(snap.cell(0, 1).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(snap.cell(4, 1).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(!snap.cell(6, 1).unwrap().flags.contains(CellFlags::SELECTED));
         assert_eq!(snap.selection_color, Palette::default().selection);
     }
 
@@ -1511,8 +1508,8 @@ mod tests {
     fn clearing_selection_drops_text() {
         let mut t = terminal(20, 3);
         t.process(b"hello\r\n$ ");
-        t.selection_start(0, 0, false);
-        t.selection_update(4, 0, true);
+        t.selection_start(0, 1, false);
+        t.selection_update(4, 1, true);
         assert!(t.selection_text().is_some());
         t.selection_clear();
         assert!(t.selection_text().is_none());
@@ -1548,26 +1545,33 @@ mod tests {
     }
 
     #[test]
-    fn running_output_holds_the_command_at_the_top_no_climb() {
-        // While a command streams, output fills top-to-bottom: the command line
-        // holds its row instead of climbing as each line arrives (the #7 fix).
+    fn output_hugs_the_band_with_no_gap() {
+        // The output region is bottom-anchored just above the pinned input band:
+        // recent output hugs the band rather than floating at the top with a gap.
+        let mut t = terminal(20, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let snap = t.snapshot();
+        // The resting prompt is pinned on the bottom row (the band)...
+        assert_eq!(snap.cursor.expect("cursor visible").row, 5);
+        assert_eq!(snap.cell(0, 5).unwrap().c, '$');
+        // ...and the newest output ("hi") hugs the row just above it — no gap.
+        assert_eq!(snap.cell(0, 4).unwrap().c, 'h', "output hugs the band, not the top");
+    }
+
+    #[test]
+    fn input_band_holds_still_as_output_grows() {
+        // The defining #7 property: the input line holds still while output fills
+        // and scrolls beneath it like a conventional terminal.
         let mut t = terminal(20, 6);
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07");
-        // The first column-0 '$' is the "$ cmd" command line in the output region
-        // (the running band's prompt prefix, if any, sits on the bottom row, below).
-        let cmd_row = |t: &Terminal| {
+        let band_top = |t: &Terminal| {
             let s = t.snapshot();
-            (0..s.rows).find(|&r| s.cell(0, r).is_some_and(|c| c.c == '$'))
+            s.rows - s.input_band_rows
         };
-        let first = cmd_row(&t).expect("command line visible");
-        assert_eq!(first, 0, "the command line starts at the top of the output region");
-        for line in [b"o1\r\n".as_slice(), b"o2\r\n", b"o3\r\n"] {
+        let pinned = band_top(&t);
+        for line in [b"o1\r\n".as_slice(), b"o2\r\n", b"o3\r\n", b"o4\r\n"] {
             t.process(line);
-            assert_eq!(
-                cmd_row(&t),
-                Some(first),
-                "the command line does not climb as output fills below it",
-            );
+            assert_eq!(band_top(&t), pinned, "the input band stays pinned while output grows");
         }
     }
 
@@ -1709,21 +1713,21 @@ mod tests {
         assert_eq!(b.exit_code, Some(1));
 
         let snap = t.snapshot();
-        // Output is top-anchored, so the block's prompt row is the very first row;
-        // the finished command's cursor line is relocated into the band, which
-        // carries no block decoration.
+        // Output is bottom-anchored, so the block's prompt row is the first
+        // non-padding row; the blank rows above it carry no decoration, and the
+        // finished command's cursor line is relocated into the band (no decoration).
         let top = snap
             .rows_decor
             .iter()
             .position(|d| d.block_top)
             .expect("a block-top row");
-        assert_eq!(top, 0, "the block sits at the top of the output region");
         let id = snap.rows_decor[top].block_id;
         assert_ne!(id, 0);
         assert!(snap.rows_decor[top].failed);
         assert!(snap.rows_decor[top].block_top, "prompt row is the block top");
         assert!(snap.rows_decor[top + 1].failed);
         assert!(!snap.rows_decor[top + 1].block_top);
+        assert_eq!(snap.rows_decor[0].block_id, 0, "rows above the block are padding");
         let band = snap.rows as usize - 1;
         assert_eq!(snap.rows_decor[band].block_id, 0, "the band row carries no block decoration");
     }
@@ -1853,9 +1857,10 @@ mod tests {
         let cur = snap.cursor.expect("cursor visible");
         assert_eq!(cur.row, 5, "the prompt rests on the bottom row");
         assert_eq!(snap.cell(0, 5).unwrap().c, '$');
-        // The finished command's prompt line ("$ x") stays in the output region.
-        assert_eq!(snap.cell(0, 0).unwrap().c, '$');
-        assert_eq!(snap.cell(2, 0).unwrap().c, 'x');
+        // The finished command's prompt line ("$ x") stays in the output region,
+        // bottom-anchored just above the band on row 4.
+        assert_eq!(snap.cell(0, 4).unwrap().c, '$');
+        assert_eq!(snap.cell(2, 4).unwrap().c, 'x');
     }
 
     #[test]
