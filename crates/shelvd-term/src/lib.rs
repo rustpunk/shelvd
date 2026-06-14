@@ -17,6 +17,8 @@ use alacritty_terminal::Term;
 
 use std::time::Instant;
 
+use unicode_width::UnicodeWidthChar;
+
 use shelvd_core::{
     CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba, RowDecor,
     StickyHeader,
@@ -258,10 +260,13 @@ impl Terminal {
                     .map(|b| (b.command_line, b.command_col));
                 if let Some((cmd_line, cmd_col)) = pending {
                     let command = self.capture_command(cmd_line, cmd_col, line);
+                    // From column 0: the prompt prefix plus the command, for the band.
+                    let prompt_command = self.capture_command(cmd_line, 0, line);
                     let started = Instant::now();
                     if let Some(b) = self.blocks.last_mut() {
                         b.output_line = Some(line);
                         b.command = command;
+                        b.prompt_command = prompt_command;
                         b.started_at = Some(started);
                     }
                 }
@@ -465,9 +470,11 @@ impl Terminal {
         }
 
         // Sticky header: the top visible row's block, if its prompt scrolled off.
-        // Only when content fills the grid (no bottom-anchor padding above it).
-        if shift == 0 {
-            let top_abs = self.abs_base - offset as i64;
+        // Only when content fills the grid — either no bottom-anchor padding above
+        // the top row (shift == 0) or the input band pushed the top row off the
+        // screen (shift < 0). The top row maps to `abs_base - shift - offset`.
+        if shift <= 0 {
+            let top_abs = self.abs_base - shift as i64 - offset as i64;
             if let Some(idx) = self.block_row(top_abs, cursor_abs) {
                 let b = &self.blocks[idx];
                 if b.prompt_line < top_abs && !b.command.is_empty() {
@@ -667,15 +674,44 @@ impl Terminal {
     /// [`Self::BOTTOM_GUTTER`] keeps the prompt off the very last row when room
     /// permits, collapsing gracefully as the screen fills.
     fn display_shift(&self) -> i32 {
-        let grid = self.term.grid();
-        if grid.display_offset() != 0 || self.term.mode().contains(TermMode::ALT_SCREEN) {
+        self.display_shift_with(self.input_band_rows())
+    }
+
+    /// [`Self::display_shift`] given a precomputed band reserve, so a caller that
+    /// also fills the band ([`Self::snapshot`]) derives both from one value.
+    fn display_shift_with(&self, band: i32) -> i32 {
+        if self.is_scrolled() || self.alt_screen() {
             return 0;
         }
         let rows = self.dims.rows as i32;
         if rows <= 1 {
             return 0;
         }
-        (rows - 1 - self.content_bottom() - Self::BOTTOM_GUTTER).max(0)
+        // Reserve a strip at the bottom: a breathing gutter at a prompt, or the
+        // persistent input band while a command runs. The gutter yields to content
+        // (clamp at 0); the band holds even once output fills the screen (clamp at
+        // `-band`, scrolling the oldest visible row off the top — it self-heals
+        // into scrollback as more output arrives).
+        let reserve = Self::BOTTOM_GUTTER.max(band);
+        (rows - 1 - reserve - self.content_bottom()).max(-band)
+    }
+
+    /// Rows to reserve at the bottom for the pinned input band. One while a shell
+    /// command is running at the live edge of the main screen — so its output
+    /// scrolls above a fixed strip — and zero everywhere else: at a prompt the
+    /// prompt *is* the bottom line (today's anchor, [`Self::BOTTOM_GUTTER`]), and
+    /// the band is ruled out without shell integration, on the alt screen, and in
+    /// scrolled-back history.
+    fn input_band_rows(&self) -> i32 {
+        // Need at least one row above the band; on a degenerate 1-row grid
+        // `display_shift_with` also bails, so keep the two in agreement.
+        if self.dims.rows <= 1 || self.is_scrolled() || self.alt_screen() {
+            return 0;
+        }
+        match self.blocks.last() {
+            Some(b) if b.output_line.is_some() && b.end_line.is_none() => 1,
+            _ => 0,
+        }
     }
 
     /// The lowest occupied visible row at the live edge: the cursor's row or the
@@ -713,7 +749,8 @@ impl Terminal {
             GridSnapshot::filled(cols, rows, self.palette.foreground, self.palette.background);
         snap.selection_color = self.palette.selection;
 
-        let shift = self.display_shift();
+        let band = self.input_band_rows();
+        let shift = self.display_shift_with(band);
         let selection = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
@@ -774,7 +811,42 @@ impl Terminal {
 
         snap.cursor = self.cursor_snapshot(offset, shift, cols, rows);
         self.decorate(&mut snap, offset, shift);
+        self.fill_input_band(&mut snap, band);
         snap
+    }
+
+    /// Paint the running-command band and flag it on the snapshot. The band
+    /// exists only while a command is running (see [`Self::input_band_rows`]); at
+    /// a prompt the bottom row is the live prompt itself, so this is a no-op and
+    /// the snapshot keeps its plain bottom-anchor. The label mirrors the executed
+    /// prompt line from the block above, dimmed to read as a locked, non-editable
+    /// strip while the command holds the input.
+    fn fill_input_band(&self, snap: &mut GridSnapshot, band: i32) {
+        if band <= 0 {
+            return;
+        }
+        let cols = snap.cols as usize;
+        let band_top = snap.rows.saturating_sub(band as u16) as usize;
+        // De-emphasized so the strip reads as locked chrome, not live output.
+        let dim = self.palette.indexed(8); // ash / bright-black
+        // Reset the band rows to blanks and drop any block decoration that mapped
+        // onto them, so the strip is its own region rather than the running
+        // block's trailing output.
+        let blank = CellSnapshot::blank(dim, self.palette.background);
+        for row in band_top..snap.rows as usize {
+            for col in 0..cols {
+                snap.cells[row * cols + col] = blank;
+            }
+            snap.rows_decor[row] = RowDecor::default();
+        }
+        // The executed prompt line (prompt prefix + command), mirroring the block
+        // above; fall back to a generic marker if it wasn't captured.
+        let label = match self.blocks.last() {
+            Some(b) if !b.prompt_command.is_empty() => b.prompt_command.as_str(),
+            _ => "running…",
+        };
+        write_row(&mut snap.cells[band_top * cols..(band_top + 1) * cols], label, blank);
+        snap.input_band_rows = band as u16;
     }
 
     fn cursor_snapshot(&self, offset: i32, shift: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
@@ -837,6 +909,30 @@ impl Terminal {
                 self.palette.indexed(idx as u8)
             }
         }
+    }
+}
+
+/// Write `text` into a single display row (`cells`, length == the column count),
+/// honoring double-width glyphs: a wide char takes a [`CellFlags::WIDE`] cell plus
+/// a trailing [`CellFlags::WIDE_SPACER`], so it never overdraws its neighbor.
+/// `blank` supplies the row's colors; writing stops when the row is full.
+fn write_row(cells: &mut [CellSnapshot], text: &str, blank: CellSnapshot) {
+    let cols = cells.len();
+    let mut col = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w == 0 {
+            continue; // control / zero-width: nothing to place
+        }
+        if col + w > cols {
+            break;
+        }
+        cells[col] = CellSnapshot { c: ch, ..blank };
+        if w == 2 {
+            cells[col].flags = CellFlags::WIDE;
+            cells[col + 1] = CellSnapshot { c: ' ', flags: CellFlags::WIDE_SPACER, ..blank };
+        }
+        col += w;
     }
 }
 
@@ -1156,5 +1252,79 @@ mod tests {
         let snap = t.snapshot();
         let sticky = snap.sticky.expect("prompt scrolled off the top -> sticky header");
         assert_eq!(sticky.command, "make");
+    }
+
+    /// Read a display row's glyphs into a string, for asserting on band text.
+    fn row_text(snap: &GridSnapshot, row: u16) -> String {
+        (0..snap.cols).filter_map(|c| snap.cell(c, row).map(|x| x.c)).collect()
+    }
+
+    #[test]
+    fn running_command_reserves_a_bottom_band() {
+        let mut t = terminal(20, 6);
+        // A block in the running state: prompt, command, output started but not
+        // finished (no 133;D).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07ping x\r\n\x1b]133;C\x07reply\r\n");
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 1, "a running command reserves the band");
+        let last = snap.rows - 1;
+        assert_eq!(snap.cell(0, last).unwrap().c, '$', "band mirrors the prompt line");
+        assert!(row_text(&snap, last).contains("ping x"), "band shows the executed command");
+    }
+
+    #[test]
+    fn running_band_persists_when_output_fills_the_screen() {
+        let mut t = terminal(20, 4);
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07loop\r\n\x1b]133;C\x07");
+        for i in 0..12 {
+            input.extend_from_slice(format!("out{i}\r\n").as_bytes());
+        }
+        t.process(&input);
+        let snap = t.snapshot();
+        // Output overflows the 4-row grid, yet the bottom strip is still the band,
+        // not the newest output line: the persistent band did not collapse (the
+        // single-grid cost is the oldest visible row scrolling off the top).
+        assert_eq!(snap.input_band_rows, 1);
+        let last = snap.rows - 1;
+        assert_eq!(snap.cell(0, last).unwrap().c, '$');
+        assert!(row_text(&snap, last).contains("loop"), "band still names the command");
+        assert!(!row_text(&snap, last).contains("out"), "output never overwrites the band");
+    }
+
+    #[test]
+    fn input_band_suppressed_on_a_one_row_grid() {
+        // Degenerate 1-row grid: `display_shift` bails, so `input_band_rows` must
+        // agree (return 0) or `fill_input_band` would overwrite the only row.
+        let mut t = terminal(20, 1);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07go\r\n\x1b]133;C\x07out\r\n");
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 0, "no band when there is no row above it");
+    }
+
+    #[test]
+    fn band_handles_wide_glyphs_in_the_command() {
+        let mut t = terminal(20, 6);
+        // A CJK char in the command is double-width: the band must flag it WIDE
+        // with a trailing spacer rather than overdrawing its neighbor.
+        t.process("\x1b]133;A\x07$ \x1b]133;B\x07編\r\n\x1b]133;C\x07x\r\n".as_bytes());
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        // Prompt line is "$ 編": '$'(0) ' '(1) '編'(2, wide) spacer(3).
+        assert_eq!(snap.cell(2, last).unwrap().c, '編');
+        assert!(snap.cell(2, last).unwrap().flags.contains(CellFlags::WIDE));
+        assert!(snap.cell(3, last).unwrap().flags.contains(CellFlags::WIDE_SPACER));
+    }
+
+    #[test]
+    fn prompt_has_no_input_band() {
+        let mut t = terminal(20, 6);
+        // Command finished and a fresh prompt drawn: no band — the prompt is the
+        // bottom line itself (today's plain bottom-anchor, preserved).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 0, "a prompt keeps the plain bottom-anchor");
+        let cur = snap.cursor.expect("cursor visible");
+        assert_eq!(snap.cell(0, cur.row).unwrap().c, '$');
     }
 }
