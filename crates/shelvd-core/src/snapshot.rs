@@ -111,6 +111,13 @@ pub struct GridSnapshot {
     pub block_tint: Rgba,
     /// Hairline color drawn between adjacent blocks.
     pub block_separator: Rgba,
+    /// Rows at the bottom reserved for the pinned input band (0 = none, today's
+    /// plain bottom-anchor). `shelvd-term` sets this while a command is running so
+    /// the live region keeps a fixed strip — the renderer draws a separator above
+    /// it — instead of letting the bottom collapse as output fills the screen. The
+    /// band's text (a running-command indicator) is written into the corresponding
+    /// bottom rows of `cells`, so the renderer paints it as ordinary glyphs.
+    pub input_band_rows: u16,
 }
 
 impl GridSnapshot {
@@ -129,6 +136,7 @@ impl GridSnapshot {
             block_stripe: bg,
             block_tint: bg,
             block_separator: bg,
+            input_band_rows: 0,
         }
     }
 
@@ -144,5 +152,20 @@ impl GridSnapshot {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filled_has_no_input_band_by_default() {
+        let bg = Rgba::new(0, 0, 0, 255);
+        let fg = Rgba::new(255, 255, 255, 255);
+        let snap = GridSnapshot::filled(8, 4, fg, bg);
+        // The input band is opt-in: a fresh snapshot reserves none, so existing
+        // bottom-anchor behavior is unchanged until `shelvd-term` sets it.
+        assert_eq!(snap.input_band_rows, 0);
     }
 }

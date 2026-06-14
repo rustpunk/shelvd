@@ -37,6 +37,10 @@ pub struct Block {
     pub end_line: Option<i64>,
     /// The command text, captured from `B`..`C`.
     pub command: String,
+    /// The full prompt line as rendered — the prompt prefix plus the typed
+    /// command (the `command_line` from column 0). Drives the running-command
+    /// band so it mirrors the executed line as it appears in the block above.
+    pub prompt_command: String,
     /// The command's exit code, if reported.
     pub exit_code: Option<i32>,
     /// Lifecycle state, derived from the exit code.
@@ -60,6 +64,7 @@ impl Block {
             output_line: None,
             end_line: None,
             command: String::new(),
+            prompt_command: String::new(),
             exit_code: None,
             state: BlockState::Running,
             cwd,

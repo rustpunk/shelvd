@@ -615,6 +615,15 @@ impl Renderer {
             }
         }
 
+        // Input band: the fixed bottom strip held while a command runs (its
+        // indicator text is already in the grid cells). A rule along its top edge
+        // sets it off as its own region — the mirror of the sticky header.
+        if snap.input_band_rows > 0 {
+            let band_top = snap.rows.saturating_sub(snap.input_band_rows);
+            let y = grid_pad_y + band_top as f32 * ch;
+            rects.push(Rect { x: 0.0, y, w: width, h: sep_h, color: sep });
+        }
+
         if let Some(cur) = snap.cursor {
             let x = pad.x + cur.col as f32 * cw;
             let y = grid_pad_y + cur.row as f32 * ch;
