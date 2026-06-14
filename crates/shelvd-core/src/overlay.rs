@@ -44,6 +44,16 @@ pub struct Overlay {
     /// Index *within `items`* of the highlighted row, or `None` if (degenerately)
     /// the selection falls outside the visible window.
     pub selected_visible: Option<usize>,
+    /// Whether a non-empty query matched nothing. Carried explicitly because an
+    /// empty `items` is ambiguous post-windowing (no matches vs. zero capacity);
+    /// when set, the renderer draws a dim "no matches" row instead of a blank
+    /// list. Stays `false` for an empty query, where the placeholder already
+    /// conveys the empty state.
+    pub no_matches: bool,
+    /// Display column for the query caret, measured in cells from the panel's
+    /// left text edge. Computed app-side from the *display width* of the prompt
+    /// plus query (via `unicode-width`) so wide/CJK glyphs don't drift the caret.
+    pub query_caret_col: usize,
     /// Resolved colors.
     pub colors: OverlayColors,
 }
