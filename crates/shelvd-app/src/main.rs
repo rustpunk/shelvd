@@ -25,7 +25,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{ResizeDirection, Window, WindowId};
 
-use overlay::{Action, OverlayState};
+use overlay::{key_to_action, Action, OverlayState};
 
 /// Events delivered to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -557,67 +557,14 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let mods = state.modifiers;
-                // Ctrl+Shift+{C,V}: clipboard. Ctrl+Shift+X: copy the current
-                // block. Ctrl+Shift+{Up,Down}: jump between command blocks.
-                // Ctrl+Shift+P: command palette. Ctrl+Shift+R: history search.
-                // (Ctrl+C alone still sends SIGINT.)
-                if mods.control_key() && mods.shift_key() {
-                    match &event.logical_key {
-                        Key::Character(s) if s.eq_ignore_ascii_case("p") => {
-                            state.selecting = false; // drop any in-progress drag
-                            state.overlay = Some(OverlayState::palette());
-                            state.window.request_redraw();
-                            return;
-                        }
-                        Key::Character(s) if s.eq_ignore_ascii_case("r") => {
-                            open_history(state);
-                            state.window.request_redraw();
-                            return;
-                        }
-                        Key::Character(s) if s.eq_ignore_ascii_case("c") => {
-                            copy_selection(state);
-                            return;
-                        }
-                        Key::Character(s) if s.eq_ignore_ascii_case("v") => {
-                            paste_clipboard(state);
-                            return;
-                        }
-                        Key::Character(s) if s.eq_ignore_ascii_case("x") => {
-                            copy_block(state);
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            if state.terminal.scroll_to_prev_block() {
-                                state.window.request_redraw();
-                            }
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            if state.terminal.scroll_to_next_block() {
-                                state.window.request_redraw();
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // Shift+PageUp / Shift+PageDown: scroll the viewport through history.
-                if mods.shift_key() {
-                    if let Key::Named(named) = &event.logical_key {
-                        match named {
-                            NamedKey::PageUp => {
-                                state.terminal.scroll_page_up();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            NamedKey::PageDown => {
-                                state.terminal.scroll_page_down();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
+                // A bound key chord — command palette, history, block jumps,
+                // clipboard, paging — runs its action; everything else is input.
+                // The keymap and the palette share one command table (see
+                // `overlay`). Ctrl+C is unbound here, so it still sends SIGINT.
+                if let Some(action) = key_to_action(&event, mods) {
+                    run_action(state, event_loop, action);
+                    state.window.request_redraw();
+                    return;
                 }
                 // Normal input: jump back to the live edge, then send the bytes.
                 if let Some(bytes) = key_to_bytes(&event, mods) {
@@ -964,16 +911,23 @@ fn handle_overlay_key(state: &mut State, event_loop: &ActiveEventLoop, event: &K
 /// Execute an overlay [`Action`] against the live subsystems.
 fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
     match action {
+        Action::OpenPalette => {
+            state.selecting = false; // drop any in-progress drag
+            state.overlay = Some(OverlayState::palette());
+        }
         Action::ScrollToTop => state.terminal.scroll_to_top(),
         Action::ScrollToBottom => state.terminal.scroll_to_bottom(),
         Action::CopySelection => copy_selection(state),
         Action::CopyBlock => copy_block(state),
+        Action::Paste => paste_clipboard(state),
         Action::PrevBlock => {
             state.terminal.scroll_to_prev_block();
         }
         Action::NextBlock => {
             state.terminal.scroll_to_next_block();
         }
+        Action::PageUp => state.terminal.scroll_page_up(),
+        Action::PageDown => state.terminal.scroll_page_down(),
         Action::SearchHistory => open_history(state),
         Action::Quit => event_loop.exit(),
         Action::InsertCommand(cmd) => {
