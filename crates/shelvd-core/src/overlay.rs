@@ -37,10 +37,13 @@ pub struct Overlay {
     pub prompt: String,
     /// The text typed so far.
     pub query: String,
-    /// Filtered items, best match first.
+    /// The visible window of filtered items, best match first. The app has
+    /// already windowed the full match list to only the rows that fit this
+    /// frame, so the renderer paints these directly without re-deriving a slice.
     pub items: Vec<OverlayItem>,
-    /// Index into `items` of the highlighted row.
-    pub selected: usize,
+    /// Index *within `items`* of the highlighted row, or `None` if (degenerately)
+    /// the selection falls outside the visible window.
+    pub selected_visible: Option<usize>,
     /// Resolved colors.
     pub colors: OverlayColors,
 }

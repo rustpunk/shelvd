@@ -260,6 +260,13 @@ impl Renderer {
         self.cell
     }
 
+    /// How many overlay item rows fit below the query line this frame. The app
+    /// uses this to window its filtered list before building the [`Overlay`], so
+    /// only the visible rows are materialized.
+    pub fn overlay_capacity(&self) -> usize {
+        (self.grid_size().rows.saturating_sub(2) as usize).min(12)
+    }
+
     /// Current surface size in physical pixels.
     pub fn surface_size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
@@ -421,8 +428,8 @@ impl Renderer {
         }
 
         // Overlay text.
-        if let (Some(ov), Some(l)) = (overlay, layout) {
-            self.set_overlay_text(ov, l);
+        if let Some(ov) = overlay {
+            self.set_overlay_text(ov);
         }
 
         self.viewport.update(
@@ -705,19 +712,11 @@ impl Renderer {
         self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
-    /// Compute the overlay panel's row count and which slice of items is shown.
+    /// Compute the overlay panel's row count. The app has already windowed the
+    /// items to what fits ([`overlay_capacity`](Self::overlay_capacity)), so the
+    /// panel is simply the query row plus the visible items.
     fn overlay_layout(&self, ov: &Overlay) -> OverlayLayout {
-        let grid_rows = self.grid_size().rows;
-        // One query row plus a capped list; leave a little headroom at the bottom.
-        let max_visible = (grid_rows.saturating_sub(2)).min(12) as usize;
-        let visible = ov.items.len().min(max_visible);
-        // Scroll the window so the selected row stays inside it.
-        let mut first_item = 0;
-        if visible > 0 && ov.selected >= visible {
-            first_item = ov.selected + 1 - visible;
-        }
-        first_item = first_item.min(ov.items.len().saturating_sub(visible));
-        OverlayLayout { panel_rows: 1 + visible as u16, first_item, visible }
+        OverlayLayout { panel_rows: 1 + ov.items.len() as u16 }
     }
 
     /// Append the overlay's solid quads: panel, selection highlight, query
@@ -732,11 +731,8 @@ impl Renderer {
         let panel_h = pad.y + layout.panel_rows as f32 * ch;
         rects.push(Rect { x: 0.0, y: tb, w: width, h: panel_h, color: c.panel_bg.to_linear_f32() });
 
-        if layout.visible > 0
-            && ov.selected >= layout.first_item
-            && ov.selected < layout.first_item + layout.visible
-        {
-            let row = 1 + (ov.selected - layout.first_item) as u16;
+        if let Some(sv) = ov.selected_visible {
+            let row = 1 + sv as u16;
             let y = tb + pad.y + row as f32 * ch;
             rects.push(Rect { x: 0.0, y, w: width, h: ch, color: c.sel_bg.to_linear_f32() });
         }
@@ -750,9 +746,9 @@ impl Renderer {
         rects.push(Rect { x: 0.0, y: tb + panel_h - rule_h, w: width, h: rule_h, color: c.accent.to_linear_f32() });
     }
 
-    /// Lay out the overlay's text (query line + the visible item slice) into the
+    /// Lay out the overlay's text (query line + the pre-windowed items) into the
     /// overlay buffer as colored spans.
-    fn set_overlay_text(&mut self, ov: &Overlay, layout: OverlayLayout) {
+    fn set_overlay_text(&mut self, ov: &Overlay) {
         let c = ov.colors;
         let mut text = String::new();
         let mut spans: Vec<(usize, usize, Rgba, bool)> = Vec::new();
@@ -765,10 +761,9 @@ impl Renderer {
             push_span(&mut text, &mut spans, &ov.query, c.fg, false);
         }
 
-        for idx in layout.first_item..layout.first_item + layout.visible {
+        for (idx, item) in ov.items.iter().enumerate() {
             push_span(&mut text, &mut spans, "\n", c.fg, false);
-            let item = &ov.items[idx];
-            let selected = idx == ov.selected;
+            let selected = Some(idx) == ov.selected_visible;
             push_span(&mut text, &mut spans, "  ", c.fg, false);
             push_span(&mut text, &mut spans, &item.label, c.fg, selected);
             if let Some(detail) = &item.detail {
@@ -796,12 +791,8 @@ impl Renderer {
 /// Geometry of the overlay panel for one frame.
 #[derive(Clone, Copy)]
 struct OverlayLayout {
-    /// Grid rows the panel occupies (1 query row + visible items).
+    /// Grid rows the panel occupies (1 query row + the pre-windowed items).
     panel_rows: u16,
-    /// Index of the first item shown (scroll offset into the list).
-    first_item: usize,
-    /// Number of items shown.
-    visible: usize,
 }
 
 /// Append a styled run to `text`/`spans`, skipping empty segments.

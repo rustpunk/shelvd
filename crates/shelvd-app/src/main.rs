@@ -595,10 +595,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.overlay.is_some() {
                     snapshot.cursor = None;
                 }
+                let capacity = state.renderer.overlay_capacity();
                 let overlay = state
                     .overlay
                     .as_ref()
-                    .map(|ov| ov.to_overlay(state.overlay_colors));
+                    .map(|ov| ov.to_overlay(state.overlay_colors, capacity));
                 if let Err(e) =
                     state.renderer.render(&snapshot, overlay.as_ref(), state.anim_offset_px)
                 {
