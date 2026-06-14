@@ -14,3 +14,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 log.workspace = true
 flume.workspace = true
+
+# termios lives only on unix; off-unix `echo_enabled` is a const `true`.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true

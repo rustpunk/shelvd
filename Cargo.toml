@@ -45,6 +45,8 @@ toml = "1"
 dirs = "6"
 flume = "0.12"
 unicode-width = "0.2"
+# termios echo-state query (mask no-echo input, e.g. sudo passwords); unix only
+nix = { version = "0.28", features = ["term"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
 bitflags = "2"
 nucleo-matcher = "0.3"

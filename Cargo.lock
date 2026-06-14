@@ -2328,6 +2328,7 @@ dependencies = [
  "anyhow",
  "flume",
  "log",
+ "nix",
  "portable-pty",
  "thiserror 2.0.18",
 ]
