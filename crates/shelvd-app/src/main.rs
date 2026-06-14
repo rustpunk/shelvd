@@ -16,7 +16,7 @@ use arboard::Clipboard;
 use shelvd_core::{Config, OverlayColors, ResizeEdge, Rgba, TitlebarHit};
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
-use shelvd_term::{ComposeBand, SemanticKind, TermEvent, Terminal};
+use shelvd_term::{BandState, SemanticKind, TermEvent, Terminal};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -301,11 +301,10 @@ impl ApplicationHandler<UserEvent> for App {
                     dirty = true;
                 }
                 // A command-block boundary moved; redraw so block visuals follow.
-                // A fresh prompt (133;A) while composing is the cue to advance the
-                // type-ahead queue by one command.
+                // A fresh prompt (133;A) is the cue to advance the type-ahead queue.
                 TermEvent::SemanticPrompt { kind, .. } => {
-                    if kind == SemanticKind::PromptStart && state.compose.is_some() {
-                        flush_or_idle(state);
+                    if kind == SemanticKind::PromptStart {
+                        on_prompt_start(state);
                     }
                     dirty = true;
                 }
@@ -594,6 +593,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // band instead of going to the PTY (global chords above still fire).
                 if state.compose.is_some() {
                     handle_compose_key(state, &event);
+                    return;
+                }
+                // Input lock: while a command runs (and we are not composing), plain
+                // typing is swallowed so it can't leak into the output. Control/Alt
+                // combos still pass through, so Ctrl+C and friends can signal the
+                // command; compose mode (Ctrl+Shift+Enter) is the way to type ahead.
+                // The alt screen is exempt — full-screen apps own all input there.
+                if state.terminal.command_running()
+                    && !state.terminal.alt_screen()
+                    && !mods.control_key()
+                    && !mods.alt_key()
+                {
                     return;
                 }
                 // Normal input: jump back to the live edge, then send the bytes.
@@ -982,14 +993,14 @@ fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
 }
 
 /// Mirror the app's compose / queue state into the terminal so the band renders
-/// the editable line. Called after any change to either, before the next redraw,
-/// so layout and rendering stay derived from one source.
+/// the editable line and the queued commands. Called after any change to either,
+/// before the next redraw, so layout and rendering stay derived from one source.
 fn sync_compose(state: &mut State) {
-    let band = state.compose.as_ref().map(|c| ComposeBand {
-        text: c.text().to_owned(),
-        queued: state.queue.len(),
-    });
-    state.terminal.set_compose(band);
+    let band = BandState {
+        editing: state.compose.as_ref().map(|c| c.text().to_owned()),
+        queued: state.queue.iter().cloned().collect(),
+    };
+    state.terminal.set_band(band);
 }
 
 /// Route a key press to the compose-next band: edit the buffer, queue the
@@ -1030,12 +1041,13 @@ fn handle_compose_key(state: &mut State, event: &KeyEvent) {
     state.window.request_redraw();
 }
 
-/// At a fresh shell prompt while composing: run the next queued command (type it
-/// and press Enter), or — when the queue is empty — leave compose mode so the
-/// now-idle prompt regains the keyboard. Any in-progress (un-queued) text is
-/// handed to the live prompt rather than dropped, so finishing a command
-/// mid-compose never loses what was typed.
-fn flush_or_idle(state: &mut State) {
+/// Handle a fresh shell prompt (OSC 133;A): advance the type-ahead queue by one.
+/// The queue runs independently of compose mode — once queued, commands keep
+/// firing on each prompt even after compose is dismissed. When the queue is empty
+/// but compose is still open with a half-typed line and nothing left to run, that
+/// line is handed to the now-idle prompt (no Enter, so it lands as editable input)
+/// rather than dropped, and compose mode exits.
+fn on_prompt_start(state: &mut State) {
     if let Some(cmd) = state.queue.pop_front() {
         let mut bytes = cmd.into_bytes();
         bytes.push(b'\r'); // type the command and run it
@@ -1045,15 +1057,15 @@ fn flush_or_idle(state: &mut State) {
         sync_compose(state);
         return;
     }
-    // Nothing queued: hand any half-typed line to the live prompt (no Enter, so it
-    // lands as editable input) and exit compose mode.
-    let pending = state.compose.take().map(|mut c| c.take()).unwrap_or_default();
-    if !pending.is_empty() {
-        if let Err(e) = state.pty.write(pending.as_bytes()) {
-            log::debug!("compose handoff failed: {e}");
+    if state.compose.is_some() {
+        let pending = state.compose.take().map(|mut c| c.take()).unwrap_or_default();
+        if !pending.is_empty() {
+            if let Err(e) = state.pty.write(pending.as_bytes()) {
+                log::debug!("compose handoff failed: {e}");
+            }
         }
+        sync_compose(state);
     }
-    sync_compose(state);
 }
 
 /// Open the history overlay from this session's block command strings.

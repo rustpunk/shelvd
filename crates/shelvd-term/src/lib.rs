@@ -62,18 +62,19 @@ pub enum TermEvent {
     Exit,
 }
 
-/// What the editable compose band should display this frame: the command being
-/// typed ahead and how many commands are already queued behind it. The event
-/// loop pushes this with [`Terminal::set_compose`] while compose-next mode is
-/// engaged; `None` is the resting state, where the band (if any) mirrors the
-/// running command instead. The caret column is derived here from `text` (the
-/// line is end-anchored), keeping all band layout inside this crate.
+/// What the bottom input band should display this frame, pushed by the app via
+/// [`Terminal::set_band`]: the editable compose line (present only while compose
+/// mode is engaged) and the commands queued to run on upcoming prompts. These
+/// layer the type-ahead UI over the band's resting job of mirroring the running
+/// command (see [`Terminal::command_running`]). A default (empty) value leaves
+/// the band in that resting state. All band layout stays inside this crate.
 #[derive(Clone, Debug, Default)]
-pub struct ComposeBand {
-    /// The command composed so far.
-    pub text: String,
-    /// Commands queued ahead of this one, surfaced as an "N queued" hint.
-    pub queued: usize,
+pub struct BandState {
+    /// The editable compose line, present only while compose mode is engaged.
+    pub editing: Option<String>,
+    /// Commands queued to run on upcoming prompts, oldest (next to run) first;
+    /// shown stacked above the input line, pushing the console up.
+    pub queued: Vec<String>,
 }
 
 /// Grid dimensions handed to alacritty. `total_lines == screen_lines`; the grid
@@ -158,10 +159,11 @@ pub struct Terminal {
     /// byte the grid is empty; suppressing the cursor until then avoids a lone
     /// cursor flashing at the bottom of an otherwise blank, bottom-anchored screen.
     seen_output: bool,
-    /// Compose-next mode payload, pushed by the app. While set, the input band is
-    /// forced (even at a prompt) and rendered as the editable compose line rather
-    /// than the locked running-command mirror. `None` is the resting state.
-    compose: Option<ComposeBand>,
+    /// Input-band state pushed by the app: the editable compose line and the
+    /// type-ahead queue. While either is active the band is forced (even at a
+    /// prompt) and shows the type-ahead UI; otherwise it falls back to the locked
+    /// running-command mirror.
+    band: BandState,
 }
 
 impl Terminal {
@@ -194,7 +196,7 @@ impl Terminal {
             cursor_shape,
             dims,
             seen_output: false,
-            compose: None,
+            band: BandState::default(),
         }
     }
 
@@ -653,15 +655,15 @@ impl Terminal {
 
     // --- compose-next mode ---------------------------------------------------
 
-    /// Engage / update / exit compose-next mode. While `Some`, the terminal
-    /// reserves a bottom band even at a prompt and renders the editable buffer
-    /// (with a caret and an "N queued" hint) in place of the locked
-    /// running-command mirror; `None` returns the band to its resting state. The
-    /// app owns the authoritative edit state and pushes a fresh view here on
-    /// every change, so layout ([`Self::display_shift`]) and rendering
-    /// ([`Self::fill_input_band`]) stay derived from one source.
-    pub fn set_compose(&mut self, compose: Option<ComposeBand>) {
-        self.compose = compose;
+    /// Push the bottom input band's state (the editable compose line and the
+    /// type-ahead queue). While either is non-empty the terminal reserves a band
+    /// even at a prompt and renders the type-ahead UI in place of the locked
+    /// running-command mirror. The app owns the authoritative edit/queue state and
+    /// pushes a fresh view here on every change, so band height
+    /// ([`Self::display_shift`]) and rendering ([`Self::fill_input_band`]) stay
+    /// derived from one source.
+    pub fn set_band(&mut self, band: BandState) {
+        self.band = band;
     }
 
     /// Whether a command is running at the live edge: shell integration reported
@@ -752,6 +754,10 @@ impl Terminal {
     /// shift is clamped at 0 and content always wins over the gutter.
     const BOTTOM_GUTTER: i32 = 1;
 
+    /// Most queued commands shown as their own rows in the band before the rest
+    /// collapse into a "+N more" line, so a long queue can't swallow the screen.
+    const MAX_QUEUE_ROWS: i32 = 6;
+
     /// Blank rows to reserve above the grid so the live prompt rests near the
     /// bottom of the window (Warp-style) instead of climbing down from the top.
     /// Active only at the live edge of the main screen, and only until output
@@ -783,24 +789,30 @@ impl Terminal {
         (rows - 1 - reserve - self.content_bottom()).max(-band)
     }
 
-    /// Rows to reserve at the bottom for the pinned input band. One while a shell
-    /// command is running at the live edge of the main screen — so its output
-    /// scrolls above a fixed strip — or while compose-next mode is engaged (so the
-    /// editable line persists across the brief prompt between queued commands), and
-    /// zero everywhere else: at a resting prompt the prompt *is* the bottom line
-    /// (today's anchor, [`Self::BOTTOM_GUTTER`]), and the band is ruled out without
-    /// shell integration, on the alt screen, and in scrolled-back history.
+    /// Rows to reserve at the bottom for the pinned input band: an input line plus
+    /// one row per queued command (stacked above it). The input line is present
+    /// while a command runs (its output scrolls above the band) or while compose
+    /// mode is engaged; queued commands add rows whenever the queue is non-empty,
+    /// pushing the console up. Zero when none of those hold — at a resting prompt
+    /// the prompt *is* the bottom line ([`Self::BOTTOM_GUTTER`]) — and the band is
+    /// ruled out without shell integration, on the alt screen, and in scrollback.
+    /// Capped to leave at least one content row, and [`Self::MAX_QUEUE_ROWS`]
+    /// queued rows before the remainder collapses into a "+N more" line.
     fn input_band_rows(&self) -> i32 {
         // Need at least one row above the band; on a degenerate 1-row grid
         // `display_shift_with` also bails, so keep the two in agreement.
         if self.dims.rows <= 1 || self.is_scrolled() || self.alt_screen() {
             return 0;
         }
-        if self.compose.is_some() || self.command_running() {
-            1
-        } else {
-            0
+        let bottom = i32::from(self.band.editing.is_some() || self.command_running());
+        let queued = self.band.queued.len() as i32;
+        if bottom == 0 && queued == 0 {
+            return 0;
         }
+        // Keep at least one content row; show up to MAX_QUEUE_ROWS queued rows.
+        let max_total = (self.dims.rows as i32 - 1).max(1);
+        let queue_rows = queued.min(Self::MAX_QUEUE_ROWS).min(max_total - bottom).max(0);
+        bottom + queue_rows
     }
 
     /// The lowest occupied visible row at the live edge: the cursor's row or the
@@ -873,20 +885,23 @@ impl Terminal {
     }
 
     /// Paint the input band and flag it on the snapshot. The band exists while a
-    /// command is running (see [`Self::input_band_rows`]) or while compose-next
-    /// mode is engaged; at a resting prompt the bottom row is the live prompt
-    /// itself, so this is a no-op and the snapshot keeps its plain bottom-anchor.
+    /// command is running, while compose mode is engaged, or while commands are
+    /// queued (see [`Self::input_band_rows`]); at a resting prompt the bottom row
+    /// is the live prompt itself, so this is a no-op.
     ///
-    /// The band always reads as an anchored shell prompt: it leads with the
-    /// captured prompt prefix (e.g. `user@host:~$ `) in its real colors, then —
-    /// at rest — the running command dimmed so only the command is distinct, or —
-    /// while composing — the editable buffer (see [`Self::fill_compose_band`]).
+    /// Bottom-up the band is: the **input line** — the editable compose line
+    /// (Warp-style, leading with the captured prompt prefix in its real colors)
+    /// while composing, otherwise the running command mirrored after that prompt,
+    /// dimmed so only the command is distinct — and, stacked above it, one **queued
+    /// row** per typed-ahead command. While a command runs and we are not
+    /// composing the input is locked, so the grid cursor is hidden.
     fn fill_input_band(&self, snap: &mut GridSnapshot, band: i32) {
         if band <= 0 {
             return;
         }
         let cols = snap.cols as usize;
-        let band_top = snap.rows.saturating_sub(band as u16) as usize;
+        let rows = snap.rows as usize;
+        let band_top = rows.saturating_sub(band as usize);
         // De-emphasized so the running command reads as locked chrome, not live
         // output.
         let dim = self.palette.indexed(8); // ash / bright-black
@@ -894,7 +909,7 @@ impl Terminal {
         // onto them, so the strip is its own region rather than the running
         // block's trailing output.
         let blank = CellSnapshot::blank(dim, self.palette.background);
-        for row in band_top..snap.rows as usize {
+        for row in band_top..rows {
             for col in 0..cols {
                 snap.cells[row * cols + col] = blank;
             }
@@ -902,14 +917,28 @@ impl Terminal {
         }
         snap.input_band_rows = band as u16;
 
-        // Lead with the prompt prefix in its captured colors so the band reads as
-        // a real prompt line, shared by the resting mirror and the compose line.
+        let editing = self.band.editing.is_some();
+        let has_input_line = editing || self.command_running();
+
+        // Queued commands stack above the input line — or fill the whole band in
+        // the brief transient where the queue is flushing at a fresh prompt and
+        // there is no input line yet.
+        let queue_rows = band as usize - usize::from(has_input_line);
+        self.fill_queued_rows(snap, band_top, queue_rows);
+
+        if !has_input_line {
+            return;
+        }
+        let input_row = rows - 1;
+
+        // Lead the input line with the prompt prefix in its captured colors so the
+        // band reads as a real prompt line, shared by the mirror and compose line.
         let prefix_w = {
             let prefix = match self.blocks.last() {
                 Some(b) => b.prompt_prefix.as_slice(),
                 None => &[],
             };
-            let row = &mut snap.cells[band_top * cols..(band_top + 1) * cols];
+            let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
             let mut col = 0;
             for cell in prefix {
                 if col >= cols {
@@ -921,29 +950,53 @@ impl Terminal {
             col
         };
 
-        if self.compose.is_some() {
-            self.fill_compose_band(snap, band_top, prefix_w);
+        if editing {
+            self.fill_compose_line(snap, input_row, prefix_w);
             return;
         }
-        // Resting band: the running command after the prompt, dimmed so only the
-        // command is the distinct, locked part. Fall back to a generic marker if
-        // the command wasn't captured.
+        // Running, not composing: the command after the prompt, dimmed so only it
+        // is the distinct, locked part; and the grid cursor hidden, as the input is
+        // locked until the command ends or compose mode is engaged.
         let command = match self.blocks.last() {
             Some(b) if !b.command.is_empty() => b.command.as_str(),
             _ => "running…",
         };
-        let row = &mut snap.cells[band_top * cols..(band_top + 1) * cols];
+        let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
         write_row(&mut row[prefix_w.min(cols)..], command, blank);
+        snap.cursor = None;
     }
 
-    /// Render the editable compose-next line after the prompt prefix: the typed
-    /// command in the normal foreground (so it reads as live input, not the dim
-    /// locked command), a beam caret at its end, and a right-aligned dim hint —
-    /// the queue depth once commands wait, otherwise the affordance that Enter
-    /// queues the line. The text is end-anchored: if it outgrows the band, only
-    /// its tail (where the caret sits) shows. `prefix_w` is where the prompt ends.
-    fn fill_compose_band(&self, snap: &mut GridSnapshot, band_top: usize, prefix_w: usize) {
-        let Some(compose) = self.compose.as_ref() else {
+    /// Render the queued commands as dim, italic rows stacked above the input
+    /// line, oldest (next to run) first. When more are queued than `count` rows,
+    /// the bottom row collapses the remainder into a "+N more queued" line.
+    fn fill_queued_rows(&self, snap: &mut GridSnapshot, top: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let cols = snap.cols as usize;
+        let total = self.band.queued.len();
+        // Dim + italic reads as pending, distinct from the bright input line.
+        let mut style = CellSnapshot::blank(self.palette.indexed(8), self.palette.background);
+        style.flags = CellFlags::ITALIC;
+        for i in 0..count {
+            let text = if i + 1 == count && total > count {
+                format!("+ {} more queued", total - (count - 1))
+            } else {
+                format!("\u{2022} {}", self.band.queued[i]) // • bullet
+            };
+            let row = &mut snap.cells[(top + i) * cols..(top + i + 1) * cols];
+            write_row(row, &text, style);
+        }
+    }
+
+    /// Render the editable compose line after the prompt prefix on `input_row`:
+    /// the typed command in the normal foreground (so it reads as live input, not
+    /// the dim locked command), a beam caret at its end, and a right-aligned dim
+    /// "Enter to queue" hint (the queue depth itself is shown as the stacked rows
+    /// above). The text is end-anchored: if it outgrows the line, only its tail
+    /// (where the caret sits) shows. `prefix_w` is where the prompt ends.
+    fn fill_compose_line(&self, snap: &mut GridSnapshot, input_row: usize, prefix_w: usize) {
+        let Some(text) = self.band.editing.as_deref() else {
             return;
         };
         let cols = snap.cols as usize;
@@ -951,23 +1004,19 @@ impl Terminal {
         let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
         let dim_blank = CellSnapshot::blank(self.palette.indexed(8), bg);
 
-        let hint = if compose.queued > 0 {
-            format!("{} queued", compose.queued)
-        } else {
-            "Enter to queue".to_owned()
-        };
-        let hint_w = UnicodeWidthStr::width(hint.as_str());
+        let hint = "Enter to queue";
+        let hint_w = UnicodeWidthStr::width(hint);
         // Reserve the hint's columns plus a gap at the right (dropped if it would
         // crowd the line), and a trailing column for the caret, so the editable
         // text collides with neither the prompt, the hint, nor the caret.
         let right = if hint_w + 1 < cols { hint_w + 1 } else { 0 };
         let text_cols = cols.saturating_sub(prefix_w).saturating_sub(right).saturating_sub(1);
 
-        let shown = visible_tail(&compose.text, text_cols);
-        let row = &mut snap.cells[band_top * cols..(band_top + 1) * cols];
+        let shown = visible_tail(text, text_cols);
+        let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
         write_row(&mut row[prefix_w.min(cols)..], shown, fg_blank);
         if right > 0 {
-            write_row(&mut row[cols - hint_w..], &hint, dim_blank);
+            write_row(&mut row[cols - hint_w..], hint, dim_blank);
         }
 
         // A beam caret reads as a text-insertion point, distinct from the block
@@ -977,7 +1026,7 @@ impl Terminal {
         let caret = (prefix_w + UnicodeWidthStr::width(shown)).min(cols.saturating_sub(1)) as u16;
         snap.cursor = Some(CursorSnapshot {
             col: caret,
-            row: band_top as u16,
+            row: input_row as u16,
             shape: CursorShape::Beam,
             color: self.palette.cursor,
             text_color: self.palette.cursor_text,
@@ -1491,28 +1540,36 @@ mod tests {
         assert!(!t.command_running(), "command finished");
     }
 
+    /// Engage compose mode with the given editable text and queued commands.
+    fn band(editing: &str, queued: &[&str]) -> BandState {
+        BandState {
+            editing: Some(editing.to_owned()),
+            queued: queued.iter().map(|s| s.to_owned().to_owned()).collect(),
+        }
+    }
+
     #[test]
     fn compose_band_keeps_the_prompt_prefix_before_the_editable_text() {
         let mut t = terminal(40, 6);
         // A running command so the prompt prefix ("$ ") is captured.
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
-        t.set_compose(Some(ComposeBand { text: "echo hi".into(), queued: 0 }));
+        t.set_band(band("echo hi", &[]));
         let snap = t.snapshot();
-        assert_eq!(snap.input_band_rows, 1, "compose holds the band");
+        assert_eq!(snap.input_band_rows, 1, "just the input line when nothing is queued");
         let last = snap.rows - 1;
         let line = row_text(&snap, last);
         // Reads as an anchored prompt: prefix kept, editable command after it.
         assert!(line.starts_with("$ "), "the prompt prefix leads the band: {line:?}");
         assert!(line.contains("echo hi"), "the editable command follows it: {line:?}");
         let cur = snap.cursor.expect("a caret in the band");
-        assert_eq!(cur.row, last, "the caret sits on the band row");
+        assert_eq!(cur.row, last, "the caret sits on the input row");
         // Caret after the prompt ("$ " = 2 cols) plus the typed text ("echo hi" = 7).
         assert_eq!(cur.col, 9, "the caret rests past the prompt and the typed text");
         assert_eq!(cur.shape, CursorShape::Beam, "a beam reads as a text-insertion point");
     }
 
     #[test]
-    fn resting_band_keeps_the_prompt_normal_and_dims_the_command() {
+    fn resting_band_keeps_the_prompt_normal_dims_the_command_and_hides_the_cursor() {
         let mut t = terminal(40, 6);
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
         let snap = t.snapshot();
@@ -1524,28 +1581,58 @@ mod tests {
         assert_eq!(snap.cell(0, last).unwrap().fg, pal.foreground, "the prompt keeps its normal style");
         assert_eq!(snap.cell(2, last).unwrap().c, 's', "the command begins after the prompt");
         assert_eq!(snap.cell(2, last).unwrap().fg, pal.indexed(8), "the command is dimmed/distinct");
+        // Input is locked while the command runs, so no cursor is shown.
+        assert!(snap.cursor.is_none(), "the cursor is hidden while a command runs");
     }
 
     #[test]
-    fn compose_band_overrides_the_locked_command_and_counts_the_queue() {
+    fn compose_band_overrides_the_locked_command() {
         let mut t = terminal(40, 6);
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
         // While running and not composing, the band mirrors the executed command.
         assert!(row_text(&t.snapshot(), 5).contains("sleep 9"), "resting band mirrors the command");
-        t.set_compose(Some(ComposeBand { text: "next".into(), queued: 2 }));
+        t.set_band(band("next", &[]));
         let line = row_text(&t.snapshot(), 5);
         assert!(line.starts_with("$ "), "the prompt prefix is still there: {line:?}");
         assert!(line.contains("next"), "editable buffer replaces the command: {line:?}");
         assert!(!line.contains("sleep"), "the locked command is gone while composing: {line:?}");
-        assert!(line.contains("2 queued"), "the queue depth is surfaced: {line:?}");
+    }
+
+    #[test]
+    fn queued_commands_stack_above_the_input_line_and_grow_the_band() {
+        let mut t = terminal(40, 8);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        t.set_band(band("", &["one", "two", "three"]));
+        let snap = t.snapshot();
+        // One input line + one row per queued command: the band grew, pushing the
+        // console up.
+        assert_eq!(snap.input_band_rows, 4, "input line plus three queued rows");
+        let rows = snap.rows;
+        // Queued rows sit above the input line, oldest (next to run) at the top.
+        assert!(row_text(&snap, rows - 4).contains("one"), "next-to-run queued at the top");
+        assert!(row_text(&snap, rows - 3).contains("two"));
+        assert!(row_text(&snap, rows - 2).contains("three"), "newest just above the input line");
+        assert!(row_text(&snap, rows - 1).starts_with("$ "), "the input line is at the bottom");
+    }
+
+    #[test]
+    fn a_long_queue_collapses_into_a_more_row() {
+        let mut t = terminal(40, 14);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        let many: Vec<&str> = "abcdefghij".split("").filter(|s| !s.is_empty()).collect(); // 10 items
+        t.set_band(band("", &many));
+        let snap = t.snapshot();
+        // Capped at MAX_QUEUE_ROWS queued rows (6) plus the input line.
+        assert_eq!(snap.input_band_rows, 7, "queue rows are capped");
+        let collapsed = (0..snap.rows).any(|r| row_text(&snap, r).contains("more queued"));
+        assert!(collapsed, "the overflow collapses into a \"+N more queued\" row");
     }
 
     #[test]
     fn compose_band_hints_that_enter_queues() {
         let mut t = terminal(40, 6);
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
-        t.set_compose(Some(ComposeBand { text: "echo hi".into(), queued: 0 }));
-        // With nothing queued yet, the hint teaches the queue affordance.
+        t.set_band(band("echo hi", &[]));
         assert!(row_text(&t.snapshot(), 5).contains("Enter to queue"), "the queue hint shows");
     }
 
@@ -1555,7 +1642,7 @@ mod tests {
         for i in 0..10 {
             t.process(format!("l{i}\r\n").as_bytes());
         }
-        t.set_compose(Some(ComposeBand { text: "x".into(), queued: 0 }));
+        t.set_band(band("x", &[]));
         t.scroll_lines(3);
         // Scrolled history lays out top-to-bottom like a normal terminal; the band
         // (and its forced reserve) yields, matching `viewport_to_point`.
@@ -1567,7 +1654,7 @@ mod tests {
         // A composed line wider than the grid keeps its end (where the caret is)
         // visible, dropping the head — the caret never leaves the band.
         let mut t = terminal(8, 4);
-        t.set_compose(Some(ComposeBand { text: "abcdefghij".into(), queued: 0 }));
+        t.set_band(band("abcdefghij", &[]));
         let snap = t.snapshot();
         let last = snap.rows - 1;
         let line = row_text(&snap, last);
