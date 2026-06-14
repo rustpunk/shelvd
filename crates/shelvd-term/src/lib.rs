@@ -7,7 +7,7 @@
 //! channel for the event-loop owner to act on.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -155,9 +155,17 @@ pub struct Terminal {
     blocks: Vec<Block>,
     /// Frozen buffers of completed blocks, oldest first, one per finished block.
     /// Captured on OSC-133 `;D` and kept in lockstep with `blocks` (a finished
-    /// block lives in both until pruned). The first slice of the multi-grid
-    /// model: finished output owned here, leaving the live grid the active region.
+    /// block lives in both until pruned), index-aligned by id. The first slice of
+    /// the multi-grid model: finished output owned here, leaving the live grid the
+    /// active region.
     frozen: Vec<FrozenBlock>,
+    /// Composite scroll position. `None` at the live edge (the bottom-anchored
+    /// live grid). `Some(abs)` is the absolute line shown at the top of the
+    /// viewport while scrolled back through history; the snapshot then composites
+    /// frozen block buffers (above) with the live grid's active region (below),
+    /// indexed in absolute-line space — independent of alacritty's own scrollback
+    /// offset, which we leave at 0.
+    scroll_top_abs: Option<i64>,
     /// Next block id to hand out (ids are never 0).
     next_block_id: u32,
     /// Working directory reported (OSC 7) since the last block opened.
@@ -201,6 +209,7 @@ impl Terminal {
             prev_alt: false,
             blocks: Vec::new(),
             frozen: Vec::new(),
+            scroll_top_abs: None,
             next_block_id: 1,
             pending_cwd: None,
             palette,
@@ -393,19 +402,30 @@ impl Terminal {
         }
     }
 
-    /// Absolute line currently shown at the top of the viewport.
+    /// Absolute line currently shown at the top of the viewport: the composite
+    /// scroll position when scrolled, else the live edge (`abs_base`, the active
+    /// grid's line 0).
     fn viewport_top_line(&self) -> i64 {
-        self.abs_base - self.term.grid().display_offset() as i64
+        self.scroll_top_abs.unwrap_or(self.abs_base)
     }
 
-    /// Scroll the display so absolute line `abs` becomes the top visible row.
+    /// Oldest absolute line the composite can render: the older of the live grid's
+    /// retained-history floor and the first block's prompt. Frozen buffers can
+    /// outlive the grid's own scrollback, so the first block may sit below the
+    /// grid floor. Always `<= abs_base`, so it is a safe clamp lower bound.
+    fn composite_oldest_abs(&self) -> i64 {
+        let grid_oldest = self.abs_base - self.term.grid().history_size() as i64;
+        let frozen_oldest = self.blocks.first().map_or(i64::MAX, |b| b.prompt_line);
+        grid_oldest.min(frozen_oldest)
+    }
+
+    /// Park the composite so absolute line `abs` is the top visible row, clamped to
+    /// the oldest renderable line; snapping back to the live edge once `abs`
+    /// reaches it.
     fn scroll_top_to(&mut self, abs: i64) {
-        let d_req = (self.abs_base - abs).max(0);
-        let d0 = self.term.grid().display_offset() as i64;
-        let delta = (d_req - d0) as i32;
-        if delta != 0 {
-            self.term.scroll_display(Scroll::Delta(delta));
-        }
+        let edge = self.abs_base; // top line shown at the live edge
+        let clamped = abs.clamp(self.composite_oldest_abs(), edge);
+        self.scroll_top_abs = if clamped >= edge { None } else { Some(clamped) };
     }
 
     /// Clamp an absolute line to a valid grid `Line`, so text extraction never
@@ -705,33 +725,36 @@ impl Terminal {
     // --- scrollback ----------------------------------------------------------
 
     /// Scroll the viewport by `delta` lines (positive scrolls up, into history).
+    /// Moves the composite top line; clamped to the oldest renderable line and
+    /// snapping back to the live edge at the bottom.
     pub fn scroll_lines(&mut self, delta: i32) {
-        self.term.scroll_display(Scroll::Delta(delta));
+        let cur = self.viewport_top_line();
+        self.scroll_top_to(cur - delta as i64);
     }
 
     /// Scroll up one screen.
     pub fn scroll_page_up(&mut self) {
-        self.term.scroll_display(Scroll::PageUp);
+        self.scroll_lines(self.dims.rows.saturating_sub(1) as i32);
     }
 
     /// Scroll down one screen.
     pub fn scroll_page_down(&mut self) {
-        self.term.scroll_display(Scroll::PageDown);
+        self.scroll_lines(-(self.dims.rows.saturating_sub(1) as i32));
     }
 
     /// Jump to the oldest line in history.
     pub fn scroll_to_top(&mut self) {
-        self.term.scroll_display(Scroll::Top);
+        self.scroll_top_to(self.composite_oldest_abs());
     }
 
-    /// Jump back to the live edge (display offset 0).
+    /// Jump back to the live edge.
     pub fn scroll_to_bottom(&mut self) {
-        self.term.scroll_display(Scroll::Bottom);
+        self.scroll_top_abs = None;
     }
 
     /// Whether the viewport is scrolled away from the live edge.
     pub fn is_scrolled(&self) -> bool {
-        self.term.grid().display_offset() != 0
+        self.scroll_top_abs.is_some()
     }
 
     /// Blank rows currently reserved above the grid by the bottom-anchor layout.
@@ -830,10 +853,14 @@ impl Terminal {
 
     /// Map a viewport cell (accounting for scrollback offset) to a grid point.
     fn viewport_to_point(&self, col: u16, row: u16) -> Point {
-        let offset = self.term.grid().display_offset() as i32;
-        let shift = self.display_shift();
         let max_col = self.dims.cols.saturating_sub(1) as usize;
-        Point::new(Line(row as i32 - shift - offset), Column((col as usize).min(max_col)))
+        let line = match self.scroll_top_abs {
+            // Scrolled: a screen row maps straight onto a composite (absolute) line.
+            Some(top) => ((top + row as i64) - self.abs_base) as i32,
+            // Live edge: undo the bottom-anchor shift (alacritty stays at offset 0).
+            None => row as i32 - self.display_shift(),
+        };
+        Point::new(Line(line), Column((col as usize).min(max_col)))
     }
 
     /// Rows of breathing room left below the bottom-anchored prompt so it does not
@@ -931,7 +958,14 @@ impl Terminal {
     }
 
     /// Build a render-ready snapshot of the visible grid.
+    ///
+    /// At the live edge this paints the live grid bottom-anchored (with the input
+    /// band); scrolled back, it paints the composite — frozen block buffers above
+    /// the live grid's active region — via [`Self::composite_snapshot`].
     pub fn snapshot(&self) -> GridSnapshot {
+        if self.scroll_top_abs.is_some() {
+            return self.composite_snapshot();
+        }
         let cols = self.dims.cols;
         let rows = self.dims.rows;
         let mut snap =
@@ -970,6 +1004,91 @@ impl Terminal {
         self.decorate(&mut snap, offset, shift);
         self.fill_input_band(&mut snap, band);
         snap
+    }
+
+    /// Snapshot while scrolled back through history: a top-aligned window over the
+    /// composite, starting at [`Self::scroll_top_abs`]. Each row is sourced from a
+    /// finished block's frozen buffer when the absolute line falls inside one, and
+    /// from the live grid otherwise (the active region, or raw history when there
+    /// is no shell integration). No bottom-anchor, input band, or live cursor here
+    /// — those belong to the live edge — and selection across the frozen/live
+    /// boundary is a later step (#18), so no cells are flagged selected.
+    fn composite_snapshot(&self) -> GridSnapshot {
+        let cols = self.dims.cols;
+        let rows = self.dims.rows;
+        let mut snap =
+            GridSnapshot::filled(cols, rows, self.palette.foreground, self.palette.background);
+        snap.selection_color = self.palette.selection;
+        snap.block_stripe = self.palette.indexed(9); // bright red
+        let red = self.palette.indexed(1);
+        snap.block_tint = Rgba::new(red.r, red.g, red.b, 30); // subtle wash
+        snap.block_separator = self.palette.indexed(8); // ash
+
+        let ncols = cols as usize;
+        let top_abs = self.viewport_top_line();
+        let cursor_abs = self.absolute_cursor_line();
+        for r in 0..rows as usize {
+            let abs = top_abs + r as i64;
+            let dst = r * ncols;
+            self.composite_row_into(abs, cursor_abs, &mut snap.cells[dst..dst + ncols]);
+            if let Some(idx) = self.block_row(abs, cursor_abs) {
+                let b = &self.blocks[idx];
+                snap.rows_decor[r] = RowDecor {
+                    block_id: b.id,
+                    failed: b.state == BlockState::Failed,
+                    block_top: abs == b.prompt_line,
+                };
+            }
+        }
+
+        // Sticky header for the top row's block, if its prompt is above the view.
+        if let Some(idx) = self.block_row(top_abs, cursor_abs) {
+            let b = &self.blocks[idx];
+            if b.prompt_line < top_abs && !b.command.is_empty() {
+                snap.sticky = Some(StickyHeader {
+                    command: b.command.clone(),
+                    failed: b.state == BlockState::Failed,
+                });
+            }
+        }
+        snap
+    }
+
+    /// Fill one composite row (`out.len() == cols`) for absolute line `abs`: from a
+    /// finished block's frozen buffer when `abs` lands inside one, else from the
+    /// live grid. Out-of-range lines stay blank.
+    fn composite_row_into(&self, abs: i64, cursor_abs: i64, out: &mut [CellSnapshot]) {
+        out.fill(CellSnapshot::blank(self.palette.foreground, self.palette.background));
+
+        // Finished block → its frozen buffer (index-aligned with `blocks` by id).
+        if let Some(idx) = self.block_row(abs, cursor_abs) {
+            if idx < self.frozen.len() && self.frozen[idx].id == self.blocks[idx].id {
+                let fb = &self.frozen[idx];
+                // The buffer's last row is the block's end line; map back from there
+                // so a clipped head (rows lost to history) lines up correctly.
+                if let Some(end) = self.blocks[idx].end_line {
+                    let k = abs - end + fb.rows() as i64 - 1;
+                    if let Some(src) = usize::try_from(k).ok().and_then(|k| fb.row(k)) {
+                        let n = src.len().min(out.len());
+                        out[..n].copy_from_slice(&src[..n]);
+                    }
+                }
+                return;
+            }
+        }
+
+        // Otherwise the live grid: the active region, or un-integrated history.
+        let g = abs - self.abs_base;
+        let top = -(self.term.grid().history_size() as i64);
+        let bottom = self.dims.rows.saturating_sub(1) as i64;
+        if g < top || g > bottom {
+            return; // outside the retained grid → blank
+        }
+        let grid = self.term.grid();
+        let gl = Line(g as i32);
+        for (c, cell) in out.iter_mut().enumerate().take(self.dims.cols as usize) {
+            *cell = self.cell_to_snapshot(&grid[gl][Column(c)]);
+        }
     }
 
     /// Paint the input band and flag it on the snapshot. The band exists while a
@@ -1269,6 +1388,52 @@ mod tests {
         assert!(t.is_scrolled(), "wheel-up moves into history");
         t.scroll_to_bottom();
         assert!(!t.is_scrolled(), "scroll-to-bottom returns to the live edge");
+    }
+
+    #[test]
+    fn scrolling_spans_frozen_blocks_and_live_grid() {
+        let mut t = terminal(20, 4);
+        // Two finished blocks (frozen) with distinctive output, then a running one
+        // that keeps a live/active region at the bottom.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07AAA\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07BBB\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07third\r\n\x1b]133;C\x07CCC\r\n");
+        assert_eq!(t.frozen_blocks().len(), 2, "two finished blocks frozen");
+
+        // At the live edge the oldest output has scrolled above the 4-row viewport.
+        let edge: String = t.snapshot().cells.iter().map(|c| c.c).collect();
+        assert!(!edge.contains("AAA"), "first block is above the live edge: {edge:?}");
+
+        // Scrolled to the top, the composite sources the first block from its
+        // frozen buffer — spanning frozen blocks and (further down) the live grid.
+        t.scroll_to_top();
+        assert!(t.is_scrolled(), "parked in history");
+        let hist: String = t.snapshot().cells.iter().map(|c| c.c).collect();
+        assert!(hist.contains("AAA"), "scrolled view shows the first frozen block: {hist:?}");
+
+        // Back at the live edge the running command's output is visible again.
+        t.scroll_to_bottom();
+        assert!(!t.is_scrolled());
+        let back: String = t.snapshot().cells.iter().map(|c| c.c).collect();
+        assert!(back.contains("CCC"), "live edge shows the running output: {back:?}");
+    }
+
+    #[test]
+    fn composite_scroll_clamps_at_both_ends() {
+        let mut t = terminal(10, 3);
+        for i in 0..20 {
+            t.process(format!("l{i}\r\n").as_bytes());
+        }
+        assert!(!t.is_scrolled());
+        t.scroll_lines(-5); // already at the edge — cannot scroll further down
+        assert!(!t.is_scrolled(), "scrolling down at the live edge is a no-op");
+        t.scroll_to_top();
+        assert!(t.is_scrolled(), "scrolled to the oldest line");
+        let oldest_top = t.viewport_top_line();
+        t.scroll_lines(100); // cannot move past the oldest line
+        assert_eq!(t.viewport_top_line(), oldest_top, "clamped at the oldest line");
+        t.scroll_to_bottom();
+        assert!(!t.is_scrolled(), "returned to the live edge");
     }
 
     #[test]
