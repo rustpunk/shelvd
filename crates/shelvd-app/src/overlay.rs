@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use unicode_width::UnicodeWidthStr;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -332,14 +333,28 @@ impl OverlayState {
             && self.selected < first + visible)
             .then(|| self.selected - first);
 
+        let prompt = match self.kind {
+            Kind::Palette => ">".to_owned(),
+            Kind::History => "history".to_owned(),
+        };
+        // Caret column = display width of "<prompt> <query>" (the renderer draws
+        // the prompt, one space, then the query). Using display width — not a
+        // char count — keeps the caret on the real cell when the query holds
+        // wide/CJK glyphs that occupy two columns each.
+        let query_caret_col =
+            UnicodeWidthStr::width(prompt.as_str()) + 1 + UnicodeWidthStr::width(self.query.as_str());
+
         Overlay {
-            prompt: match self.kind {
-                Kind::Palette => ">".into(),
-                Kind::History => "history".into(),
-            },
+            prompt,
             query: self.query.clone(),
             items,
             selected_visible,
+            // Only flag "no matches" once the user has actually typed — an empty
+            // query shows the "type to search…" placeholder, which already
+            // conveys the empty state, so a "no matches" row beside it (e.g. an
+            // empty history with no query) would be a contradictory double-message.
+            no_matches: !self.query.is_empty() && self.filtered.is_empty(),
+            query_caret_col,
             colors,
         }
     }
@@ -384,6 +399,45 @@ mod tests {
         let ov = h.to_overlay(test_colors(), 12);
         assert_eq!(ov.items.len(), 3);
         assert_eq!(ov.selected_visible, Some(0));
+    }
+
+    #[test]
+    fn to_overlay_flags_no_matches() {
+        let mut p = OverlayState::palette();
+        // A matching query: results exist, so the flag is clear.
+        for c in "quit".chars() {
+            p.input_char(c);
+        }
+        assert!(!p.to_overlay(test_colors(), 12).no_matches);
+        // Nonsense query: nothing matches, so the flag is set (and the renderer
+        // draws a "no matches" row off it, not off an empty `items`).
+        for c in "zzz".chars() {
+            p.input_char(c);
+        }
+        assert!(p.filtered.is_empty());
+        assert!(p.to_overlay(test_colors(), 12).no_matches);
+
+        // An empty query never flags "no matches", even when nothing is listed:
+        // a history with no recorded commands shows only the placeholder, not a
+        // contradictory placeholder + "no matches" pair.
+        let empty_history = OverlayState::history(vec![]);
+        assert!(empty_history.filtered.is_empty());
+        assert!(!empty_history.to_overlay(test_colors(), 12).no_matches);
+    }
+
+    #[test]
+    fn to_overlay_caret_column_uses_display_width() {
+        // Palette prompt ">" is one column; the separating space is another.
+        let base = OverlayState::palette().to_overlay(test_colors(), 12).query_caret_col;
+        assert_eq!(base, 2, "\"> \" places the caret in column 2");
+
+        // A wide (double-width) CJK glyph advances the caret by two columns, not
+        // one — a char count would have drifted it left by one.
+        let mut h = OverlayState::history(vec!["世界".into()]);
+        h.input_char('世'); // U+4E16, display width 2
+        let ov = h.to_overlay(test_colors(), 12);
+        // prompt "history" = 7 cols, + 1 space, + 2 for the wide glyph.
+        assert_eq!(ov.query_caret_col, 7 + 1 + 2);
     }
 
     #[test]
