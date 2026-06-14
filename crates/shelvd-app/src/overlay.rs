@@ -37,6 +37,9 @@ pub enum Action {
     Quit,
     /// Write this command into the PTY's input line (a history pick).
     InsertCommand(String),
+    /// Add the band's current input to the type-ahead queue, to run on the next
+    /// prompt (the global "queue this command" action).
+    QueueInput,
 }
 
 /// The base key of a chord: a character (matched case-insensitively) or a named
@@ -100,6 +103,7 @@ impl Chord {
             ChordKey::Named(NamedKey::ArrowDown) => s.push_str("Down"),
             ChordKey::Named(NamedKey::PageUp) => s.push_str("PageUp"),
             ChordKey::Named(NamedKey::PageDown) => s.push_str("PageDown"),
+            ChordKey::Named(NamedKey::Enter) => s.push_str("Enter"),
             ChordKey::Named(_) => {}
         }
         s
@@ -152,6 +156,11 @@ fn commands() -> &'static [Binding] {
                 label: Some("Copy selection"),
             },
             Binding { action: Action::Paste, chord: cs(Char('v')), label: None },
+            Binding {
+                action: Action::QueueInput,
+                chord: cs(Named(NamedKey::Enter)),
+                label: Some("Add typed input to run next"),
+            },
             Binding { action: Action::PageUp, chord: sh(Named(NamedKey::PageUp)), label: None },
             Binding { action: Action::PageDown, chord: sh(Named(NamedKey::PageDown)), label: None },
             Binding { action: Action::ScrollToTop, chord: None, label: Some("Scroll to top") },
@@ -169,6 +178,85 @@ pub fn key_to_action(event: &KeyEvent, mods: ModifiersState) -> Option<Action> {
         let chord = b.chord?;
         chord.matches(&event.logical_key, mods).then(|| b.action.clone())
     })
+}
+
+/// A single editable text line: append-typed, backspace-deleted, with a caret
+/// that always rests at the end. The shared input primitive behind both the
+/// palette/history query and the compose-next band, so both edit text the same
+/// way — control chars ignored, the caret measured in display columns (wide
+/// glyphs count as two) rather than `char`s.
+#[derive(Default)]
+struct InputLine {
+    text: String,
+}
+
+impl InputLine {
+    /// Append a typed character (ignoring control chars).
+    fn input_char(&mut self, c: char) {
+        if !c.is_control() {
+            self.text.push(c);
+        }
+    }
+
+    /// Delete the last character.
+    fn backspace(&mut self) {
+        self.text.pop();
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Take the text, leaving the line empty (used to queue a composed command).
+    fn take(&mut self) -> String {
+        std::mem::take(&mut self.text)
+    }
+
+    /// Display column the caret rests on: the summed width of every glyph, so a
+    /// wide/CJK char advances it by two columns, not one.
+    fn caret_col(&self) -> usize {
+        UnicodeWidthStr::width(self.text.as_str())
+    }
+}
+
+/// The band's input line: the next command being typed at the bottom while a
+/// command runs. Edits the same way the overlay query does (see [`InputLine`]);
+/// the event loop takes it on Enter (send to the running command) or on
+/// Ctrl+Shift+Enter ([`Action::QueueInput`], queue for the next prompt).
+#[derive(Default)]
+pub struct BandInput {
+    line: InputLine,
+}
+
+impl BandInput {
+    /// Append a typed character to the input line.
+    pub fn input_char(&mut self, c: char) {
+        self.line.input_char(c);
+    }
+
+    /// Delete the last character of the input line.
+    pub fn backspace(&mut self) {
+        self.line.backspace();
+    }
+
+    /// The text typed so far.
+    pub fn text(&self) -> &str {
+        self.line.text()
+    }
+
+    /// Whether the input line is empty.
+    pub fn is_empty(&self) -> bool {
+        self.line.is_empty()
+    }
+
+    /// Take the typed text, leaving the line empty.
+    pub fn take(&mut self) -> String {
+        self.line.take()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,7 +288,7 @@ impl Candidate {
 /// Live state of an open overlay.
 pub struct OverlayState {
     kind: Kind,
-    query: String,
+    query: InputLine,
     candidates: Vec<Candidate>,
     /// Indices into `candidates`, best match first.
     filtered: Vec<usize>,
@@ -236,7 +324,7 @@ impl OverlayState {
     fn build(kind: Kind, candidates: Vec<Candidate>) -> Self {
         let mut state = Self {
             kind,
-            query: String::new(),
+            query: InputLine::default(),
             filtered: (0..candidates.len()).collect(),
             candidates,
             selected: 0,
@@ -248,16 +336,13 @@ impl OverlayState {
 
     /// Append a typed character to the query (ignoring control chars).
     pub fn input_char(&mut self, c: char) {
-        if c.is_control() {
-            return;
-        }
-        self.query.push(c);
+        self.query.input_char(c);
         self.refilter();
     }
 
     /// Delete the last query character.
     pub fn backspace(&mut self) {
-        self.query.pop();
+        self.query.backspace();
         self.refilter();
     }
 
@@ -283,7 +368,8 @@ impl OverlayState {
         if self.query.is_empty() {
             self.filtered = (0..self.candidates.len()).collect();
         } else {
-            let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+            let pattern =
+                Pattern::parse(self.query.text(), CaseMatching::Ignore, Normalization::Smart);
             let candidates = &self.candidates;
             let matcher = &mut self.matcher;
             // One scratch buffer, reused per candidate (Utf32Str::new clears it).
@@ -342,11 +428,11 @@ impl OverlayState {
         // char count — keeps the caret on the real cell when the query holds
         // wide/CJK glyphs that occupy two columns each.
         let query_caret_col =
-            UnicodeWidthStr::width(prompt.as_str()) + 1 + UnicodeWidthStr::width(self.query.as_str());
+            UnicodeWidthStr::width(prompt.as_str()) + 1 + self.query.caret_col();
 
         Overlay {
             prompt,
-            query: self.query.clone(),
+            query: self.query.text().to_owned(),
             items,
             selected_visible,
             // Only flag "no matches" once the user has actually typed — an empty
@@ -541,6 +627,35 @@ mod tests {
             Chord::new(false, true, false, ChordKey::Named(NamedKey::PageDown)).hint(),
             "Shift+PageDown"
         );
+        // The compose-next chord: the hint must name Enter, not stop at the mods.
+        assert_eq!(
+            Chord::new(true, true, false, ChordKey::Named(NamedKey::Enter)).hint(),
+            "Ctrl+Shift+Enter"
+        );
+    }
+
+    #[test]
+    fn band_input_edits_like_a_line() {
+        let mut c = BandInput::default();
+        for ch in "hi".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(c.text(), "hi");
+        c.backspace();
+        assert_eq!(c.text(), "h");
+        // Taking the text yields it and clears the line for the next entry.
+        assert_eq!(c.take(), "h");
+        assert!(c.is_empty(), "take leaves the line empty");
+    }
+
+    #[test]
+    fn queue_input_is_keybound_and_listed() {
+        let queue = commands()
+            .iter()
+            .find(|b| matches!(b.action, Action::QueueInput))
+            .expect("queue-input is in the command table");
+        assert_eq!(queue.chord.unwrap().hint(), "Ctrl+Shift+Enter");
+        assert!(queue.label.is_some(), "it surfaces in the palette");
     }
 
     #[test]

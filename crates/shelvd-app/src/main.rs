@@ -8,7 +8,7 @@
 
 mod overlay;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ use arboard::Clipboard;
 use shelvd_core::{Config, OverlayColors, ResizeEdge, Rgba, TitlebarHit};
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
-use shelvd_term::{TermEvent, Terminal};
+use shelvd_term::{BandState, SemanticKind, TermEvent, Terminal};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -25,7 +25,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{ResizeDirection, Window, WindowId};
 
-use overlay::{key_to_action, Action, OverlayState};
+use overlay::{key_to_action, Action, BandInput, OverlayState};
 
 /// Events delivered to the loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +119,12 @@ struct State {
     /// The open command palette / history overlay, if any. While present, the
     /// keyboard drives the overlay instead of the PTY.
     overlay: Option<OverlayState>,
+    /// The bottom band's input line — what the user is typing while a command
+    /// runs. Sent to the running command on Enter, or queued on Ctrl+Shift+Enter.
+    input: BandInput,
+    /// Commands queued ahead, flushed one at a time to the PTY on each new shell
+    /// prompt (OSC 133;A).
+    queue: VecDeque<String>,
     /// Overlay colors resolved from the theme at startup.
     overlay_colors: OverlayColors,
     /// Current downward pixel offset of the grid layer for the fill transition
@@ -239,6 +245,8 @@ impl ApplicationHandler<UserEvent> for App {
             blink_on: true,
             last_blink: Instant::now(),
             overlay: None,
+            input: BandInput::default(),
+            queue: VecDeque::new(),
             overlay_colors: overlay_colors(&self.config),
             anim_offset_px: 0.0,
             anim_from_px: 0.0,
@@ -293,7 +301,13 @@ impl ApplicationHandler<UserEvent> for App {
                     dirty = true;
                 }
                 // A command-block boundary moved; redraw so block visuals follow.
-                TermEvent::SemanticPrompt { .. } => dirty = true,
+                // A fresh prompt (133;A) is the cue to advance the type-ahead queue.
+                TermEvent::SemanticPrompt { kind, .. } => {
+                    if kind == SemanticKind::PromptStart {
+                        on_prompt_start(state);
+                    }
+                    dirty = true;
+                }
                 TermEvent::Bell | TermEvent::ClipboardStore(_) | TermEvent::Wakeup
                 | TermEvent::MouseCursorDirty | TermEvent::WorkingDirectory(_) => {}
             }
@@ -573,6 +587,20 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(action) = key_to_action(&event, mods) {
                     run_action(state, event_loop, action);
                     state.window.request_redraw();
+                    return;
+                }
+                // While a command runs, the bottom band is the live input field:
+                // typing edits it (Enter sends it to the running command, while
+                // Ctrl+Shift+Enter — handled above — queues it) instead of leaking
+                // raw into the output. Control/Alt combos still pass straight
+                // through, so Ctrl+C and friends can signal the command. The alt
+                // screen is exempt — full-screen apps own all input there.
+                if state.terminal.command_running()
+                    && !state.terminal.alt_screen()
+                    && !mods.control_key()
+                    && !mods.alt_key()
+                {
+                    handle_band_key(state, &event);
                     return;
                 }
                 // Normal input: jump back to the live edge, then send the bytes.
@@ -945,6 +973,81 @@ fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
                 log::debug!("history insert failed: {e}");
             }
         }
+        Action::QueueInput => {
+            // Add the band's current input to the type-ahead queue, to run on the
+            // next prompt. Meaningful while a command is running (that is when the
+            // band is the input field); a no-op when the line is empty.
+            let line = state.input.take();
+            if !line.trim().is_empty() {
+                state.queue.push_back(line);
+            }
+            sync_band(state);
+        }
+    }
+}
+
+/// Mirror the app's band input + queue into the terminal so it renders the input
+/// line and the queued commands. Called after any change to either, before the
+/// next redraw, so layout and rendering stay derived from one source.
+fn sync_band(state: &mut State) {
+    let band = BandState {
+        input: state.input.text().to_owned(),
+        queued: state.queue.iter().cloned().collect(),
+        // Mask the input when the running command has turned echo off (a password
+        // prompt); the real bytes are still what we send on Enter.
+        masked: !state.pty.echo_enabled(),
+    };
+    state.terminal.set_band(band);
+}
+
+/// Route a key press to the band's input line while a command runs: edit the
+/// text, or — on Enter — send it to the running command's stdin and clear it.
+/// (Ctrl+Shift+Enter, handled earlier as [`Action::QueueInput`], queues instead.)
+fn handle_band_key(state: &mut State, event: &KeyEvent) {
+    match &event.logical_key {
+        Key::Named(NamedKey::Enter) => {
+            // Send the typed line to the running command's stdin, then clear it.
+            let mut bytes = state.input.take().into_bytes();
+            bytes.push(b'\r');
+            if let Err(e) = state.pty.write(&bytes) {
+                log::debug!("band send failed: {e}");
+            }
+        }
+        Key::Named(NamedKey::Backspace) => state.input.backspace(),
+        Key::Named(NamedKey::Space) => state.input.input_char(' '),
+        Key::Character(s) => {
+            for ch in s.chars() {
+                state.input.input_char(ch);
+            }
+        }
+        _ => {}
+    }
+    // Keep the band at the live edge so the input line stays on screen.
+    state.terminal.scroll_to_bottom();
+    sync_band(state);
+    state.window.request_redraw();
+}
+
+/// Handle a fresh shell prompt (OSC 133;A): advance the type-ahead queue by one.
+/// The queue runs on every prompt until drained. When nothing is queued but the
+/// band still holds a half-typed line, that line is handed to the now-idle prompt
+/// (no Enter, so it lands as editable input) rather than dropped.
+fn on_prompt_start(state: &mut State) {
+    if let Some(cmd) = state.queue.pop_front() {
+        let mut bytes = cmd.into_bytes();
+        bytes.push(b'\r'); // type the command and run it
+        if let Err(e) = state.pty.write(&bytes) {
+            log::debug!("queue flush failed: {e}");
+        }
+        sync_band(state);
+        return;
+    }
+    if !state.input.is_empty() {
+        let pending = state.input.take();
+        if let Err(e) = state.pty.write(pending.as_bytes()) {
+            log::debug!("band handoff failed: {e}");
+        }
+        sync_band(state);
     }
 }
 

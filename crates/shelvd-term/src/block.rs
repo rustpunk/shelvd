@@ -9,6 +9,8 @@
 
 use std::time::Instant;
 
+use shelvd_core::CellSnapshot;
+
 /// Where a block is in its lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockState {
@@ -37,10 +39,11 @@ pub struct Block {
     pub end_line: Option<i64>,
     /// The command text, captured from `B`..`C`.
     pub command: String,
-    /// The full prompt line as rendered — the prompt prefix plus the typed
-    /// command (the `command_line` from column 0). Drives the running-command
-    /// band so it mirrors the executed line as it appears in the block above.
-    pub prompt_command: String,
+    /// The prompt prefix as rendered — columns `[0, command_col)` of the command
+    /// line, captured with their real colors. Drives the input band so it shows
+    /// the prompt (e.g. `user@host:~$ `) in its normal style, with only the
+    /// command portion distinct.
+    pub prompt_prefix: Vec<CellSnapshot>,
     /// The command's exit code, if reported.
     pub exit_code: Option<i32>,
     /// Lifecycle state, derived from the exit code.
@@ -64,7 +67,7 @@ impl Block {
             output_line: None,
             end_line: None,
             command: String::new(),
-            prompt_command: String::new(),
+            prompt_prefix: Vec::new(),
             exit_code: None,
             state: BlockState::Running,
             cwd,

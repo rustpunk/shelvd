@@ -17,7 +17,7 @@ use alacritty_terminal::Term;
 
 use std::time::Instant;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use shelvd_core::{
     CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba, RowDecor,
@@ -60,6 +60,26 @@ pub enum TermEvent {
     WorkingDirectory(String),
     /// The child process exited.
     Exit,
+}
+
+/// What the bottom input band should display this frame, pushed by the app via
+/// [`Terminal::set_band`]: the text typed into the always-editable input line and
+/// the commands queued to run on upcoming prompts. While a command runs the band
+/// is the live input field — when `input` is empty it shows the running command
+/// grayed as a placeholder (see [`Terminal::command_running`]); as soon as the
+/// user types, their text replaces it. All band layout stays inside this crate.
+#[derive(Clone, Debug, Default)]
+pub struct BandState {
+    /// Text typed into the band's input line — the next command being composed.
+    /// Empty means show the running command as a grayed placeholder instead.
+    pub input: String,
+    /// Commands queued to run on upcoming prompts, oldest (next to run) first;
+    /// shown stacked above the input line, pushing the console up.
+    pub queued: Vec<String>,
+    /// Mask the typed input (render one bullet per character) because the running
+    /// command has turned terminal echo off — e.g. a `sudo` password prompt. The
+    /// real text is still sent on Enter; only the on-screen rendering is hidden.
+    pub masked: bool,
 }
 
 /// Grid dimensions handed to alacritty. `total_lines == screen_lines`; the grid
@@ -144,6 +164,11 @@ pub struct Terminal {
     /// byte the grid is empty; suppressing the cursor until then avoids a lone
     /// cursor flashing at the bottom of an otherwise blank, bottom-anchored screen.
     seen_output: bool,
+    /// Input-band state pushed by the app: the editable compose line and the
+    /// type-ahead queue. While either is active the band is forced (even at a
+    /// prompt) and shows the type-ahead UI; otherwise it falls back to the locked
+    /// running-command mirror.
+    band: BandState,
 }
 
 impl Terminal {
@@ -176,6 +201,7 @@ impl Terminal {
             cursor_shape,
             dims,
             seen_output: false,
+            band: BandState::default(),
         }
     }
 
@@ -260,13 +286,14 @@ impl Terminal {
                     .map(|b| (b.command_line, b.command_col));
                 if let Some((cmd_line, cmd_col)) = pending {
                     let command = self.capture_command(cmd_line, cmd_col, line);
-                    // From column 0: the prompt prefix plus the command, for the band.
-                    let prompt_command = self.capture_command(cmd_line, 0, line);
+                    // The prompt prefix (columns before the command), kept with its
+                    // real colors so the band shows it in its normal style.
+                    let prompt_prefix = self.capture_row_cells(cmd_line, cmd_col);
                     let started = Instant::now();
                     if let Some(b) = self.blocks.last_mut() {
                         b.output_line = Some(line);
                         b.command = command;
-                        b.prompt_command = prompt_command;
+                        b.prompt_prefix = prompt_prefix;
                         b.started_at = Some(started);
                     }
                 }
@@ -381,6 +408,52 @@ impl Terminal {
             return String::new();
         }
         self.term.bounds_to_string(start, end).trim().to_string()
+    }
+
+    /// Resolve one alacritty cell into a render-ready [`CellSnapshot`] (colors via
+    /// the full path so inverse/hidden/bold-brighten are respected, plus the
+    /// attribute flags). Selection is layered on by the caller — it is a viewport
+    /// concern, not a property of the cell. Shared by the grid snapshot and the
+    /// prompt-prefix capture so both resolve cells identically.
+    fn cell_to_snapshot(&self, cell: &Cell) -> CellSnapshot {
+        // Trailing/leading spacers of a wide glyph paint background only.
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            let (_, bg) = self.cell_colors(cell);
+            return CellSnapshot { c: ' ', fg: bg, bg, flags: CellFlags::WIDE_SPACER };
+        }
+        let (fg, bg) = self.cell_colors(cell);
+        let mut flags = CellFlags::empty();
+        if cell.flags.contains(Flags::BOLD) {
+            flags |= CellFlags::BOLD;
+        }
+        if cell.flags.contains(Flags::ITALIC) {
+            flags |= CellFlags::ITALIC;
+        }
+        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+            flags |= CellFlags::UNDERLINE;
+        }
+        if cell.flags.contains(Flags::STRIKEOUT) {
+            flags |= CellFlags::STRIKEOUT;
+        }
+        if cell.flags.contains(Flags::WIDE_CHAR) {
+            flags |= CellFlags::WIDE;
+        }
+        let c = if cell.c == '\0' { ' ' } else { cell.c };
+        CellSnapshot { c, fg, bg, flags }
+    }
+
+    /// Capture columns `[0, end_col)` of one absolute grid line as render-ready
+    /// cells — the prompt prefix (everything before the typed command), kept with
+    /// its real colors so the input band can show it in its normal style rather
+    /// than a flat dim. Read at OutputStart, when the line is still on the grid.
+    fn capture_row_cells(&self, line: i64, end_col: usize) -> Vec<CellSnapshot> {
+        let g = Line(self.abs_to_grid_line(line));
+        let grid = self.term.grid();
+        let end = end_col.min(self.dims.cols as usize);
+        (0..end).map(|c| self.cell_to_snapshot(&grid[g][Column(c)])).collect()
     }
 
     /// Read a trailing slice of a block's output, for later suggested actions.
@@ -585,6 +658,27 @@ impl Terminal {
         self.display_shift().max(0) as u16
     }
 
+    // --- compose-next mode ---------------------------------------------------
+
+    /// Push the bottom input band's state (the editable compose line and the
+    /// type-ahead queue). While either is non-empty the terminal reserves a band
+    /// even at a prompt and renders the type-ahead UI in place of the locked
+    /// running-command mirror. The app owns the authoritative edit/queue state and
+    /// pushes a fresh view here on every change, so band height
+    /// ([`Self::display_shift`]) and rendering ([`Self::fill_input_band`]) stay
+    /// derived from one source.
+    pub fn set_band(&mut self, band: BandState) {
+        self.band = band;
+    }
+
+    /// Whether a command is running at the live edge: shell integration reported
+    /// its output start (OSC 133;C) but not yet its finish (133;D). Compose-next
+    /// mode only engages while this holds — there must be a running command to
+    /// type ahead of — so the app gates the keybinding on it.
+    pub fn command_running(&self) -> bool {
+        matches!(self.blocks.last(), Some(b) if b.output_line.is_some() && b.end_line.is_none())
+    }
+
     // --- terminal modes ------------------------------------------------------
 
     /// Whether the program enabled bracketed paste (DEC 2004).
@@ -665,6 +759,10 @@ impl Terminal {
     /// shift is clamped at 0 and content always wins over the gutter.
     const BOTTOM_GUTTER: i32 = 1;
 
+    /// Most queued commands shown as their own rows in the band before the rest
+    /// collapse into a "+N more" line, so a long queue can't swallow the screen.
+    const MAX_QUEUE_ROWS: i32 = 6;
+
     /// Blank rows to reserve above the grid so the live prompt rests near the
     /// bottom of the window (Warp-style) instead of climbing down from the top.
     /// Active only at the live edge of the main screen, and only until output
@@ -696,22 +794,30 @@ impl Terminal {
         (rows - 1 - reserve - self.content_bottom()).max(-band)
     }
 
-    /// Rows to reserve at the bottom for the pinned input band. One while a shell
-    /// command is running at the live edge of the main screen — so its output
-    /// scrolls above a fixed strip — and zero everywhere else: at a prompt the
-    /// prompt *is* the bottom line (today's anchor, [`Self::BOTTOM_GUTTER`]), and
-    /// the band is ruled out without shell integration, on the alt screen, and in
-    /// scrolled-back history.
+    /// Rows to reserve at the bottom for the pinned input band: an input line plus
+    /// one row per queued command (stacked above it). The input line is present
+    /// while a command runs (its output scrolls above the band) or while compose
+    /// mode is engaged; queued commands add rows whenever the queue is non-empty,
+    /// pushing the console up. Zero when none of those hold — at a resting prompt
+    /// the prompt *is* the bottom line ([`Self::BOTTOM_GUTTER`]) — and the band is
+    /// ruled out without shell integration, on the alt screen, and in scrollback.
+    /// Capped to leave at least one content row, and [`Self::MAX_QUEUE_ROWS`]
+    /// queued rows before the remainder collapses into a "+N more" line.
     fn input_band_rows(&self) -> i32 {
         // Need at least one row above the band; on a degenerate 1-row grid
         // `display_shift_with` also bails, so keep the two in agreement.
         if self.dims.rows <= 1 || self.is_scrolled() || self.alt_screen() {
             return 0;
         }
-        match self.blocks.last() {
-            Some(b) if b.output_line.is_some() && b.end_line.is_none() => 1,
-            _ => 0,
+        let bottom = i32::from(self.command_running());
+        let queued = self.band.queued.len() as i32;
+        if bottom == 0 && queued == 0 {
+            return 0;
         }
+        // Keep at least one content row; show up to MAX_QUEUE_ROWS queued rows.
+        let max_total = (self.dims.rows as i32 - 1).max(1);
+        let queue_rows = queued.min(Self::MAX_QUEUE_ROWS).min(max_total - bottom).max(0);
+        bottom + queue_rows
     }
 
     /// The lowest occupied visible row at the live edge: the cursor's row or the
@@ -770,43 +876,11 @@ impl Terminal {
                 .as_ref()
                 .is_some_and(|range| point_in_range(indexed.point, range));
 
-            // Trailing/leading spacers of a wide glyph paint background only.
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                let (_, bg) = self.cell_colors(cell);
-                let mut flags = CellFlags::WIDE_SPACER;
-                if selected {
-                    flags |= CellFlags::SELECTED;
-                }
-                snap.cells[dst] = CellSnapshot { c: ' ', fg: bg, bg, flags };
-                continue;
-            }
-
-            let (fg, bg) = self.cell_colors(cell);
-            let mut flags = CellFlags::empty();
-            if cell.flags.contains(Flags::BOLD) {
-                flags |= CellFlags::BOLD;
-            }
-            if cell.flags.contains(Flags::ITALIC) {
-                flags |= CellFlags::ITALIC;
-            }
-            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-                flags |= CellFlags::UNDERLINE;
-            }
-            if cell.flags.contains(Flags::STRIKEOUT) {
-                flags |= CellFlags::STRIKEOUT;
-            }
-            if cell.flags.contains(Flags::WIDE_CHAR) {
-                flags |= CellFlags::WIDE;
-            }
+            let mut snapshot = self.cell_to_snapshot(cell);
             if selected {
-                flags |= CellFlags::SELECTED;
+                snapshot.flags |= CellFlags::SELECTED;
             }
-
-            let c = if cell.c == '\0' { ' ' } else { cell.c };
-            snap.cells[dst] = CellSnapshot { c, fg, bg, flags };
+            snap.cells[dst] = snapshot;
         }
 
         snap.cursor = self.cursor_snapshot(offset, shift, cols, rows);
@@ -815,38 +889,143 @@ impl Terminal {
         snap
     }
 
-    /// Paint the running-command band and flag it on the snapshot. The band
-    /// exists only while a command is running (see [`Self::input_band_rows`]); at
-    /// a prompt the bottom row is the live prompt itself, so this is a no-op and
-    /// the snapshot keeps its plain bottom-anchor. The label mirrors the executed
-    /// prompt line from the block above, dimmed to read as a locked, non-editable
-    /// strip while the command holds the input.
+    /// Paint the input band and flag it on the snapshot. The band exists while a
+    /// command is running, or while commands are queued (see
+    /// [`Self::input_band_rows`]); at a resting prompt the bottom row is the live
+    /// shell prompt itself, so this is a no-op.
+    ///
+    /// Bottom-up the band is: the **input line** — the always-editable field,
+    /// leading with the captured prompt prefix in its real colors, then the typed
+    /// text (or, when empty, the running command grayed as a placeholder) and a
+    /// beam caret — and, stacked above it, one **queued row** per typed-ahead
+    /// command (oldest at the top), so queuing grows the band and pushes the
+    /// console up.
     fn fill_input_band(&self, snap: &mut GridSnapshot, band: i32) {
         if band <= 0 {
             return;
         }
         let cols = snap.cols as usize;
-        let band_top = snap.rows.saturating_sub(band as u16) as usize;
-        // De-emphasized so the strip reads as locked chrome, not live output.
+        let rows = snap.rows as usize;
+        let band_top = rows.saturating_sub(band as usize);
         let dim = self.palette.indexed(8); // ash / bright-black
         // Reset the band rows to blanks and drop any block decoration that mapped
         // onto them, so the strip is its own region rather than the running
         // block's trailing output.
         let blank = CellSnapshot::blank(dim, self.palette.background);
-        for row in band_top..snap.rows as usize {
+        for row in band_top..rows {
             for col in 0..cols {
                 snap.cells[row * cols + col] = blank;
             }
             snap.rows_decor[row] = RowDecor::default();
         }
-        // The executed prompt line (prompt prefix + command), mirroring the block
-        // above; fall back to a generic marker if it wasn't captured.
-        let label = match self.blocks.last() {
-            Some(b) if !b.prompt_command.is_empty() => b.prompt_command.as_str(),
-            _ => "running…",
-        };
-        write_row(&mut snap.cells[band_top * cols..(band_top + 1) * cols], label, blank);
         snap.input_band_rows = band as u16;
+
+        let has_input_line = self.command_running();
+
+        // Queued commands stack above the input line — or fill the whole band in
+        // the brief transient where the queue is flushing at a fresh prompt and
+        // there is no input line yet.
+        let queue_rows = band as usize - usize::from(has_input_line);
+        self.fill_queued_rows(snap, band_top, queue_rows);
+
+        if !has_input_line {
+            return;
+        }
+        let input_row = rows - 1;
+
+        // Lead the input line with the prompt prefix in its captured colors so the
+        // band reads as a real prompt line.
+        let prefix_w = {
+            let prefix = match self.blocks.last() {
+                Some(b) => b.prompt_prefix.as_slice(),
+                None => &[],
+            };
+            let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
+            let mut col = 0;
+            for cell in prefix {
+                if col >= cols {
+                    break;
+                }
+                row[col] = *cell;
+                col += 1;
+            }
+            col
+        };
+
+        self.fill_band_input(snap, input_row, prefix_w);
+    }
+
+    /// Render the queued commands as dim, italic rows stacked above the input
+    /// line, oldest (next to run) first. When more are queued than `count` rows,
+    /// the bottom row collapses the remainder into a "+N more queued" line.
+    fn fill_queued_rows(&self, snap: &mut GridSnapshot, top: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let cols = snap.cols as usize;
+        let total = self.band.queued.len();
+        // Dim + italic reads as pending, distinct from the bright input line.
+        let mut style = CellSnapshot::blank(self.palette.indexed(8), self.palette.background);
+        style.flags = CellFlags::ITALIC;
+        for i in 0..count {
+            let text = if i + 1 == count && total > count {
+                format!("+ {} more queued", total - (count - 1))
+            } else {
+                format!("\u{2022} {}", self.band.queued[i]) // • bullet
+            };
+            let row = &mut snap.cells[(top + i) * cols..(top + i + 1) * cols];
+            write_row(row, &text, style);
+        }
+    }
+
+    /// Render the always-editable input line after the prompt prefix on
+    /// `input_row`: the typed text in the normal foreground, or — when nothing is
+    /// typed — the running command grayed as a placeholder (so the band still
+    /// shows what is running until the user types over it). A beam caret sits at
+    /// the input position (the start of the field when empty). The typed text is
+    /// end-anchored: if it outgrows the line, only its tail (where the caret sits)
+    /// shows. `prefix_w` is where the prompt ends.
+    fn fill_band_input(&self, snap: &mut GridSnapshot, input_row: usize, prefix_w: usize) {
+        let cols = snap.cols as usize;
+        let bg = self.palette.background;
+        let avail = cols.saturating_sub(prefix_w).saturating_sub(1); // leave the caret a column
+        let input = self.band.input.as_str();
+
+        let caret = if input.is_empty() {
+            // Grayed placeholder: the running command, from its start, until typed
+            // over. The caret rests at the start of the input area.
+            let placeholder = match self.blocks.last() {
+                Some(b) if !b.command.is_empty() => b.command.as_str(),
+                _ => "running…",
+            };
+            let dim_blank = CellSnapshot::blank(self.palette.indexed(8), bg);
+            let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
+            write_row(&mut row[prefix_w.min(cols)..], placeholder, dim_blank);
+            prefix_w
+        } else {
+            let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
+            // No-echo input (e.g. a sudo password): show one bullet per character
+            // so the secret never reaches the screen. The real text is still what
+            // gets sent on Enter — only this rendering is masked.
+            let masked = self.band.masked.then(|| "\u{2022}".repeat(input.chars().count()));
+            let source = masked.as_deref().unwrap_or(input);
+            let shown = visible_tail(source, avail);
+            let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
+            write_row(&mut row[prefix_w.min(cols)..], shown, fg_blank);
+            prefix_w + UnicodeWidthStr::width(shown)
+        };
+
+        // A beam caret reads as a text-insertion point, distinct from the block
+        // cursor the shell draws. This runs after `cursor_snapshot` set the grid
+        // cursor, so it takes precedence — the input lives in the band, not the
+        // output.
+        snap.cursor = Some(CursorSnapshot {
+            col: caret.min(cols.saturating_sub(1)) as u16,
+            row: input_row as u16,
+            shape: CursorShape::Beam,
+            color: self.palette.cursor,
+            text_color: self.palette.cursor_text,
+        });
     }
 
     fn cursor_snapshot(&self, offset: i32, shift: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
@@ -934,6 +1113,24 @@ fn write_row(cells: &mut [CellSnapshot], text: &str, blank: CellSnapshot) {
         }
         col += w;
     }
+}
+
+/// The trailing slice of `text` whose display width fits in `max` columns, so an
+/// end-anchored caret stays visible once the composed line outgrows the band. A
+/// wide glyph that would straddle the boundary is dropped whole (its two columns
+/// don't fit), never split.
+fn visible_tail(text: &str, max: usize) -> &str {
+    let mut width = 0;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + w > max {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    &text[start..]
 }
 
 /// Which half of a cell a pixel fell on, as an alacritty selection side.
@@ -1326,5 +1523,157 @@ mod tests {
         assert_eq!(snap.input_band_rows, 0, "a prompt keeps the plain bottom-anchor");
         let cur = snap.cursor.expect("cursor visible");
         assert_eq!(snap.cell(0, cur.row).unwrap().c, '$');
+    }
+
+    #[test]
+    fn command_running_tracks_output_to_finish() {
+        let mut t = terminal(20, 6);
+        assert!(!t.command_running(), "idle before any command");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07go\r\n\x1b]133;C\x07");
+        assert!(t.command_running(), "output started, not yet finished");
+        t.process(b"out\r\n\x1b]133;D;0\x07");
+        assert!(!t.command_running(), "command finished");
+    }
+
+    /// Band state with the given input text and queued commands (echo on).
+    fn band(input: &str, queued: &[&str]) -> BandState {
+        BandState {
+            input: input.to_owned(),
+            queued: queued.iter().map(|s| (*s).to_owned()).collect(),
+            masked: false,
+        }
+    }
+
+    #[test]
+    fn band_input_keeps_the_prompt_prefix_before_the_typed_text() {
+        let mut t = terminal(40, 6);
+        // A running command so the prompt prefix ("$ ") is captured.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        t.set_band(band("echo hi", &[]));
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 1, "just the input line when nothing is queued");
+        let last = snap.rows - 1;
+        let line = row_text(&snap, last);
+        // Reads as an anchored prompt: prefix kept, typed text after it.
+        assert!(line.starts_with("$ "), "the prompt prefix leads the band: {line:?}");
+        assert!(line.contains("echo hi"), "the typed text follows it: {line:?}");
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last, "the caret sits on the input row");
+        // Caret after the prompt ("$ " = 2 cols) plus the typed text ("echo hi" = 7).
+        assert_eq!(cur.col, 9, "the caret rests past the prompt and the typed text");
+        assert_eq!(cur.shape, CursorShape::Beam, "a beam reads as a text-insertion point");
+    }
+
+    #[test]
+    fn masked_band_hides_typed_input_behind_bullets() {
+        let mut t = terminal(40, 6);
+        // A running command (e.g. `sudo`) that turned echo off to read a secret.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sudo true\r\n\x1b]133;C\x07");
+        t.set_band(BandState {
+            input: "hunter2".to_owned(),
+            queued: Vec::new(),
+            masked: true,
+        });
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let line = row_text(&snap, last);
+        assert!(line.starts_with("$ "), "the prompt prefix is still shown: {line:?}");
+        assert!(!line.contains("hunter2"), "the secret never reaches the screen: {line:?}");
+        // One bullet per typed character, and nothing but bullets after the prefix.
+        let bullets = line.chars().filter(|&c| c == '\u{2022}').count();
+        assert_eq!(bullets, "hunter2".chars().count(), "one bullet per typed char");
+        // The beam caret still trails the masked text (prompt "$ " = 2 cols + 7).
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last);
+        assert_eq!(cur.col, 9, "the caret rests past the prompt and the masked text");
+    }
+
+    #[test]
+    fn empty_band_shows_the_running_command_grayed_with_the_caret_at_the_start() {
+        let mut t = terminal(40, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        // Nothing typed yet: the band shows the running command as a placeholder.
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let pal = Palette::default();
+        assert_eq!(snap.cell(0, last).unwrap().c, '$');
+        assert_eq!(snap.cell(0, last).unwrap().fg, pal.foreground, "prompt keeps its normal style");
+        assert_eq!(snap.cell(2, last).unwrap().c, 's', "the running command is the placeholder");
+        assert_eq!(snap.cell(2, last).unwrap().fg, pal.indexed(8), "the placeholder is grayed");
+        // The band is the live input: a caret sits at the start of the field.
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last);
+        assert_eq!(cur.col, 2, "the caret rests at the start of the input area, after the prompt");
+        assert_eq!(cur.shape, CursorShape::Beam);
+    }
+
+    #[test]
+    fn typing_replaces_the_grayed_placeholder() {
+        let mut t = terminal(40, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        t.set_band(band("next", &[]));
+        let line = row_text(&t.snapshot(), 5);
+        assert!(line.starts_with("$ "), "the prompt prefix is still there: {line:?}");
+        assert!(line.contains("next"), "the typed text replaces the placeholder: {line:?}");
+        assert!(!line.contains("sleep"), "the running-command placeholder is gone: {line:?}");
+    }
+
+    #[test]
+    fn queued_commands_stack_above_the_input_line_and_grow_the_band() {
+        let mut t = terminal(40, 8);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        t.set_band(band("", &["one", "two", "three"]));
+        let snap = t.snapshot();
+        // One input line + one row per queued command: the band grew, pushing the
+        // console up.
+        assert_eq!(snap.input_band_rows, 4, "input line plus three queued rows");
+        let rows = snap.rows;
+        // Queued rows sit above the input line, oldest (next to run) at the top.
+        assert!(row_text(&snap, rows - 4).contains("one"), "next-to-run queued at the top");
+        assert!(row_text(&snap, rows - 3).contains("two"));
+        assert!(row_text(&snap, rows - 2).contains("three"), "newest just above the input line");
+        assert!(row_text(&snap, rows - 1).starts_with("$ "), "the input line is at the bottom");
+    }
+
+    #[test]
+    fn a_long_queue_collapses_into_a_more_row() {
+        let mut t = terminal(40, 14);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        let many: Vec<&str> = "abcdefghij".split("").filter(|s| !s.is_empty()).collect(); // 10 items
+        t.set_band(band("", &many));
+        let snap = t.snapshot();
+        // Capped at MAX_QUEUE_ROWS queued rows (6) plus the input line.
+        assert_eq!(snap.input_band_rows, 7, "queue rows are capped");
+        let collapsed = (0..snap.rows).any(|r| row_text(&snap, r).contains("more queued"));
+        assert!(collapsed, "the overflow collapses into a \"+N more queued\" row");
+    }
+
+    #[test]
+    fn band_yields_to_scrollback() {
+        let mut t = terminal(20, 3);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07go\r\n\x1b]133;C\x07");
+        for i in 0..10 {
+            t.process(format!("l{i}\r\n").as_bytes());
+        }
+        t.set_band(band("x", &[]));
+        t.scroll_lines(3);
+        // Scrolled history lays out top-to-bottom like a normal terminal; the band
+        // (and its forced reserve) yields, matching `viewport_to_point`.
+        assert_eq!(t.snapshot().input_band_rows, 0, "no band in scrolled history");
+    }
+
+    #[test]
+    fn band_input_shows_the_caret_tail_when_it_overflows() {
+        // A typed line wider than the grid keeps its end (where the caret is)
+        // visible, dropping the head — the caret never leaves the band.
+        let mut t = terminal(8, 4);
+        t.process(b"\x1b]133;A\x07$\x1b]133;B\x07go\r\n\x1b]133;C\x07");
+        t.set_band(band("abcdefghij", &[]));
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let line = row_text(&snap, last);
+        assert!(line.trim_end().ends_with('j'), "the tail of the line is shown: {line:?}");
+        let cur = snap.cursor.expect("a caret in the band");
+        assert!(cur.col < snap.cols, "the caret stays within the band: {}", cur.col);
     }
 }
