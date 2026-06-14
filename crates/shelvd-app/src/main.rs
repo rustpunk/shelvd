@@ -993,6 +993,9 @@ fn sync_band(state: &mut State) {
     let band = BandState {
         input: state.input.text().to_owned(),
         queued: state.queue.iter().cloned().collect(),
+        // Mask the input when the running command has turned echo off (a password
+        // prompt); the real bytes are still what we send on Enter.
+        masked: !state.pty.echo_enabled(),
     };
     state.terminal.set_band(band);
 }

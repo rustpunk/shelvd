@@ -76,6 +76,10 @@ pub struct BandState {
     /// Commands queued to run on upcoming prompts, oldest (next to run) first;
     /// shown stacked above the input line, pushing the console up.
     pub queued: Vec<String>,
+    /// Mask the typed input (render one bullet per character) because the running
+    /// command has turned terminal echo off — e.g. a `sudo` password prompt. The
+    /// real text is still sent on Enter; only the on-screen rendering is hidden.
+    pub masked: bool,
 }
 
 /// Grid dimensions handed to alacritty. `total_lines == screen_lines`; the grid
@@ -1000,7 +1004,12 @@ impl Terminal {
             prefix_w
         } else {
             let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
-            let shown = visible_tail(input, avail);
+            // No-echo input (e.g. a sudo password): show one bullet per character
+            // so the secret never reaches the screen. The real text is still what
+            // gets sent on Enter — only this rendering is masked.
+            let masked = self.band.masked.then(|| "\u{2022}".repeat(input.chars().count()));
+            let source = masked.as_deref().unwrap_or(input);
+            let shown = visible_tail(source, avail);
             let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
             write_row(&mut row[prefix_w.min(cols)..], shown, fg_blank);
             prefix_w + UnicodeWidthStr::width(shown)
@@ -1526,11 +1535,12 @@ mod tests {
         assert!(!t.command_running(), "command finished");
     }
 
-    /// Band state with the given input text and queued commands.
+    /// Band state with the given input text and queued commands (echo on).
     fn band(input: &str, queued: &[&str]) -> BandState {
         BandState {
             input: input.to_owned(),
             queued: queued.iter().map(|s| (*s).to_owned()).collect(),
+            masked: false,
         }
     }
 
@@ -1552,6 +1562,30 @@ mod tests {
         // Caret after the prompt ("$ " = 2 cols) plus the typed text ("echo hi" = 7).
         assert_eq!(cur.col, 9, "the caret rests past the prompt and the typed text");
         assert_eq!(cur.shape, CursorShape::Beam, "a beam reads as a text-insertion point");
+    }
+
+    #[test]
+    fn masked_band_hides_typed_input_behind_bullets() {
+        let mut t = terminal(40, 6);
+        // A running command (e.g. `sudo`) that turned echo off to read a secret.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sudo true\r\n\x1b]133;C\x07");
+        t.set_band(BandState {
+            input: "hunter2".to_owned(),
+            queued: Vec::new(),
+            masked: true,
+        });
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let line = row_text(&snap, last);
+        assert!(line.starts_with("$ "), "the prompt prefix is still shown: {line:?}");
+        assert!(!line.contains("hunter2"), "the secret never reaches the screen: {line:?}");
+        // One bullet per typed character, and nothing but bullets after the prefix.
+        let bullets = line.chars().filter(|&c| c == '\u{2022}').count();
+        assert_eq!(bullets, "hunter2".chars().count(), "one bullet per typed char");
+        // The beam caret still trails the masked text (prompt "$ " = 2 cols + 7).
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last);
+        assert_eq!(cur.col, 9, "the caret rests past the prompt and the masked text");
     }
 
     #[test]

@@ -195,6 +195,32 @@ impl Pty {
     pub fn has_exited(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
+
+    /// Whether the child's terminal currently echoes typed input.
+    ///
+    /// Returns `false` when a program has switched the tty to no-echo to read a
+    /// secret — e.g. `sudo` or `ssh` prompting for a password — so a caller that
+    /// echoes input itself (the input band) can mask it. The real bytes are still
+    /// sent on write; only the on-screen rendering should hide them.
+    ///
+    /// Defaults to `true` (assume echo is on) when the termios query fails, and
+    /// is a constant `true` off-unix where termios is unavailable — we never hide
+    /// input we are not sure is secret.
+    #[cfg(unix)]
+    pub fn echo_enabled(&self) -> bool {
+        use nix::sys::termios::LocalFlags;
+        self.master
+            .get_termios()
+            .map(|t| t.local_flags.contains(LocalFlags::ECHO))
+            .unwrap_or(true)
+    }
+
+    /// See the unix variant; off-unix termios is unavailable, so input is always
+    /// shown as typed.
+    #[cfg(not(unix))]
+    pub fn echo_enabled(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for Pty {
