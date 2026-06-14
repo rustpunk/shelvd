@@ -37,9 +37,9 @@ pub enum Action {
     Quit,
     /// Write this command into the PTY's input line (a history pick).
     InsertCommand(String),
-    /// Toggle compose-next mode: turn the running-command band into an editable
-    /// line that queues commands to run on later prompts (type-ahead).
-    ComposeNext,
+    /// Add the band's current input to the type-ahead queue, to run on the next
+    /// prompt (the global "queue this command" action).
+    QueueInput,
 }
 
 /// The base key of a chord: a character (matched case-insensitively) or a named
@@ -157,9 +157,9 @@ fn commands() -> &'static [Binding] {
             },
             Binding { action: Action::Paste, chord: cs(Char('v')), label: None },
             Binding {
-                action: Action::ComposeNext,
+                action: Action::QueueInput,
                 chord: cs(Named(NamedKey::Enter)),
-                label: Some("Compose next command (while one is running)"),
+                label: Some("Add typed input to run next"),
             },
             Binding { action: Action::PageUp, chord: sh(Named(NamedKey::PageUp)), label: None },
             Binding { action: Action::PageDown, chord: sh(Named(NamedKey::PageDown)), label: None },
@@ -223,32 +223,37 @@ impl InputLine {
     }
 }
 
-/// Live state of compose-next mode: the command being typed ahead of the running
-/// one. Edits the same way the overlay query does (see [`InputLine`]); the event
-/// loop queues [`Self::take`] on Enter and flushes the queue at later prompts.
+/// The band's input line: the next command being typed at the bottom while a
+/// command runs. Edits the same way the overlay query does (see [`InputLine`]);
+/// the event loop takes it on Enter (send to the running command) or on
+/// Ctrl+Shift+Enter ([`Action::QueueInput`], queue for the next prompt).
 #[derive(Default)]
-pub struct ComposeState {
+pub struct BandInput {
     line: InputLine,
 }
 
-impl ComposeState {
-    /// Append a typed character to the composed command.
+impl BandInput {
+    /// Append a typed character to the input line.
     pub fn input_char(&mut self, c: char) {
         self.line.input_char(c);
     }
 
-    /// Delete the last character of the composed command.
+    /// Delete the last character of the input line.
     pub fn backspace(&mut self) {
         self.line.backspace();
     }
 
-    /// The command composed so far.
+    /// The text typed so far.
     pub fn text(&self) -> &str {
         self.line.text()
     }
 
-    /// Take the composed command, leaving the buffer empty so composing can
-    /// continue for the command after it.
+    /// Whether the input line is empty.
+    pub fn is_empty(&self) -> bool {
+        self.line.is_empty()
+    }
+
+    /// Take the typed text, leaving the line empty.
     pub fn take(&mut self) -> String {
         self.line.take()
     }
@@ -630,28 +635,27 @@ mod tests {
     }
 
     #[test]
-    fn compose_state_edits_like_a_line() {
-        let mut c = ComposeState::default();
+    fn band_input_edits_like_a_line() {
+        let mut c = BandInput::default();
         for ch in "hi".chars() {
             c.input_char(ch);
         }
         assert_eq!(c.text(), "hi");
         c.backspace();
         assert_eq!(c.text(), "h");
-        // Taking the buffer yields the command and clears the line so the next
-        // command can be composed without a fresh allocation of state.
+        // Taking the text yields it and clears the line for the next entry.
         assert_eq!(c.take(), "h");
-        assert_eq!(c.text(), "", "take leaves the buffer empty for continued composing");
+        assert!(c.is_empty(), "take leaves the line empty");
     }
 
     #[test]
-    fn compose_next_is_keybound_and_listed() {
-        let compose = commands()
+    fn queue_input_is_keybound_and_listed() {
+        let queue = commands()
             .iter()
-            .find(|b| matches!(b.action, Action::ComposeNext))
-            .expect("compose-next is in the command table");
-        assert_eq!(compose.chord.unwrap().hint(), "Ctrl+Shift+Enter");
-        assert!(compose.label.is_some(), "it surfaces in the palette");
+            .find(|b| matches!(b.action, Action::QueueInput))
+            .expect("queue-input is in the command table");
+        assert_eq!(queue.chord.unwrap().hint(), "Ctrl+Shift+Enter");
+        assert!(queue.label.is_some(), "it surfaces in the palette");
     }
 
     #[test]
