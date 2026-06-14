@@ -512,8 +512,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // Scroll the overlay list instead of the terminal, honoring
                     // the delta magnitude the same way the terminal-scroll path
                     // below does (so a fast flick moves several rows, not one).
-                    // Positive `notches` means scrolling up, which moves the
-                    // highlight up — hence the negated step.
+                    // The highlight follows the wheel by screen direction —
+                    // scrolling down moves it down the list — matching the feel
+                    // of scrolling the terminal pane.
                     let notches = match delta {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
                         MouseScrollDelta::PixelDelta(p) => {
@@ -523,7 +524,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if notches != 0 {
                         if let Some(ov) = state.overlay.as_mut() {
-                            ov.move_selection(-notches);
+                            ov.move_selection(notches);
                             state.window.request_redraw();
                         }
                     }
