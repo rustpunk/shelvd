@@ -4,26 +4,170 @@
 //! clipboard. Pressing Enter yields an [`Action`] the event loop executes.
 //! Filtering uses `nucleo-matcher` for the same smart fuzzy ranking editors use.
 
+use std::sync::OnceLock;
+
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use winit::event::KeyEvent;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use shelvd_core::{Overlay, OverlayColors, OverlayItem};
 
-/// What pressing Enter on a selected row does. The event loop runs it (it
-/// touches subsystems the overlay deliberately knows nothing about).
+/// A command in shelvd's vocabulary: the single thing a key chord and a palette
+/// row both resolve to. The event loop runs it through `run_action` (it touches
+/// subsystems the overlay deliberately knows nothing about).
 #[derive(Clone, Debug)]
 pub enum Action {
+    /// Open the command palette.
+    OpenPalette,
     ScrollToTop,
     ScrollToBottom,
     CopySelection,
     CopyBlock,
+    /// Paste the clipboard into the PTY.
+    Paste,
     PrevBlock,
     NextBlock,
+    /// Scroll the viewport one page up / down through history.
+    PageUp,
+    PageDown,
     /// Open the history-search overlay.
     SearchHistory,
     Quit,
     /// Write this command into the PTY's input line (a history pick).
     InsertCommand(String),
+}
+
+/// The base key of a chord: a character (matched case-insensitively) or a named
+/// key. Kept separate from winit's `Key` so the table stays a plain data literal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChordKey {
+    Char(char),
+    Named(NamedKey),
+}
+
+/// A key chord: a base key plus the modifiers that must be held. Only the named
+/// modifiers are *required* — extra ones are ignored, matching the terminal
+/// convention that Ctrl+Shift+X fires whether or not Alt is also down.
+#[derive(Clone, Copy)]
+struct Chord {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    key: ChordKey,
+}
+
+impl Chord {
+    const fn new(ctrl: bool, shift: bool, alt: bool, key: ChordKey) -> Self {
+        Self { ctrl, shift, alt, key }
+    }
+
+    /// Whether a key press with `mods` held satisfies this chord.
+    fn matches(&self, key: &Key, mods: ModifiersState) -> bool {
+        if (self.ctrl && !mods.control_key())
+            || (self.shift && !mods.shift_key())
+            || (self.alt && !mods.alt_key())
+        {
+            return false;
+        }
+        match (self.key, key) {
+            (ChordKey::Char(c), Key::Character(s)) => {
+                s.eq_ignore_ascii_case(c.encode_utf8(&mut [0u8; 4]))
+            }
+            (ChordKey::Named(n), Key::Named(k)) => n == *k,
+            _ => false,
+        }
+    }
+
+    /// A human-readable rendering, e.g. `Ctrl+Shift+X`. The palette shows this as
+    /// each row's keybinding hint, so the hint is derived from the binding and
+    /// can never drift from it.
+    fn hint(&self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.shift {
+            s.push_str("Shift+");
+        }
+        if self.alt {
+            s.push_str("Alt+");
+        }
+        match self.key {
+            ChordKey::Char(c) => s.push(c.to_ascii_uppercase()),
+            ChordKey::Named(NamedKey::ArrowUp) => s.push_str("Up"),
+            ChordKey::Named(NamedKey::ArrowDown) => s.push_str("Down"),
+            ChordKey::Named(NamedKey::PageUp) => s.push_str("PageUp"),
+            ChordKey::Named(NamedKey::PageDown) => s.push_str("PageDown"),
+            ChordKey::Named(_) => {}
+        }
+        s
+    }
+}
+
+/// One command's full definition: the [`Action`] it runs, its default key chord
+/// (if any), and its palette label (if it appears as a palette row). This is the
+/// single command table — both the keymap and the palette are derived from it,
+/// so a command added here is reachable both ways and the two can't diverge.
+struct Binding {
+    action: Action,
+    chord: Option<Chord>,
+    label: Option<&'static str>,
+}
+
+/// The command table, built once. Order matters twice: the keymap takes the
+/// first chord that matches, and the palette lists labelled rows in this order.
+fn commands() -> &'static [Binding] {
+    use ChordKey::{Char, Named};
+    static TABLE: OnceLock<Vec<Binding>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let cs = |key| Some(Chord::new(true, true, false, key)); // Ctrl+Shift+…
+        let sh = |key| Some(Chord::new(false, true, false, key)); // Shift+…
+        vec![
+            Binding { action: Action::OpenPalette, chord: cs(Char('p')), label: None },
+            Binding {
+                action: Action::SearchHistory,
+                chord: cs(Char('r')),
+                label: Some("Search command history"),
+            },
+            Binding {
+                action: Action::PrevBlock,
+                chord: cs(Named(NamedKey::ArrowUp)),
+                label: Some("Jump to previous block"),
+            },
+            Binding {
+                action: Action::NextBlock,
+                chord: cs(Named(NamedKey::ArrowDown)),
+                label: Some("Jump to next block"),
+            },
+            Binding {
+                action: Action::CopyBlock,
+                chord: cs(Char('x')),
+                label: Some("Copy current block"),
+            },
+            Binding {
+                action: Action::CopySelection,
+                chord: cs(Char('c')),
+                label: Some("Copy selection"),
+            },
+            Binding { action: Action::Paste, chord: cs(Char('v')), label: None },
+            Binding { action: Action::PageUp, chord: sh(Named(NamedKey::PageUp)), label: None },
+            Binding { action: Action::PageDown, chord: sh(Named(NamedKey::PageDown)), label: None },
+            Binding { action: Action::ScrollToTop, chord: None, label: Some("Scroll to top") },
+            Binding { action: Action::ScrollToBottom, chord: None, label: Some("Scroll to bottom") },
+            Binding { action: Action::Quit, chord: None, label: Some("Quit shelvd") },
+        ]
+    })
+}
+
+/// Resolve a key press to the [`Action`] it is bound to, if any. The single
+/// keymap: every direct keybinding lives in [`commands`], the same table the
+/// palette lists, so the two can never drift apart.
+pub fn key_to_action(event: &KeyEvent, mods: ModifiersState) -> Option<Action> {
+    commands().iter().find_map(|b| {
+        let chord = b.chord?;
+        chord.matches(&event.logical_key, mods).then(|| b.action.clone())
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,18 +209,17 @@ pub struct OverlayState {
 }
 
 impl OverlayState {
-    /// The command palette: a fixed list of actions.
+    /// The command palette: the labelled rows of the single command table, each
+    /// showing the keybinding hint derived from its own chord.
     pub fn palette() -> Self {
-        let candidates = vec![
-            Candidate::new("Search command history", Some("Ctrl+Shift+R"), Action::SearchHistory),
-            Candidate::new("Jump to previous block", Some("Ctrl+Shift+Up"), Action::PrevBlock),
-            Candidate::new("Jump to next block", Some("Ctrl+Shift+Down"), Action::NextBlock),
-            Candidate::new("Copy current block", Some("Ctrl+Shift+X"), Action::CopyBlock),
-            Candidate::new("Copy selection", Some("Ctrl+Shift+C"), Action::CopySelection),
-            Candidate::new("Scroll to top", None, Action::ScrollToTop),
-            Candidate::new("Scroll to bottom", None, Action::ScrollToBottom),
-            Candidate::new("Quit shelvd", None, Action::Quit),
-        ];
+        let candidates = commands()
+            .iter()
+            .filter_map(|b| {
+                let label = b.label?;
+                let hint = b.chord.map(|c| c.hint());
+                Some(Candidate::new(label, hint.as_deref(), b.action.clone()))
+            })
+            .collect();
         Self::build(Kind::Palette, candidates)
     }
 
@@ -264,5 +407,56 @@ mod tests {
         // Both still match; the highlight must follow the item, not reset to top.
         p.input_char('o');
         assert!(matches!(p.selected_action(), Some(Action::ScrollToBottom)));
+    }
+
+    #[test]
+    fn chord_matches_required_mods_case_insensitively() {
+        let p = Chord::new(true, true, false, ChordKey::Char('p'));
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(p.matches(&Key::Character("p".into()), ctrl_shift));
+        assert!(p.matches(&Key::Character("P".into()), ctrl_shift));
+        // A required modifier missing: no match.
+        assert!(!p.matches(&Key::Character("p".into()), ModifiersState::CONTROL));
+        // Extra modifiers are ignored — only the required ones are checked.
+        assert!(p.matches(&Key::Character("p".into()), ctrl_shift | ModifiersState::ALT));
+        // Wrong key: no match.
+        assert!(!p.matches(&Key::Character("q".into()), ctrl_shift));
+    }
+
+    #[test]
+    fn chord_hint_reads_like_the_keybinding() {
+        assert_eq!(Chord::new(true, true, false, ChordKey::Char('x')).hint(), "Ctrl+Shift+X");
+        assert_eq!(
+            Chord::new(true, true, false, ChordKey::Named(NamedKey::ArrowUp)).hint(),
+            "Ctrl+Shift+Up"
+        );
+        assert_eq!(
+            Chord::new(false, true, false, ChordKey::Named(NamedKey::PageDown)).hint(),
+            "Shift+PageDown"
+        );
+    }
+
+    #[test]
+    fn open_palette_is_keybound_but_not_a_palette_row() {
+        // The table is the single source of truth: open-palette is reachable by
+        // its chord yet never lists itself as a palette row.
+        let open = commands()
+            .iter()
+            .find(|b| matches!(b.action, Action::OpenPalette))
+            .expect("open-palette is in the command table");
+        assert!(open.chord.is_some());
+        assert!(open.label.is_none());
+    }
+
+    #[test]
+    fn a_keybound_palette_row_surfaces_its_chord_as_the_hint() {
+        // A labelled row with a chord teaches the keybinding rather than carrying
+        // a hand-written hint that could drift from the keymap.
+        let copy_block = commands()
+            .iter()
+            .find(|b| matches!(b.action, Action::CopyBlock))
+            .unwrap();
+        assert_eq!(copy_block.label, Some("Copy current block"));
+        assert_eq!(copy_block.chord.unwrap().hint(), "Ctrl+Shift+X");
     }
 }
