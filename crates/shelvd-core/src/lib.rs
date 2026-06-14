@@ -7,6 +7,7 @@
 pub mod color;
 pub mod config;
 pub mod error;
+pub mod frozen;
 pub mod geometry;
 pub mod overlay;
 pub mod palette;
@@ -16,6 +17,7 @@ pub mod theme;
 pub use color::Rgba;
 pub use config::Config;
 pub use error::{Error, Result};
+pub use frozen::FrozenBlock;
 pub use geometry::{CellMetrics, GridSize, Padding, PixelSize, ResizeEdge, TitlebarHit};
 pub use overlay::{Overlay, OverlayColors, OverlayItem};
 pub use palette::Palette;
