@@ -1028,12 +1028,14 @@ impl Terminal {
         }
         // Bottom-anchor the output region just above the band; it fills upward and
         // then scrolls (the `-band` floor is hit once alacritty itself scrolls,
-        // content_bottom saturating at `rows - 1`). At a resting prompt the cursor
-        // line is relocated into the band ([`Self::fill_resting_input`]), so it does
-        // not count toward the output's lowest line — subtract it, or the output
-        // would sit a needless row higher.
+        // content_bottom saturating at `rows - 1`). At a resting prompt the whole
+        // (soft-wrapped) input line is relocated into the band
+        // ([`Self::fill_resting_input`]), so those rows do not count toward the
+        // output's lowest line — subtract their height, or the output would sit
+        // needlessly high.
         let reserve = Self::BOTTOM_GUTTER.max(band);
-        let out_bottom = self.content_bottom() - i32::from(!self.command_running());
+        let relocated = if self.command_running() { 0 } else { self.resting_input_height() };
+        let out_bottom = self.content_bottom() - relocated;
         (rows - 1 - reserve - out_bottom).max(-band)
     }
 
@@ -1052,12 +1054,60 @@ impl Terminal {
         if self.dims.rows <= 1 || self.is_scrolled() || self.alt_screen() {
             return 0;
         }
-        let bottom = 1; // the input line — relocated prompt, or running type-ahead
+        // The input line — the running type-ahead field (one row), or the relocated
+        // resting prompt, which is as tall as its (soft-wrapped) logical input.
+        let max_total = (self.dims.rows as i32 - 1).max(1);
+        let input = if self.command_running() { 1 } else { self.resting_input_height() };
+        let input = input.clamp(1, max_total);
         let queued = self.band.queued.len() as i32;
         // Keep at least one content row; show up to MAX_QUEUE_ROWS queued rows.
-        let max_total = (self.dims.rows as i32 - 1).max(1);
-        let queue_rows = queued.min(Self::MAX_QUEUE_ROWS).min(max_total - bottom).max(0);
-        bottom + queue_rows
+        let queue_rows = queued.min(Self::MAX_QUEUE_ROWS).min(max_total - input).max(0);
+        input + queue_rows
+    }
+
+    /// Grid-row span `[top, bottom]` of the resting prompt's logical input — the
+    /// soft-wrapped command line the cursor sits on. `bottom` follows soft-wrap
+    /// (`WRAPLINE`) down from the cursor; `top` is the open block's command line
+    /// (where input begins) when shell integration provides it, else the soft-wrap
+    /// predecessors of the cursor. Bounded so the band always leaves one content
+    /// row. A single row when the input does not wrap — so single-line behavior is
+    /// unchanged.
+    fn resting_input_span(&self) -> (i32, i32) {
+        let grid = self.term.grid();
+        let cols = self.dims.cols as usize;
+        let cursor = grid.cursor.point.line.0;
+        let bot_bound = self.dims.rows as i32 - 1;
+        let last = Column(cols.saturating_sub(1));
+
+        let mut bottom = cursor;
+        while cols > 0
+            && bottom < bot_bound
+            && grid[Line(bottom)][last].flags.contains(Flags::WRAPLINE)
+        {
+            bottom += 1;
+        }
+
+        let mut top = match self.blocks.last().filter(|b| b.end_line.is_none()) {
+            Some(b) => self.abs_to_grid_line(b.command_line).min(cursor),
+            None => {
+                let mut t = cursor;
+                while cols > 0 && t > 0 && grid[Line(t - 1)][last].flags.contains(Flags::WRAPLINE) {
+                    t -= 1;
+                }
+                t
+            }
+        };
+        // Leave at least one content row above the band.
+        let max_h = bot_bound.max(1);
+        top = top.max(bottom - (max_h - 1)).min(bottom);
+        (top, bottom)
+    }
+
+    /// Number of rows the resting prompt's relocated input occupies (its
+    /// [`Self::resting_input_span`] height), at least 1.
+    fn resting_input_height(&self) -> i32 {
+        let (top, bottom) = self.resting_input_span();
+        (bottom - top + 1).max(1)
     }
 
     /// The lowest occupied visible row at the live edge: the cursor's row or the
@@ -1109,16 +1159,19 @@ impl Terminal {
         let shift = self.display_shift_with(band);
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
-        // At a resting prompt the live input line is relocated into the band
-        // ([`Self::fill_input_band`]); skip it here so it isn't also drawn in the
-        // output region (which would double it and leave the prompt in the
-        // scrolling area). While a command runs there is no resting prompt to move.
-        let relocate_line =
-            (band > 0 && !self.command_running()).then_some(grid.cursor.point.line.0);
+        // At a resting prompt the live input line — its whole soft-wrapped span —
+        // is relocated into the band ([`Self::fill_input_band`]); skip those rows
+        // here so they aren't also drawn in the output region (which would double
+        // them and leave the prompt in the scrolling area). While a command runs
+        // there is no resting prompt to move.
+        let relocate =
+            (band > 0 && !self.command_running()).then(|| self.resting_input_span());
 
         for indexed in grid.display_iter() {
-            if Some(indexed.point.line.0) == relocate_line {
-                continue;
+            if let Some((top, bottom)) = relocate {
+                if (top..=bottom).contains(&indexed.point.line.0) {
+                    continue;
+                }
             }
             let row_i = indexed.point.line.0 + offset + shift;
             if row_i < 0 {
@@ -1267,13 +1320,21 @@ impl Terminal {
         }
         snap.input_band_rows = band as u16;
 
-        // Queued commands stack above the always-present input line.
-        let input_row = rows - 1;
-        let queue_rows = (band as usize).saturating_sub(1);
+        // The input occupies the bottom rows of the band (one for a running
+        // type-ahead field, the full soft-wrapped height for a resting prompt);
+        // queued commands stack in whatever rows remain above it.
+        let input_height = if self.command_running() {
+            1
+        } else {
+            (self.resting_input_height() as usize).clamp(1, band as usize)
+        };
+        let input_top = rows - input_height;
+        let queue_rows = (band as usize).saturating_sub(input_height);
         self.fill_queued_rows(snap, band_top, queue_rows);
 
         if self.command_running() {
             // Running: the type-ahead field, led by the captured prompt prefix.
+            let input_row = rows - 1;
             let prefix_w = {
                 let prefix = match self.blocks.last() {
                     Some(b) => b.prompt_prefix.as_slice(),
@@ -1292,25 +1353,33 @@ impl Terminal {
             };
             self.fill_band_input(snap, input_row, prefix_w);
         } else {
-            // Resting prompt: relocate the grid's cursor line into the band.
-            self.fill_resting_input(snap, input_row);
+            // Resting prompt: relocate the (soft-wrapped) input line into the band.
+            self.fill_resting_input(snap, input_top, input_height);
         }
     }
 
-    /// Relocate the live shell prompt line into the band's input row at a resting
-    /// prompt: copy the grid's cursor line (prompt prefix + typed input) verbatim
-    /// and place the cursor on it, so the prompt holds at the bottom while output
-    /// above it scrolls top-to-bottom. The same line is skipped in the output loop
-    /// ([`Self::snapshot`]) so it is not drawn twice.
-    fn fill_resting_input(&self, snap: &mut GridSnapshot, input_row: usize) {
+    /// Relocate the live shell prompt's input into the band at a resting prompt:
+    /// copy its grid rows (the soft-wrapped [`Self::resting_input_span`] — prompt
+    /// prefix + typed input) verbatim into the band's bottom `height` rows and
+    /// place the cursor on the matching row, so the prompt holds at the bottom
+    /// while output above scrolls top-to-bottom. The same rows are skipped in the
+    /// output loop ([`Self::snapshot`]) so they are not drawn twice.
+    fn fill_resting_input(&self, snap: &mut GridSnapshot, input_top: usize, height: usize) {
         let cols = snap.cols as usize;
         let grid = self.term.grid();
-        let cline = grid.cursor.point.line;
-        let dst = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
-        for (c, cell) in dst.iter_mut().enumerate() {
-            *cell = self.cell_to_snapshot(&grid[cline][Column(c)]);
+        let (top, bottom) = self.resting_input_span();
+        let h = ((bottom - top + 1).max(1) as usize).min(height);
+        for i in 0..h {
+            let src = Line(top + i as i32);
+            let brow = input_top + i;
+            let dst = &mut snap.cells[brow * cols..(brow + 1) * cols];
+            for (c, cell) in dst.iter_mut().enumerate() {
+                *cell = self.cell_to_snapshot(&grid[src][Column(c)]);
+            }
         }
-        snap.cursor = self.band_cursor(grid.cursor.point.column.0, input_row);
+        // The cursor sits on the band row matching its grid row within the span.
+        let offset = (grid.cursor.point.line.0 - top).clamp(0, h as i32 - 1) as usize;
+        snap.cursor = self.band_cursor(grid.cursor.point.column.0, input_top + offset);
     }
 
     /// A cursor on the band's input row at `col`, honoring the shell's cursor shape
@@ -2076,6 +2145,31 @@ mod tests {
         // bottom-anchored just above the band on row 4.
         assert_eq!(snap.cell(0, 4).unwrap().c, '$');
         assert_eq!(snap.cell(2, 4).unwrap().c, 'x');
+    }
+
+    #[test]
+    fn wrapped_resting_input_relocates_whole_into_the_band() {
+        let mut t = terminal(10, 6);
+        // A typed command longer than the width soft-wraps across two rows at a
+        // resting prompt (OSC-133 prompt + command, no OutputStart — still editing).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07abcdefghijklmno");
+        assert!(!t.command_running(), "still editing at the prompt");
+
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 2, "band is as tall as the wrapped input");
+        let rows = snap.rows;
+        let band0 = row_text(&snap, rows - 2);
+        let band1 = row_text(&snap, rows - 1);
+        assert!(band0.contains("abcdefgh"), "first input row in the band: {band0:?}");
+        assert!(band1.contains("ijklmno"), "continuation row in the band: {band1:?}");
+        // The wrapped input is *relocated*, not duplicated into the scrolling output.
+        for r in 0..rows - 2 {
+            let line = row_text(&snap, r);
+            assert!(!line.contains("abcdefgh"), "row {r} must not duplicate the input: {line:?}");
+        }
+        // The caret rides the continuation row where the typing ended.
+        let cur = snap.cursor.expect("cursor visible at the prompt");
+        assert_eq!(cur.row, rows - 1, "cursor on the last input row");
     }
 
     #[test]
