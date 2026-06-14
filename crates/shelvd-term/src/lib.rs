@@ -20,8 +20,8 @@ use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use shelvd_core::{
-    CellFlags, CellSnapshot, CursorShape, CursorSnapshot, GridSnapshot, Palette, Rgba, RowDecor,
-    StickyHeader,
+    CellFlags, CellSnapshot, CursorShape, CursorSnapshot, FrozenBlock, GridSnapshot, Palette, Rgba,
+    RowDecor, StickyHeader,
 };
 
 mod block;
@@ -153,6 +153,11 @@ pub struct Terminal {
     prev_alt: bool,
     /// Command blocks, oldest first, delimited by semantic-prompt markers.
     blocks: Vec<Block>,
+    /// Frozen buffers of completed blocks, oldest first, one per finished block.
+    /// Captured on OSC-133 `;D` and kept in lockstep with `blocks` (a finished
+    /// block lives in both until pruned). The first slice of the multi-grid
+    /// model: finished output owned here, leaving the live grid the active region.
+    frozen: Vec<FrozenBlock>,
     /// Next block id to hand out (ids are never 0).
     next_block_id: u32,
     /// Working directory reported (OSC 7) since the last block opened.
@@ -195,6 +200,7 @@ impl Terminal {
             prev_history: 0,
             prev_alt: false,
             blocks: Vec::new(),
+            frozen: Vec::new(),
             next_block_id: 1,
             pending_cwd: None,
             palette,
@@ -312,6 +318,14 @@ impl Terminal {
                         b.output_excerpt = e;
                     }
                 }
+                // Freeze the now-completed block into an immutable buffer for the
+                // multi-grid model. Its source rows stay on the live grid for now
+                // (the composite that draws frozen buffers instead lands later),
+                // so nothing is double-drawn.
+                let frozen = self.blocks.last().and_then(|b| self.freeze_block(b));
+                if let Some(frozen) = frozen {
+                    self.frozen.push(frozen);
+                }
             }
         }
     }
@@ -319,6 +333,14 @@ impl Terminal {
     /// All command blocks, oldest first.
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
+    }
+
+    /// Frozen buffers of completed blocks, oldest first — one per finished block,
+    /// captured on OSC-133 `;D`. The live grid still renders their source rows for
+    /// now; the composite snapshot that draws these instead lands with the rest of
+    /// the multi-grid model.
+    pub fn frozen_blocks(&self) -> &[FrozenBlock] {
+        &self.frozen
     }
 
     /// Scroll so the previous block's prompt sits at the top of the viewport.
@@ -470,6 +492,57 @@ impl Terminal {
         self.term.bounds_to_string(start, end).trim_end().to_string()
     }
 
+    /// Freeze a finished block into an immutable [`FrozenBlock`]: its rows
+    /// (prompt→end) captured as resolved cells at the current width, plus the
+    /// unwrapped logical lines for later reflow. Returns `None` until the block
+    /// has an end line. Only retained rows are read — any head that already
+    /// scrolled out of history is omitted, since those cells are gone.
+    fn freeze_block(&self, b: &Block) -> Option<FrozenBlock> {
+        let end = b.end_line?;
+        let cols = self.dims.cols as usize;
+        let oldest = self.abs_base - self.term.grid().history_size() as i64;
+        let start = b.prompt_line.max(oldest);
+
+        let grid = self.term.grid();
+        let mut cells: Vec<CellSnapshot> = Vec::new();
+        let mut logical_lines: Vec<Vec<CellSnapshot>> = Vec::new();
+        let mut logical: Vec<CellSnapshot> = Vec::new();
+
+        let mut abs = start;
+        while abs <= end {
+            let g = Line(self.abs_to_grid_line(abs));
+            // Soft-wrap is flagged on a row's last cell: a wrapped row continues
+            // the same logical line; an unwrapped row ends it.
+            let wrapped = cols > 0 && grid[g][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            for c in 0..cols {
+                let snap = self.cell_to_snapshot(&grid[g][Column(c)]);
+                cells.push(snap);
+                logical.push(snap);
+            }
+            if !wrapped {
+                trim_trailing_blanks(&mut logical);
+                logical_lines.push(std::mem::take(&mut logical));
+            }
+            abs += 1;
+        }
+        // A trailing soft-wrapped run with no closing unwrapped row (defensive;
+        // a finished block normally ends on an unwrapped line).
+        if !logical.is_empty() {
+            trim_trailing_blanks(&mut logical);
+            logical_lines.push(logical);
+        }
+
+        Some(FrozenBlock {
+            id: b.id,
+            command: b.command.clone(),
+            failed: b.state == BlockState::Failed,
+            cwd: b.cwd.clone(),
+            cols: self.dims.cols,
+            cells,
+            logical_lines,
+        })
+    }
+
     /// Drop blocks whose whole range has scrolled out of retained history, plus
     /// a hard cap so a long-lived session can't grow the list without bound.
     fn prune_blocks(&mut self) {
@@ -490,6 +563,12 @@ impl Terminal {
         if self.blocks.len() > MAX_BLOCKS {
             let excess = self.blocks.len() - MAX_BLOCKS;
             self.blocks.drain(0..excess);
+        }
+        // Keep the frozen list in lockstep: drop any frozen buffer whose source
+        // block was just pruned (ids are monotonic, both lists oldest-first).
+        match self.blocks.first().map(|b| b.id) {
+            Some(id) => self.frozen.retain(|f| f.id >= id),
+            None => self.frozen.clear(),
         }
     }
 
@@ -580,6 +659,7 @@ impl Terminal {
                 // History shrank (a clear): every existing anchor is meaningless.
                 self.abs_base = 0;
                 self.blocks.clear();
+                self.frozen.clear();
             }
         }
         self.prev_history = hist;
@@ -597,10 +677,13 @@ impl Terminal {
         // Reflow renumbers lines; rebase the scroll baseline to the new history
         // depth so the next chunk's delta is measured from solid ground. Block
         // anchors don't survive reflow (we keep a single grid, not Warp's
-        // per-block grids), so drop them and let new commands re-establish them.
+        // per-block grids), so drop them — and the frozen buffers captured at the
+        // old width with them — and let new commands re-establish them. (Reflowing
+        // the frozen buffers to the new width instead is the per-block-reflow step.)
         self.prev_history = self.term.grid().history_size();
         self.prev_alt = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.blocks.clear();
+        self.frozen.clear();
         self.pending_cwd = None;
     }
 
@@ -1133,6 +1216,14 @@ fn visible_tail(text: &str, max: usize) -> &str {
     &text[start..]
 }
 
+/// Drop trailing blank cells from a frozen logical line — soft-wrap padding is
+/// not part of the unwrapped content the line stands for.
+fn trim_trailing_blanks(line: &mut Vec<CellSnapshot>) {
+    while line.last().is_some_and(CellSnapshot::is_blank) {
+        line.pop();
+    }
+}
+
 /// Which half of a cell a pixel fell on, as an alacritty selection side.
 fn side(right_half: bool) -> Side {
     if right_half {
@@ -1533,6 +1624,67 @@ mod tests {
         assert!(t.command_running(), "output started, not yet finished");
         t.process(b"out\r\n\x1b]133;D;0\x07");
         assert!(!t.command_running(), "command finished");
+    }
+
+    #[test]
+    fn command_finished_freezes_the_block() {
+        let mut t = terminal(20, 6);
+        assert!(t.frozen_blocks().is_empty(), "nothing frozen before a command finishes");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07echo\r\n\x1b]133;C\x07hi there\r\n\x1b]133;D;0\x07");
+        let frozen = t.frozen_blocks();
+        assert_eq!(frozen.len(), 1, "the finished block is frozen exactly once");
+        let fb = &frozen[0];
+        assert_eq!(fb.command, "echo", "command text carried over");
+        assert!(!fb.failed, "exit 0 is success");
+        assert_eq!(fb.cols, 20, "captured at the grid width");
+        assert!(fb.rows() >= 2, "prompt and output rows captured");
+        let text: String = fb.cells.iter().map(|c| c.c).collect();
+        assert!(text.contains("hi there"), "frozen cells include the output: {text:?}");
+        let has_output_line = fb
+            .logical_lines
+            .iter()
+            .any(|l| l.iter().map(|c| c.c).collect::<String>().contains("hi there"));
+        assert!(has_output_line, "a logical line holds the unwrapped output");
+    }
+
+    #[test]
+    fn frozen_blocks_list_in_order_with_metadata() {
+        let mut t = terminal(20, 8);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07a\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07b\r\n\x1b]133;D;1\x07");
+        let f = t.frozen_blocks();
+        assert_eq!(f.len(), 2, "one frozen buffer per finished block");
+        assert_eq!(f[0].command, "one");
+        assert!(!f[0].failed, "exit 0 is success");
+        assert_eq!(f[1].command, "two");
+        assert!(f[1].failed, "exit 1 is failed");
+        assert!(f[0].id < f[1].id, "oldest first, by ascending block id");
+    }
+
+    #[test]
+    fn resize_drops_frozen_blocks_in_lockstep() {
+        let mut t = terminal(20, 4);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07a\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.frozen_blocks().len(), 1);
+        // Reflow renumbers lines, so block anchors — and the buffers tied to them —
+        // are dropped together.
+        t.resize(30, 6);
+        assert!(t.blocks().is_empty(), "blocks dropped on resize");
+        assert!(t.frozen_blocks().is_empty(), "frozen dropped in lockstep");
+    }
+
+    #[test]
+    fn clearing_history_drops_frozen_blocks_in_lockstep() {
+        let mut t = terminal(20, 4);
+        // Build up some history so a reset actually shrinks it.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07a\r\n\x1b]133;C\x07l1\r\nl2\r\nl3\r\nl4\r\nl5\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.frozen_blocks().len(), 1);
+        assert!(!t.blocks().is_empty());
+        // A full reset (RIS) clears the screen and scrollback: history shrinks, so
+        // the whole block model is wiped — the frozen list must go with it.
+        t.process(b"\x1bc");
+        assert!(t.blocks().is_empty(), "blocks cleared when history shrinks");
+        assert!(t.frozen_blocks().is_empty(), "frozen cleared in lockstep");
     }
 
     /// Band state with the given input text and queued commands (echo on).
