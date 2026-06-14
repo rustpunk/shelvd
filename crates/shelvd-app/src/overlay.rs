@@ -306,16 +306,32 @@ impl OverlayState {
             .unwrap_or(0);
     }
 
-    /// Build the render-ready overlay description for this frame.
-    pub fn to_overlay(&self, colors: OverlayColors) -> Overlay {
-        let items = self
-            .filtered
+    /// Build the render-ready overlay description for this frame, materializing
+    /// only the `capacity` rows that fit below the query line. The window scrolls
+    /// so the selection stays visible, so a long history clones a dozen strings
+    /// per redraw rather than the whole filtered list.
+    pub fn to_overlay(&self, colors: OverlayColors, capacity: usize) -> Overlay {
+        let len = self.filtered.len();
+        let visible = len.min(capacity);
+        let mut first = if visible > 0 && self.selected >= visible {
+            self.selected + 1 - visible
+        } else {
+            0
+        };
+        first = first.min(len.saturating_sub(visible));
+
+        let items = self.filtered[first..first + visible]
             .iter()
             .map(|&i| {
                 let c = &self.candidates[i];
                 OverlayItem { label: c.label.clone(), detail: c.detail.clone() }
             })
             .collect();
+        let selected_visible = (visible > 0
+            && self.selected >= first
+            && self.selected < first + visible)
+            .then(|| self.selected - first);
+
         Overlay {
             prompt: match self.kind {
                 Kind::Palette => ">".into(),
@@ -323,7 +339,7 @@ impl OverlayState {
             },
             query: self.query.clone(),
             items,
-            selected: self.selected,
+            selected_visible,
             colors,
         }
     }
@@ -332,6 +348,43 @@ impl OverlayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelvd_core::Rgba;
+
+    /// A throwaway palette — `to_overlay` only copies it into the `Overlay`, so
+    /// the exact values don't matter for the windowing assertions.
+    fn test_colors() -> OverlayColors {
+        let c = Rgba::new(0, 0, 0, 255);
+        OverlayColors { panel_bg: c, fg: c, dim: c, sel_bg: c, accent: c }
+    }
+
+    #[test]
+    fn to_overlay_windows_to_capacity_around_the_selection() {
+        // More commands than the window holds, selection driven near the end.
+        let cmds: Vec<String> = (0..50).map(|i| format!("cmd-{i:02}")).collect();
+        let mut h = OverlayState::history(cmds);
+        let capacity = 12;
+        // Select the second-to-last row (index 48 of 50).
+        h.move_selection(-2);
+        assert_eq!(h.selected, 48);
+
+        let ov = h.to_overlay(test_colors(), capacity);
+
+        // (a) Exactly `capacity` rows are materialized, not the whole list.
+        assert_eq!(ov.items.len(), capacity);
+        // (b) The window scrolled to include the selected command's label.
+        let sv = ov.selected_visible.expect("selection is inside the window");
+        assert_eq!(ov.items[sv].label, "cmd-48");
+        // (c) `selected_visible` indexes the selected item within `items`.
+        assert!(sv < ov.items.len());
+    }
+
+    #[test]
+    fn to_overlay_keeps_every_row_when_under_capacity() {
+        let h = OverlayState::history(vec!["one".into(), "two".into(), "three".into()]);
+        let ov = h.to_overlay(test_colors(), 12);
+        assert_eq!(ov.items.len(), 3);
+        assert_eq!(ov.selected_visible, Some(0));
+    }
 
     #[test]
     fn palette_starts_showing_everything() {
