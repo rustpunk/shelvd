@@ -9,7 +9,6 @@
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
@@ -182,6 +181,10 @@ pub struct Terminal {
     /// prompt) and shows the type-ahead UI; otherwise it falls back to the locked
     /// running-command mirror.
     band: BandState,
+    /// Active text selection, in composite (absolute-line) coordinates so it spans
+    /// frozen block buffers and the live grid alike. `None` when nothing is
+    /// selected. Replaces alacritty's single-grid `Selection`.
+    sel: Option<CompositeSelection>,
 }
 
 impl Terminal {
@@ -217,6 +220,7 @@ impl Terminal {
             dims,
             seen_output: false,
             band: BandState::default(),
+            sel: None,
         }
     }
 
@@ -391,10 +395,11 @@ impl Terminal {
         } else {
             self.blocks[idx].end_line.map_or(cursor_abs + 1, |e| e + 1)
         };
-        let start = Point::new(Line(self.abs_to_grid_line(start_abs)), Column(0));
+        // Read through the composite, so a block that has scrolled out of the live
+        // grid still copies from its frozen buffer (not clamped grid lines).
         let last_col = self.dims.cols.saturating_sub(1) as usize;
-        let end = Point::new(Line(self.abs_to_grid_line(end_abs - 1)), Column(last_col));
-        let text = self.term.bounds_to_string(start, end).trim_end().to_string();
+        let text = self.composite_text((start_abs, 0), (end_abs - 1, last_col));
+        let text = text.trim_end().to_string();
         if text.is_empty() {
             None
         } else {
@@ -907,40 +912,86 @@ impl Terminal {
 
     // --- selection -----------------------------------------------------------
 
-    /// Begin a simple (linear) selection at a viewport cell.
+    /// Begin a linear selection at a viewport cell.
     pub fn selection_start(&mut self, col: u16, row: u16, right_half: bool) {
-        let point = self.viewport_to_point(col, row);
-        self.term.selection = Some(Selection::new(SelectionType::Simple, point, side(right_half)));
+        let p = self.viewport_to_abs(col, row, right_half);
+        self.sel = Some(CompositeSelection { anchor: p, head: p });
     }
 
     /// Extend the in-progress selection to a viewport cell.
     pub fn selection_update(&mut self, col: u16, row: u16, right_half: bool) {
-        let point = self.viewport_to_point(col, row);
-        if let Some(selection) = self.term.selection.as_mut() {
-            selection.update(point, side(right_half));
+        let p = self.viewport_to_abs(col, row, right_half);
+        if let Some(sel) = self.sel.as_mut() {
+            sel.head = p;
         }
     }
 
     /// Clear any active selection.
     pub fn selection_clear(&mut self) {
-        self.term.selection = None;
+        self.sel = None;
     }
 
-    /// The selected text, if the selection is non-empty.
+    /// The selected text, if the selection is non-empty. Walks the selected
+    /// absolute lines through [`Self::composite_row_into`], so it reads frozen
+    /// block buffers and the live grid identically — a selection can span the
+    /// frozen/live boundary. Each visual line is right-trimmed and joined by `\n`.
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string().filter(|s| !s.is_empty())
+        let sel = self.sel?;
+        let cols = self.dims.cols as usize;
+        let (start, end) = sel.bounds(cols)?;
+        let text = self.composite_text(start, end);
+        (!text.trim().is_empty()).then_some(text)
     }
 
-    /// Map a viewport cell (accounting for scrollback offset) to a grid point.
-    fn viewport_to_point(&self, col: u16, row: u16) -> Point {
+    /// Concatenate the composite cells in the inclusive `(abs, col)` range
+    /// `start..=end` (reading order) as text: each absolute line right-trimmed,
+    /// wide-glyph spacers dropped, lines joined by `\n`. Shared by selection copy
+    /// and whole-block copy.
+    fn composite_text(&self, start: (i64, usize), end: (i64, usize)) -> String {
+        let cols = self.dims.cols as usize;
+        let cursor_abs = self.absolute_cursor_line();
+        let mut buf =
+            vec![CellSnapshot::blank(self.palette.foreground, self.palette.background); cols];
+        let mut lines: Vec<String> = Vec::new();
+        for abs in start.0..=end.0 {
+            self.composite_row_into(abs, cursor_abs, &mut buf);
+            let lo = if abs == start.0 { start.1 } else { 0 };
+            let hi = if abs == end.0 { end.1 } else { cols.saturating_sub(1) };
+            let line: String = buf
+                .get(lo..=hi)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|c| !c.flags.contains(CellFlags::WIDE_SPACER))
+                .map(|c| c.c)
+                .collect();
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// Map a viewport cell to a composite selection endpoint (absolute line +
+    /// column + which cell-half the pointer fell on). The line math mirrors the
+    /// snapshot's row→line mapping (scrolled: straight onto the composite line;
+    /// live edge: undo the bottom-anchor shift) but yields an absolute line, so the
+    /// selection lives in the same coordinate space as the composite.
+    fn viewport_to_abs(&self, col: u16, row: u16, right_half: bool) -> SelPoint {
         let max_col = self.dims.cols.saturating_sub(1) as usize;
-        let line = match self.scroll_top_abs {
-            // Scrolled: a screen row maps straight onto a composite (absolute) line.
-            Some(top) => ((top + row as i64) - self.abs_base) as i32,
-            // Live edge: undo the bottom-anchor shift (alacritty stays at offset 0).
-            None => row as i32 - self.display_shift(),
+        let abs = match self.scroll_top_abs {
+            Some(top) => top + row as i64,
+            None => self.abs_base + row as i64 - self.display_shift() as i64,
         };
-        Point::new(Line(line), Column((col as usize).min(max_col)))
+        SelPoint { abs, col: (col as usize).min(max_col), side: side(right_half) }
+    }
+
+    /// Whether the composite cell at `(abs, col)` lies within the active
+    /// selection. Linear selection is a reading-order range, so the
+    /// lexicographic `(abs, col)` comparison is exactly the membership test.
+    fn is_selected(&self, abs: i64, col: usize) -> bool {
+        let Some(sel) = self.sel else { return false };
+        let Some((start, end)) = sel.bounds(self.dims.cols as usize) else {
+            return false;
+        };
+        (abs, col) >= start && (abs, col) <= end
     }
 
     /// Rows of breathing room left below the bottom-anchored prompt so it does not
@@ -1056,7 +1107,6 @@ impl Terminal {
 
         let band = self.input_band_rows();
         let shift = self.display_shift_with(band);
-        let selection = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term));
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
         // At a resting prompt the live input line is relocated into the band
@@ -1080,9 +1130,8 @@ impl Terminal {
             }
             let cell = indexed.cell;
             let dst = row * cols as usize + col;
-            let selected = selection
-                .as_ref()
-                .is_some_and(|range| point_in_range(indexed.point, range));
+            let abs = self.abs_base + indexed.point.line.0 as i64;
+            let selected = self.is_selected(abs, col);
 
             let mut snapshot = self.cell_to_snapshot(cell);
             if selected {
@@ -1102,8 +1151,8 @@ impl Terminal {
     /// finished block's frozen buffer when the absolute line falls inside one, and
     /// from the live grid otherwise (the active region, or raw history when there
     /// is no shell integration). No bottom-anchor, input band, or live cursor here
-    /// — those belong to the live edge — and selection across the frozen/live
-    /// boundary is a later step (#18), so no cells are flagged selected.
+    /// — those belong to the live edge. Selection is flagged per cell in composite
+    /// (absolute-line) space, so it spans the frozen/live boundary.
     fn composite_snapshot(&self) -> GridSnapshot {
         let cols = self.dims.cols;
         let rows = self.dims.rows;
@@ -1122,6 +1171,11 @@ impl Terminal {
             let abs = top_abs + r as i64;
             let dst = r * ncols;
             self.composite_row_into(abs, cursor_abs, &mut snap.cells[dst..dst + ncols]);
+            for c in 0..ncols {
+                if self.is_selected(abs, c) {
+                    snap.cells[dst + c].flags |= CellFlags::SELECTED;
+                }
+            }
             if let Some(idx) = self.block_row(abs, cursor_abs) {
                 let b = &self.blocks[idx];
                 snap.rows_decor[r] = RowDecor {
@@ -1474,19 +1528,48 @@ fn side(right_half: bool) -> Side {
     }
 }
 
-/// Whether a grid point lies within a selection range (linear or block).
-fn point_in_range(p: Point, range: &SelectionRange) -> bool {
-    if range.is_block {
-        p.line >= range.start.line
-            && p.line <= range.end.line
-            && p.column >= range.start.column
-            && p.column <= range.end.column
-    } else {
-        let after_start = p.line > range.start.line
-            || (p.line == range.start.line && p.column >= range.start.column);
-        let before_end = p.line < range.end.line
-            || (p.line == range.end.line && p.column <= range.end.column);
-        after_start && before_end
+/// One endpoint of a composite selection: an absolute line, a column, and which
+/// half of that cell the pointer fell on (so the boundary cell is included or not).
+#[derive(Clone, Copy)]
+struct SelPoint {
+    abs: i64,
+    col: usize,
+    side: Side,
+}
+
+/// A linear text selection over the composite (absolute-line) coordinate space,
+/// so it spans frozen block buffers and the live grid alike — unlike alacritty's
+/// `Selection`, which only sees the single live grid.
+#[derive(Clone, Copy)]
+struct CompositeSelection {
+    /// Where the drag started (its `side` is fixed for the drag).
+    anchor: SelPoint,
+    /// The current drag end (updated as the pointer moves).
+    head: SelPoint,
+}
+
+impl CompositeSelection {
+    /// The selection's inclusive `(abs, col)` start and end in reading order, with
+    /// the cell-half folded in: a `Right`-half start excludes its cell (begins at
+    /// the next column, wrapping a line), a `Left`-half end excludes its cell.
+    /// Returns `None` when the result is empty (e.g. a click with no drag).
+    fn bounds(&self, cols: usize) -> Option<((i64, usize), (i64, usize))> {
+        let (s, e) = if (self.anchor.abs, self.anchor.col) <= (self.head.abs, self.head.col) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        };
+        let start = match s.side {
+            Side::Right if s.col + 1 >= cols => (s.abs + 1, 0),
+            Side::Right => (s.abs, s.col + 1),
+            Side::Left => (s.abs, s.col),
+        };
+        let end = match e.side {
+            Side::Left if e.col == 0 => (e.abs - 1, cols.saturating_sub(1)),
+            Side::Left => (e.abs, e.col - 1),
+            Side::Right => (e.abs, e.col),
+        };
+        (start <= end).then_some((start, end))
     }
 }
 
@@ -1581,6 +1664,59 @@ mod tests {
         assert!(snap.cell(4, 1).unwrap().flags.contains(CellFlags::SELECTED));
         assert!(!snap.cell(6, 1).unwrap().flags.contains(CellFlags::SELECTED));
         assert_eq!(snap.selection_color, Palette::default().selection);
+    }
+
+    #[test]
+    fn selection_spans_the_frozen_live_boundary() {
+        let mut t = terminal(20, 8);
+        // A finished (frozen) block above a still-running (live) one.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07AAA\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07CCC\r\n");
+        assert_eq!(t.frozen_blocks().len(), 1, "first frozen, second still running");
+
+        // Locate the rendered rows by content (robust to bottom-anchor geometry).
+        let snap = t.snapshot();
+        let find = |needle: &str| (0..snap.rows).find(|&r| row_text(&snap, r).contains(needle));
+        let a_row = find("AAA").expect("frozen output visible");
+        let c_row = find("CCC").expect("live output visible");
+        assert!(a_row < c_row, "frozen block sits above the live one");
+
+        // Drag from the frozen output down into the live output.
+        t.selection_start(0, a_row, false);
+        t.selection_update(2, c_row, true);
+        let text = t.selection_text().expect("a cross-boundary selection has text");
+        assert!(text.contains("AAA"), "includes frozen-block output (read from the buffer): {text:?}");
+        assert!(text.contains("CCC"), "includes live-grid output: {text:?}");
+        assert!(
+            text.find("AAA") < text.find("CCC"),
+            "frozen text precedes live text in reading order: {text:?}"
+        );
+    }
+
+    #[test]
+    fn composite_snapshot_flags_selection_when_scrolled() {
+        let mut t = terminal(20, 4);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07AAA\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07BBB\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07third\r\n\x1b]133;C\x07CCC\r\n");
+        t.scroll_to_top();
+        assert!(t.is_scrolled(), "parked in history");
+
+        // Select the oldest frozen block's output row, found by content.
+        let snap0 = t.snapshot();
+        let a_row =
+            (0..snap0.rows).find(|&r| row_text(&snap0, r).contains("AAA")).expect("AAA at top");
+        t.selection_start(0, a_row, false);
+        t.selection_update(2, a_row, true);
+
+        // The composite (scrolled) snapshot now flags the selected frozen cells.
+        let snap = t.snapshot();
+        assert!(
+            snap.cell(0, a_row).unwrap().flags.contains(CellFlags::SELECTED),
+            "frozen cell flagged selected in the composite snapshot"
+        );
+        assert!(!snap.cell(5, a_row).unwrap().flags.contains(CellFlags::SELECTED), "past the selection");
+        assert!(t.selection_text().is_some_and(|s| s.contains("AAA")), "frozen selection yields text");
     }
 
     #[test]
@@ -2185,7 +2321,7 @@ mod tests {
         t.set_band(band("x", &[]));
         t.scroll_lines(3);
         // Scrolled history lays out top-to-bottom like a normal terminal; the band
-        // (and its forced reserve) yields, matching `viewport_to_point`.
+        // (and its forced reserve) yields, matching the composite snapshot path.
         assert_eq!(t.snapshot().input_band_rows, 0, "no band in scrolled history");
     }
 
