@@ -3,3 +3,5 @@
 *.pdb
 .DS_Store
 /.claude/
+
+notes/
