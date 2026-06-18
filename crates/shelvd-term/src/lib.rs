@@ -1061,7 +1061,11 @@ impl Terminal {
         // The input line — the running type-ahead field (one row), or the relocated
         // resting prompt, which is as tall as its (soft-wrapped) logical input.
         let max_total = (self.dims.rows as i32 - 1).max(1);
-        let input = if self.command_running() { 1 } else { self.resting_input_height() };
+        let input = if self.command_running() {
+            self.band_input_height()
+        } else {
+            self.resting_input_height()
+        };
         let input = input.clamp(1, max_total);
         let queued = self.band.queued.len() as i32;
         // Keep at least one content row; show up to MAX_QUEUE_ROWS queued rows.
@@ -1112,6 +1116,38 @@ impl Terminal {
     fn resting_input_height(&self) -> i32 {
         let (top, bottom) = self.resting_input_span();
         (bottom - top + 1).max(1)
+    }
+
+    /// Display width of the captured prompt prefix that leads the running
+    /// type-ahead field, clamped to the grid (each prefix cell is one column).
+    fn band_prefix_width(&self) -> usize {
+        let cols = self.dims.cols as usize;
+        self.blocks.last().map(|b| b.prompt_prefix.len()).unwrap_or(0).min(cols)
+    }
+
+    /// The typed input as it is rendered into the band: the text itself, or one
+    /// bullet per character when masked (no-echo). Borrows when unmasked.
+    fn band_input_source(&self) -> std::borrow::Cow<'_, str> {
+        if self.band.masked {
+            std::borrow::Cow::Owned("\u{2022}".repeat(self.band.input.chars().count()))
+        } else {
+            std::borrow::Cow::Borrowed(self.band.input.as_str())
+        }
+    }
+
+    /// Visual rows the running type-ahead field needs once soft-wrapped at the
+    /// grid width: the prompt prefix plus the typed input. One row when it fits a
+    /// single line (so single-line behavior is unchanged) or nothing is typed (the
+    /// running command shows as a one-row placeholder). The running analog of
+    /// [`Self::resting_input_height`].
+    fn band_input_height(&self) -> i32 {
+        let cols = self.dims.cols as usize;
+        if cols == 0 || self.band.input.is_empty() {
+            return 1;
+        }
+        let source = self.band_input_source();
+        let (chunks, caret_wrapped) = wrap_chunks(self.band_prefix_width(), &source, cols);
+        (chunks.len() + caret_wrapped as usize) as i32
     }
 
     /// The lowest occupied visible row at the live edge: the cursor's row or the
@@ -1324,11 +1360,11 @@ impl Terminal {
         }
         snap.input_band_rows = band as u16;
 
-        // The input occupies the bottom rows of the band (one for a running
-        // type-ahead field, the full soft-wrapped height for a resting prompt);
-        // queued commands stack in whatever rows remain above it.
+        // The input occupies the bottom rows of the band, as tall as its
+        // soft-wrapped height (the running type-ahead field or the relocated
+        // resting prompt); queued commands stack in whatever rows remain above it.
         let input_height = if self.command_running() {
-            1
+            (self.band_input_height() as usize).clamp(1, band as usize)
         } else {
             (self.resting_input_height() as usize).clamp(1, band as usize)
         };
@@ -1337,25 +1373,9 @@ impl Terminal {
         self.fill_queued_rows(snap, band_top, queue_rows);
 
         if self.command_running() {
-            // Running: the type-ahead field, led by the captured prompt prefix.
-            let input_row = rows - 1;
-            let prefix_w = {
-                let prefix = match self.blocks.last() {
-                    Some(b) => b.prompt_prefix.as_slice(),
-                    None => &[],
-                };
-                let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
-                let mut col = 0;
-                for cell in prefix {
-                    if col >= cols {
-                        break;
-                    }
-                    row[col] = *cell;
-                    col += 1;
-                }
-                col
-            };
-            self.fill_band_input(snap, input_row, prefix_w);
+            // Running: the type-ahead field, led by the captured prompt prefix and
+            // soft-wrapped down the input rows.
+            self.fill_band_input(snap, input_top, input_height);
         } else {
             // Resting prompt: relocate the (soft-wrapped) input line into the band.
             self.fill_resting_input(snap, input_top, input_height);
@@ -1384,6 +1404,20 @@ impl Terminal {
         // The cursor sits on the band row matching its grid row within the span.
         let offset = (grid.cursor.point.line.0 - top).clamp(0, h as i32 - 1) as usize;
         snap.cursor = self.band_cursor(grid.cursor.point.column.0, input_top + offset);
+    }
+
+    /// A beam caret on the band's input area at `col`/`row`: a text-insertion
+    /// point, distinct from the block cursor the shell draws. Set after the
+    /// output-region cursor so it takes precedence — the input lives in the band.
+    fn band_beam(&self, col: usize, row: usize) -> CursorSnapshot {
+        let cols = self.dims.cols as usize;
+        CursorSnapshot {
+            col: col.min(cols.saturating_sub(1)) as u16,
+            row: row as u16,
+            shape: CursorShape::Beam,
+            color: self.palette.cursor,
+            text_color: self.palette.cursor_text,
+        }
     }
 
     /// A cursor on the band's input row at `col`, honoring the shell's cursor shape
@@ -1429,63 +1463,87 @@ impl Terminal {
         }
     }
 
-    /// Render the always-editable input line after the prompt prefix on
-    /// `input_row`: the typed text in the normal foreground, or — when nothing is
-    /// typed — the running command grayed as a placeholder (so the band still
-    /// shows what is running until the user types over it). A beam caret sits at
-    /// the input position (the start of the field when empty). The typed text is
-    /// end-anchored: if it outgrows the line, only its tail (where the caret sits)
-    /// shows. `prefix_w` is where the prompt ends.
-    fn fill_band_input(&self, snap: &mut GridSnapshot, input_row: usize, prefix_w: usize) {
+    /// Render the always-editable type-ahead field into the band's input rows
+    /// [`input_top`, `input_top` + `height`): the captured prompt prefix, then the
+    /// typed text in the normal foreground (one bullet per char when masked),
+    /// soft-wrapped at the grid width, with a beam caret after the last char.
+    /// When nothing is typed, the running command shows grayed as a placeholder on
+    /// the single input row. When the wrapped field is taller than `height` (the
+    /// band clamps it to leave a content row), the bottom rows are shown so the
+    /// caret stays visible.
+    fn fill_band_input(&self, snap: &mut GridSnapshot, input_top: usize, height: usize) {
         let cols = snap.cols as usize;
+        if cols == 0 || height == 0 {
+            return;
+        }
         let bg = self.palette.background;
-        let avail = cols.saturating_sub(prefix_w).saturating_sub(1); // leave the caret a column
-        let input = self.band.input.as_str();
+        let prefix = self.blocks.last().map(|b| b.prompt_prefix.as_slice()).unwrap_or(&[]);
+        let prefix_w = prefix.len().min(cols);
+        let row_range = |brow: usize| brow * cols..(brow + 1) * cols;
 
-        let caret = if input.is_empty() {
+        if self.band.input.is_empty() {
             // Grayed placeholder: the running command, from its start, until typed
-            // over. The caret rests at the start of the input area.
+            // over. One row; the caret rests at the start of the input area.
             let placeholder = match self.blocks.last() {
                 Some(b) if !b.command.is_empty() => b.command.as_str(),
                 _ => "running…",
             };
             let dim_blank = CellSnapshot::blank(self.palette.indexed(8), bg);
-            let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
-            write_row(&mut row[prefix_w.min(cols)..], placeholder, dim_blank);
-            prefix_w
-        } else {
-            let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
-            // No-echo input (e.g. a sudo password): show one bullet per character
-            // so the secret never reaches the screen. The real text is still what
-            // gets sent on Enter — only this rendering is masked.
-            let masked = self.band.masked.then(|| "\u{2022}".repeat(input.chars().count()));
-            let source = masked.as_deref().unwrap_or(input);
-            let shown = visible_tail(source, avail);
-            let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
-            write_row(&mut row[prefix_w.min(cols)..], shown, fg_blank);
-            let caret = prefix_w + UnicodeWidthStr::width(shown);
-            // Ghost text: the un-typed completion, dimmed (the same "ash" the
-            // placeholder and queued rows use), painted from the caret onward.
-            // `write_row` truncates at the row end, so an overflowing suffix is
-            // clamped for free. The beam caret below sits on its first glyph.
-            if let Some(suffix) = self.band.suggestion.as_deref() {
-                let ghost = CellSnapshot::blank(self.palette.indexed(8), bg);
-                write_row(&mut row[caret.min(cols)..], suffix, ghost);
+            let row = &mut snap.cells[row_range(input_top)];
+            for (cell, src) in row.iter_mut().zip(prefix) {
+                *cell = *src;
             }
-            caret
+            write_row(&mut row[prefix_w.min(cols)..], placeholder, dim_blank);
+            snap.cursor = Some(self.band_beam(prefix_w, input_top));
+            return;
+        }
+
+        // Soft-wrap the typed text (bullets when masked) into visual rows; show the
+        // bottom `height` of them so the caret row stays visible when clamped.
+        let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
+        let source = self.band_input_source();
+        let (chunks, caret_wrapped) = wrap_chunks(prefix_w, &source, cols);
+        let total_rows = chunks.len() + caret_wrapped as usize;
+        let first_visible = total_rows.saturating_sub(height);
+
+        for (vrow, chunk) in chunks.iter().enumerate() {
+            if vrow < first_visible {
+                continue;
+            }
+            let brow = input_top + (vrow - first_visible);
+            let row = &mut snap.cells[row_range(brow)];
+            if vrow == 0 {
+                // The prompt prefix leads the first visual row.
+                for (cell, src) in row.iter_mut().zip(prefix) {
+                    *cell = *src;
+                }
+                write_row(&mut row[prefix_w.min(cols)..], chunk, fg_blank);
+            } else {
+                write_row(row, chunk, fg_blank);
+            }
+        }
+
+        // The caret sits after the last glyph, or at column 0 of the spilled row
+        // when the last row filled exactly.
+        let (caret_vrow, caret_vcol) = if caret_wrapped {
+            (chunks.len(), 0)
+        } else {
+            let base = if chunks.len() <= 1 { prefix_w } else { 0 };
+            (chunks.len() - 1, base + UnicodeWidthStr::width(*chunks.last().unwrap_or(&"")))
         };
 
-        // A beam caret reads as a text-insertion point, distinct from the block
-        // cursor the shell draws. This runs after `cursor_snapshot` set the grid
-        // cursor, so it takes precedence — the input lives in the band, not the
-        // output.
-        snap.cursor = Some(CursorSnapshot {
-            col: caret.min(cols.saturating_sub(1)) as u16,
-            row: input_row as u16,
-            shape: CursorShape::Beam,
-            color: self.palette.cursor,
-            text_color: self.palette.cursor_text,
-        });
+        // Ghost text: the un-typed completion, dimmed (the "ash" the placeholder
+        // and queued rows use), from the caret to the end of its row — clipped, so
+        // the suggestion never grows the band.
+        if let (Some(suffix), true) = (self.band.suggestion.as_deref(), caret_vrow >= first_visible) {
+            let brow = input_top + (caret_vrow - first_visible);
+            let ghost = CellSnapshot::blank(self.palette.indexed(8), bg);
+            let row = &mut snap.cells[row_range(brow)];
+            write_row(&mut row[caret_vcol.min(cols)..], suffix, ghost);
+        }
+
+        let caret_row = input_top + caret_vrow.saturating_sub(first_visible);
+        snap.cursor = Some(self.band_beam(caret_vcol, caret_row));
     }
 
     fn cursor_snapshot(&self, offset: i32, shift: i32, cols: u16, rows: u16) -> Option<CursorSnapshot> {
@@ -1575,22 +1633,42 @@ fn write_row(cells: &mut [CellSnapshot], text: &str, blank: CellSnapshot) {
     }
 }
 
-/// The trailing slice of `text` whose display width fits in `max` columns, so an
-/// end-anchored caret stays visible once the composed line outgrows the band. A
-/// wide glyph that would straddle the boundary is dropped whole (its two columns
-/// don't fit), never split.
-fn visible_tail(text: &str, max: usize) -> &str {
+/// Split `text` at the longest leading slice whose display width fits in `max`
+/// columns (wide glyphs kept whole, never split): the head to place on the current
+/// row and the rest to carry to the next. The head-anchored unit of a soft wrap.
+fn head_fit(text: &str, max: usize) -> (&str, &str) {
     let mut width = 0;
-    let mut start = text.len();
-    for (i, ch) in text.char_indices().rev() {
+    for (i, ch) in text.char_indices() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if width + w > max {
-            break;
+            return (&text[..i], &text[i..]);
         }
         width += w;
-        start = i;
     }
-    &text[start..]
+    (text, "")
+}
+
+/// Soft-wrap `text` across the band's input rows: the first row begins at column
+/// `prefix_w` (just past the prompt prefix), the rest span the full `cols`. Returns
+/// the per-row slices and whether the caret spills onto a fresh trailing row (the
+/// last row filled exactly, so the insertion point wraps). Used for both the
+/// reserved height and the rendering, so the two never disagree.
+fn wrap_chunks(prefix_w: usize, text: &str, cols: usize) -> (Vec<&str>, bool) {
+    let first_avail = cols.saturating_sub(prefix_w);
+    let (head, mut rest) = head_fit(text, first_avail);
+    let mut chunks = vec![head];
+    while !rest.is_empty() {
+        let (h, r) = head_fit(rest, cols);
+        if h.is_empty() {
+            break; // a glyph wider than the whole row — cannot be placed
+        }
+        chunks.push(h);
+        rest = r;
+    }
+    let last = *chunks.last().unwrap_or(&"");
+    let last_avail = if chunks.len() <= 1 { first_avail } else { cols };
+    let caret_wrapped = !last.is_empty() && UnicodeWidthStr::width(last) == last_avail;
+    (chunks, caret_wrapped)
 }
 
 /// Drop trailing blank cells from a frozen logical line — soft-wrap padding is
@@ -2470,17 +2548,41 @@ mod tests {
     }
 
     #[test]
-    fn band_input_shows_the_caret_tail_when_it_overflows() {
-        // A typed line wider than the grid keeps its end (where the caret is)
-        // visible, dropping the head — the caret never leaves the band.
-        let mut t = terminal(8, 4);
-        t.process(b"\x1b]133;A\x07$\x1b]133;B\x07go\r\n\x1b]133;C\x07");
-        t.set_band(band("abcdefghij", &[]));
+    fn wrapped_running_type_ahead_spans_band_rows() {
+        // Type-ahead wider than the grid soft-wraps onto extra band rows instead of
+        // truncating — the whole line stays visible, the caret on the last row. The
+        // running analog of `wrapped_resting_input_relocates_whole_into_the_band`.
+        let mut t = terminal(8, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07go\r\n\x1b]133;C\x07");
+        t.set_band(band("abcdefghijkl", &[]));
         let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 2, "the band grew to fit the wrapped input");
+        let rows = snap.rows;
+        // "$ " (2 cols) + the first 6 chars on the first row; the rest continue below.
+        let r0 = row_text(&snap, rows - 2);
+        let r1 = row_text(&snap, rows - 1);
+        assert!(r0.starts_with("$ "), "the prompt prefix leads the first row: {r0:?}");
+        assert!(r0.contains("abcdef"), "first wrapped row: {r0:?}");
+        assert!(r1.contains("ghijkl"), "continuation row: {r1:?}");
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, rows - 1, "the caret sits on the continuation row");
+        assert!(cur.col < snap.cols, "the caret stays within the band");
+    }
+
+    #[test]
+    fn wrapped_type_ahead_clamps_to_the_band_keeping_the_caret_visible() {
+        // On a short grid the band can't grow without starving the output, so the
+        // wrapped field is clamped and the bottom (caret) row is shown.
+        let mut t = terminal(8, 2); // one content row above the band
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07go\r\n\x1b]133;C\x07");
+        t.set_band(band("abcdefghijkl", &[]));
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 1, "clamped to one band row, leaving a content row");
         let last = snap.rows - 1;
         let line = row_text(&snap, last);
-        assert!(line.trim_end().ends_with('j'), "the tail of the line is shown: {line:?}");
+        assert!(line.contains("ghijkl"), "the tail (caret end) stays visible: {line:?}");
         let cur = snap.cursor.expect("a caret in the band");
-        assert!(cur.col < snap.cols, "the caret stays within the band: {}", cur.col);
+        assert_eq!(cur.row, last);
+        assert!(cur.col < snap.cols, "the caret stays within the band");
     }
 }
