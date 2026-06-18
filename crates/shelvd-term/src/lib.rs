@@ -79,6 +79,10 @@ pub struct BandState {
     /// command has turned terminal echo off — e.g. a `sudo` password prompt. The
     /// real text is still sent on Enter; only the on-screen rendering is hidden.
     pub masked: bool,
+    /// The un-typed completion to show dimmed after the caret (ghost text): the
+    /// rest of a prior command whose prefix matches `input`. None = nothing to
+    /// suggest. The app computes it; the band only paints it.
+    pub suggestion: Option<String>,
 }
 
 /// Grid dimensions handed to alacritty. `total_lines == screen_lines`; the grid
@@ -1459,7 +1463,16 @@ impl Terminal {
             let shown = visible_tail(source, avail);
             let row = &mut snap.cells[input_row * cols..(input_row + 1) * cols];
             write_row(&mut row[prefix_w.min(cols)..], shown, fg_blank);
-            prefix_w + UnicodeWidthStr::width(shown)
+            let caret = prefix_w + UnicodeWidthStr::width(shown);
+            // Ghost text: the un-typed completion, dimmed (the same "ash" the
+            // placeholder and queued rows use), painted from the caret onward.
+            // `write_row` truncates at the row end, so an overflowing suffix is
+            // clamped for free. The beam caret below sits on its first glyph.
+            if let Some(suffix) = self.band.suggestion.as_deref() {
+                let ghost = CellSnapshot::blank(self.palette.indexed(8), bg);
+                write_row(&mut row[caret.min(cols)..], suffix, ghost);
+            }
+            caret
         };
 
         // A beam caret reads as a text-insertion point, distinct from the block
@@ -2292,12 +2305,14 @@ mod tests {
         assert!(t.frozen_blocks().is_empty(), "frozen cleared in lockstep");
     }
 
-    /// Band state with the given input text and queued commands (echo on).
+    /// Band state with the given input text and queued commands (echo on, no
+    /// ghost-text suggestion).
     fn band(input: &str, queued: &[&str]) -> BandState {
         BandState {
             input: input.to_owned(),
             queued: queued.iter().map(|s| (*s).to_owned()).collect(),
             masked: false,
+            suggestion: None,
         }
     }
 
@@ -2330,6 +2345,7 @@ mod tests {
             input: "hunter2".to_owned(),
             queued: Vec::new(),
             masked: true,
+            suggestion: None,
         });
         let snap = t.snapshot();
         let last = snap.rows - 1;
@@ -2343,6 +2359,40 @@ mod tests {
         let cur = snap.cursor.expect("a caret in the band");
         assert_eq!(cur.row, last);
         assert_eq!(cur.col, 9, "the caret rests past the prompt and the masked text");
+    }
+
+    #[test]
+    fn ghost_text_renders_the_suggestion_dimmed_after_the_input() {
+        let mut t = terminal(40, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        // Typed "ec" with the rest of "echo hi" offered as ghost text.
+        t.set_band(BandState {
+            input: "ec".to_owned(),
+            queued: Vec::new(),
+            masked: false,
+            suggestion: Some("ho hi".to_owned()),
+        });
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        // Typed prefix and dimmed suffix read as one command on the input row.
+        assert!(row_text(&snap, last).contains("echo hi"), "prefix + ghost read as one line");
+        let pal = Palette::default();
+        // "$ " (2 cols) + "ec" (2 cols): typed text in normal fg, ghost starts at col 4.
+        assert_eq!(snap.cell(2, last).unwrap().c, 'e');
+        assert_eq!(snap.cell(2, last).unwrap().fg, pal.foreground, "typed text in normal fg");
+        assert_eq!(snap.cell(4, last).unwrap().c, 'h', "the ghost suffix follows the typed text");
+        assert_eq!(snap.cell(4, last).unwrap().fg, pal.indexed(8), "the ghost suffix is dimmed");
+    }
+
+    #[test]
+    fn no_suggestion_leaves_the_band_clear_after_the_caret() {
+        let mut t = terminal(40, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        t.set_band(band("ec", &[])); // the helper supplies suggestion: None
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        // Caret at "$ " (2) + "ec" (2) = col 4; with nothing to suggest it stays blank.
+        assert!(snap.cell(4, last).unwrap().is_blank(), "no ghost text painted past the caret");
     }
 
     #[test]
