@@ -122,6 +122,9 @@ struct State {
     /// The bottom band's input line — what the user is typing while a command
     /// runs. Sent to the running command on Enter, or queued on Ctrl+Shift+Enter.
     input: BandInput,
+    /// The pending ghost-text suggestion (the un-typed suffix shown dimmed after
+    /// the caret), recomputed on every band edit. Right/End accepts exactly this.
+    suggestion: Option<String>,
     /// Commands queued ahead, flushed one at a time to the PTY on each new shell
     /// prompt (OSC 133;A).
     queue: VecDeque<String>,
@@ -246,6 +249,7 @@ impl ApplicationHandler<UserEvent> for App {
             last_blink: Instant::now(),
             overlay: None,
             input: BandInput::default(),
+            suggestion: None,
             queue: VecDeque::new(),
             overlay_colors: overlay_colors(&self.config),
             anim_offset_px: 0.0,
@@ -991,12 +995,18 @@ fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
 /// line and the queued commands. Called after any change to either, before the
 /// next redraw, so layout and rendering stay derived from one source.
 fn sync_band(state: &mut State) {
+    // Mask the input when the running command has turned echo off (a password
+    // prompt); the real bytes are still what we send on Enter.
+    let masked = !state.pty.echo_enabled();
+    // Recompute the ghost-text suggestion against the current input, keeping an
+    // app-side copy so Right/End accepts exactly what the band shows.
+    let suggestion = suggest_completion(state.input.text(), masked, &state.terminal);
+    state.suggestion = suggestion.clone();
     let band = BandState {
         input: state.input.text().to_owned(),
         queued: state.queue.iter().cloned().collect(),
-        // Mask the input when the running command has turned echo off (a password
-        // prompt); the real bytes are still what we send on Enter.
-        masked: !state.pty.echo_enabled(),
+        masked,
+        suggestion,
     };
     state.terminal.set_band(band);
 }
@@ -1015,6 +1025,10 @@ fn handle_band_key(state: &mut State, event: &KeyEvent) {
             }
         }
         Key::Named(NamedKey::Backspace) => state.input.backspace(),
+        // Accept the ghost-text suggestion (fish convention); a no-op when none.
+        Key::Named(NamedKey::ArrowRight | NamedKey::End) => {
+            accept_suggestion(&mut state.input, &mut state.suggestion);
+        }
         Key::Named(NamedKey::Space) => state.input.input_char(' '),
         Key::Character(s) => {
             for ch in s.chars() {
@@ -1071,6 +1085,35 @@ fn history_commands(terminal: &Terminal) -> Vec<String> {
     out
 }
 
+/// The dimmed completion to offer after the caret: the most-recent prior command
+/// that strictly extends `input`, minus the typed prefix. None when nothing is
+/// typed, the input is masked (no-echo), or no command extends it.
+fn suggest_completion(input: &str, masked: bool, terminal: &Terminal) -> Option<String> {
+    if input.is_empty() || masked {
+        return None;
+    }
+    terminal
+        .blocks()
+        .iter()
+        .rev() // most recent first
+        .map(|b| b.command.as_str())
+        // `starts_with` makes `input.len()` a char boundary in `cmd`, and the
+        // length check guarantees a non-empty suffix — so the slice below is safe.
+        .find(|cmd| cmd.len() > input.len() && cmd.starts_with(input))
+        .map(|cmd| cmd[input.len()..].to_owned())
+}
+
+/// Accept the pending ghost-text suggestion into the input line (Right/End): the
+/// band editor only appends, so the suffix is pushed a char at a time. A no-op
+/// when nothing is suggested.
+fn accept_suggestion(input: &mut BandInput, suggestion: &mut Option<String>) {
+    if let Some(suffix) = suggestion.take() {
+        for ch in suffix.chars() {
+            input.input_char(ch);
+        }
+    }
+}
+
 /// Resolve the overlay's colors from the active theme.
 fn overlay_colors(config: &Config) -> OverlayColors {
     let pal = &config.theme.palette;
@@ -1119,7 +1162,11 @@ fn paste_to_pty(state: &mut State, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill_anim_offset, mouse_report, MouseAction};
+    use super::{
+        accept_suggestion, fill_anim_offset, mouse_report, suggest_completion, BandInput,
+        MouseAction, Terminal,
+    };
+    use shelvd_core::{CursorShape, Palette};
     use winit::keyboard::ModifiersState;
 
     #[test]
@@ -1178,5 +1225,52 @@ mod tests {
             mouse_report(true, MouseAction::Press(0), 0, 0, ModifiersState::CONTROL),
             b"\x1b[<16;1;1M".to_vec()
         );
+    }
+
+    /// A terminal carrying the given finished command blocks (oldest first), so
+    /// `blocks()` has history to suggest from.
+    fn term_with_history(cmds: &[&str]) -> Terminal {
+        let mut t = Terminal::new(40, 6, 1000, Palette::default(), CursorShape::Block);
+        for cmd in cmds {
+            // A complete OSC-133 block: prompt (;A), command (;B), output (;C),
+            // finish (;D). The command is captured (trimmed) between ;B and ;C.
+            let seq =
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07{cmd}\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+            t.process(seq.as_bytes());
+        }
+        t
+    }
+
+    #[test]
+    fn suggest_completion_returns_the_most_recent_prefix_extension() {
+        // Two prior commands extend "echo "; the most recent wins.
+        let t = term_with_history(&["echo aaa", "echo bbb"]);
+        assert_eq!(
+            suggest_completion("echo ", false, &t),
+            Some("bbb".to_owned()),
+            "the suffix of the most-recent command that extends the prefix"
+        );
+        // The suffix is measured from the typed prefix, not the whole command.
+        assert_eq!(suggest_completion("ec", false, &t), Some("ho bbb".to_owned()));
+    }
+
+    #[test]
+    fn suggest_completion_is_none_when_empty_masked_or_unmatched() {
+        let t = term_with_history(&["echo hello"]);
+        assert_eq!(suggest_completion("", false, &t), None, "nothing typed");
+        assert_eq!(suggest_completion("ec", true, &t), None, "masked (no-echo) input");
+        assert_eq!(suggest_completion("zzz", false, &t), None, "no command extends it");
+        assert_eq!(suggest_completion("echo hello", false, &t), None, "exact match has no suffix");
+    }
+
+    #[test]
+    fn accept_suggestion_fills_the_line_and_clears() {
+        let mut input = BandInput::default();
+        input.input_char('e');
+        input.input_char('c');
+        let mut suggestion = Some("ho hi".to_owned());
+        accept_suggestion(&mut input, &mut suggestion);
+        assert_eq!(input.text(), "echo hi", "the suffix is appended to the typed prefix");
+        assert!(suggestion.is_none(), "the accepted suggestion is consumed");
     }
 }
