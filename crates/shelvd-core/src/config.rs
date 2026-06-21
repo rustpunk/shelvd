@@ -23,6 +23,10 @@ pub struct Config {
     pub shell: Option<String>,
     /// Number of scrollback lines to retain.
     pub scrollback: usize,
+    /// Whether a program may set the system clipboard via OSC 52. On by default
+    /// (matching alacritty's `OnlyCopy` and mainstream terminals); set `false` to
+    /// deny program-driven clipboard writes. The read direction is never honored.
+    pub osc52_clipboard_write: bool,
 }
 
 impl Default for Config {
@@ -31,6 +35,7 @@ impl Default for Config {
             theme: Theme::default(),
             shell: None,
             scrollback: 10_000,
+            osc52_clipboard_write: true,
         }
     }
 }
@@ -83,6 +88,7 @@ impl Config {
 struct ConfigFile {
     shell: Option<String>,
     scrollback: Option<usize>,
+    osc52_clipboard_write: Option<bool>,
     theme: ThemeFile,
 }
 
@@ -94,6 +100,9 @@ impl ConfigFile {
         }
         if let Some(scrollback) = self.scrollback {
             config.scrollback = scrollback;
+        }
+        if let Some(osc52_clipboard_write) = self.osc52_clipboard_write {
+            config.osc52_clipboard_write = osc52_clipboard_write;
         }
         self.theme.resolve_into(&mut config.theme)?;
         Ok(config)
@@ -256,5 +265,18 @@ mod tests {
     #[test]
     fn unknown_field_rejected() {
         assert!(toml::from_str::<ConfigFile>("nonsense = 1\n").is_err());
+    }
+
+    #[test]
+    fn osc52_clipboard_write_defaults_on() {
+        assert!(resolve("").unwrap().osc52_clipboard_write);
+    }
+
+    #[test]
+    fn osc52_clipboard_write_can_be_disabled() {
+        let config = resolve("osc52_clipboard_write = false\n").unwrap();
+        assert!(!config.osc52_clipboard_write);
+        // Anything not named keeps its default.
+        assert_eq!(config.scrollback, Config::default().scrollback);
     }
 }

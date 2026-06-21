@@ -2089,6 +2089,19 @@ mod tests {
     }
 
     #[test]
+    fn osc52_store_surfaces_decoded_clipboard_text() {
+        let mut t = terminal(20, 3);
+        // OSC 52 ; c ; <base64> BEL — "aGVsbG8=" is base64("hello"). alacritty
+        // decodes the payload before emitting, so the event carries plain text.
+        t.process(b"\x1b]52;c;aGVsbG8=\x07");
+        let stored = t.events().try_iter().find_map(|e| match e {
+            TermEvent::ClipboardStore(s) => Some(s),
+            _ => None,
+        });
+        assert_eq!(stored.as_deref(), Some("hello"));
+    }
+
+    #[test]
     fn marker_split_across_process_calls() {
         let mut t = terminal(20, 3);
         t.process(b"x\x1b]133;");
