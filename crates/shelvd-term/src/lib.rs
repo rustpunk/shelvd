@@ -977,12 +977,24 @@ impl Terminal {
     /// column + which cell-half the pointer fell on). The line math mirrors the
     /// snapshot's row→line mapping (scrolled: straight onto the composite line;
     /// live edge: undo the bottom-anchor shift) but yields an absolute line, so the
-    /// selection lives in the same coordinate space as the composite.
+    /// selection lives in the same coordinate space as the composite. At a resting
+    /// prompt the live input is relocated into the pinned band, so a viewport row
+    /// over the band's input rows maps back to the relocated grid line (which is
+    /// pinned, not subject to the bottom-anchor shift) rather than the output region.
     fn viewport_to_abs(&self, col: u16, row: u16, right_half: bool) -> SelPoint {
         let max_col = self.dims.cols.saturating_sub(1) as usize;
         let abs = match self.scroll_top_abs {
             Some(top) => top + row as i64,
-            None => self.abs_base + row as i64 - self.display_shift() as i64,
+            None => match self.resting_band_layout() {
+                // Over the relocated-input rows: map to the grid line that band row
+                // carries, clamped into `[top, top + h)`.
+                Some((input_top, top, h)) if row as usize >= input_top => {
+                    let i = (row as usize - input_top).min(h - 1);
+                    self.abs_base + top as i64 + i as i64
+                }
+                // Output region (or queued rows above the input): bottom-anchored.
+                _ => self.abs_base + row as i64 - self.display_shift() as i64,
+            },
         };
         SelPoint { abs, col: (col as usize).min(max_col), side: side(right_half) }
     }
@@ -1116,6 +1128,27 @@ impl Terminal {
     fn resting_input_height(&self) -> i32 {
         let (top, bottom) = self.resting_input_span();
         (bottom - top + 1).max(1)
+    }
+
+    /// Geometry of the relocated resting input inside the band, at the live edge:
+    /// `(input_top, top, h)` where band rows `[input_top, input_top + h)` carry
+    /// grid lines `[top, top + h)` (band row `input_top + i` is grid line
+    /// `top + i`, absolute line `abs_base + top + i`). `None` unless we are at the
+    /// live edge, no command is running, and the band is present. Mirrors the
+    /// layout [`Self::fill_input_band`]/[`Self::fill_resting_input`] paint, so
+    /// selection hit-testing and painting share one source of truth.
+    fn resting_band_layout(&self) -> Option<(usize, i32, usize)> {
+        if self.scroll_top_abs.is_some() || self.command_running() {
+            return None;
+        }
+        let band = self.input_band_rows();
+        if band <= 0 {
+            return None;
+        }
+        let rows = self.dims.rows as usize;
+        let (top, _bottom) = self.resting_input_span();
+        let input_height = (self.resting_input_height() as usize).clamp(1, band as usize);
+        Some((rows - input_height, top, input_height))
     }
 
     /// Display width of the captured prompt prefix that leads the running
@@ -1396,9 +1429,16 @@ impl Terminal {
         for i in 0..h {
             let src = Line(top + i as i32);
             let brow = input_top + i;
+            // The relocated rows are real live grid lines; flag the active
+            // selection here (it is skipped in the output loop), in the same
+            // absolute-line space [`Self::viewport_to_abs`] maps band rows into.
+            let abs = self.abs_base + top as i64 + i as i64;
             let dst = &mut snap.cells[brow * cols..(brow + 1) * cols];
             for (c, cell) in dst.iter_mut().enumerate() {
                 *cell = self.cell_to_snapshot(&grid[src][Column(c)]);
+                if self.is_selected(abs, c) {
+                    cell.flags |= CellFlags::SELECTED;
+                }
             }
         }
         // The cursor sits on the band row matching its grid row within the span.
@@ -2261,6 +2301,78 @@ mod tests {
         // The caret rides the continuation row where the typing ended.
         let cur = snap.cursor.expect("cursor visible at the prompt");
         assert_eq!(cur.row, rows - 1, "cursor on the last input row");
+    }
+
+    #[test]
+    fn selects_relocated_resting_input_in_the_band() {
+        let mut t = terminal(20, 4);
+        // Resting prompt with typed (not yet run) input, relocated into the band.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07hello");
+        assert!(!t.command_running(), "still editing at the prompt");
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 1, "single-row relocated input");
+        let band_row = snap.rows - snap.input_band_rows;
+        assert!(row_text(&snap, band_row).contains("$ hello"), "input is in the band");
+
+        // Drag across "hello" (cols 2..=6) on the band's input row.
+        t.selection_start(2, band_row, false);
+        t.selection_update(6, band_row, true);
+        assert_eq!(t.selection_text().as_deref(), Some("hello"), "band selection copies the input");
+
+        // The band cells are flagged SELECTED so the highlight is painted.
+        let snap = t.snapshot();
+        assert!(snap.cell(2, band_row).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(snap.cell(6, band_row).unwrap().flags.contains(CellFlags::SELECTED));
+        assert!(!snap.cell(8, band_row).unwrap().flags.contains(CellFlags::SELECTED));
+    }
+
+    #[test]
+    fn selects_wrapped_relocated_input_across_band_rows() {
+        let mut t = terminal(10, 6);
+        // Input longer than the width soft-wraps across two band rows (the setup
+        // from `wrapped_resting_input_relocates_whole_into_the_band`).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07abcdefghijklmno");
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 2, "band is as tall as the wrapped input");
+        let first = snap.rows - 2; // first input row (band)
+        let wrap = snap.rows - 1; // continuation row (band)
+
+        // Drag from the start of the first band row through the wrap row.
+        t.selection_start(0, first, false);
+        t.selection_update(4, wrap, true); // through 'm' on the continuation row
+        let text = t.selection_text().expect("multi-row band selection has text");
+        assert!(text.contains("abcdefgh"), "first row of the wrapped input: {text:?}");
+        assert!(text.contains("ijklm"), "continuation row of the wrapped input: {text:?}");
+        assert!(
+            text.find("abc") < text.find("ijk"),
+            "reading order spans the wrap coherently: {text:?}"
+        );
+    }
+
+    #[test]
+    fn selection_spans_output_into_the_relocated_band_input() {
+        let mut t = terminal(20, 4);
+        // Committed output stays in the output region; the resting prompt with typed
+        // input is relocated into the band below it.
+        t.process(b"out\r\n$ tail");
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 1);
+        let band_row = snap.rows - snap.input_band_rows;
+        let out_row = (0..snap.rows)
+            .find(|&r| row_text(&snap, r).contains("out"))
+            .expect("output visible");
+        assert!(out_row < band_row, "output sits above the band");
+
+        // Drag from the output region down into the relocated input.
+        t.selection_start(0, out_row, false);
+        t.selection_update(5, band_row, true); // through "tail" in the band
+        let text = t.selection_text().expect("cross-region selection has text");
+        assert!(text.contains("out"), "includes the output-region text: {text:?}");
+        assert!(text.contains("tail"), "includes the relocated band input: {text:?}");
+        assert!(
+            text.find("out") < text.find("tail"),
+            "output precedes the input in reading order: {text:?}"
+        );
     }
 
     #[test]
