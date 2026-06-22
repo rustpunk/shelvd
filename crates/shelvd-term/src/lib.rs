@@ -11,9 +11,10 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, TermMode};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, Rgb};
 use alacritty_terminal::Term;
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -111,9 +112,29 @@ impl Dimensions for TermDimensions {
     }
 }
 
-/// Forwards alacritty events onto a channel, mapping them to [`TermEvent`].
+/// A pending OSC color query awaiting a reply. The reply closure (supplied by
+/// alacritty) already bakes in the OSC prefix and the request's terminator; we
+/// only resolve `index` against the active [`Palette`] to an [`Rgb`] and call it.
+///
+/// This is forwarded on a dedicated channel rather than answered inline because
+/// [`EventProxy::send_event`] fires from inside `parser.advance` and has no
+/// access to the palette — that lives on [`Terminal`], reachable only after the
+/// parse returns (see [`Terminal::reply_color_queries`]).
+struct ColorQuery {
+    index: usize,
+    reply: Arc<dyn Fn(Rgb) -> String + Send + Sync>,
+}
+
+/// Forwards alacritty events onto channels, mapping them to [`TermEvent`].
+///
+/// Most events go straight to `events`. Color queries can't be answered here
+/// (no palette in scope), so they're parked on `colors` for [`Terminal`] to
+/// resolve after the parse.
 #[derive(Clone)]
-struct EventProxy(flume::Sender<TermEvent>);
+struct EventProxy {
+    events: flume::Sender<TermEvent>,
+    colors: flume::Sender<ColorQuery>,
+}
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
@@ -127,12 +148,18 @@ impl EventListener for EventProxy {
             Event::MouseCursorDirty => Some(TermEvent::MouseCursorDirty),
             Event::CursorBlinkingChange => Some(TermEvent::CursorBlink),
             Event::Exit => Some(TermEvent::Exit),
-            // Callback-carrying queries (color/text-area/clipboard-load) are
-            // ignored for now; they land in a later milestone.
+            // Park color queries (OSC 4/10/11/12) on the dedicated channel; the
+            // palette they resolve against lives on `Terminal`, not here.
+            Event::ColorRequest(index, formatter) => {
+                let _ = self.colors.send(ColorQuery { index, reply: formatter });
+                None
+            }
+            // The remaining callback-carrying queries (clipboard-load,
+            // text-area-size) are still ignored; they land in a later milestone.
             _ => None,
         };
         if let Some(ev) = mapped {
-            let _ = self.0.send(ev);
+            let _ = self.events.send(ev);
         }
     }
 }
@@ -145,6 +172,10 @@ pub struct Terminal {
     /// Sender shared with [`EventProxy`], so OSC-133 markers detected by the tee
     /// reach the same channel as alacritty's own side effects.
     tx: flume::Sender<TermEvent>,
+    /// Pending OSC color queries forwarded by [`EventProxy`]. They're answered
+    /// here (not in the proxy) because resolving an index needs `self.palette`,
+    /// which the proxy can't reach from inside `parser.advance`.
+    color_queries: flume::Receiver<ColorQuery>,
     /// Tees the byte stream for shell-integration markers `alacritty` drops.
     scanner: Scanner,
     /// Absolute grid-line index of active line 0, advanced as content scrolls
@@ -202,14 +233,17 @@ impl Terminal {
         cursor_shape: CursorShape,
     ) -> Self {
         let (tx, rx) = flume::unbounded();
+        let (color_tx, color_rx) = flume::unbounded();
         let config = Config { scrolling_history: scrollback, ..Config::default() };
         let dims = TermDimensions::new(cols, rows);
-        let term = Term::new(config, &dims, EventProxy(tx.clone()));
+        let proxy = EventProxy { events: tx.clone(), colors: color_tx };
+        let term = Term::new(config, &dims, proxy);
         Self {
             term,
             parser: Processor::new(),
             events: rx,
             tx,
+            color_queries: color_rx,
             scanner: Scanner::new(),
             abs_base: 0,
             prev_history: 0,
@@ -241,15 +275,16 @@ impl Terminal {
         let hits = self.scanner.scan(bytes);
         if hits.is_empty() {
             self.advance_segment(bytes);
-            return;
+        } else {
+            let mut start = 0;
+            for (end, marker) in hits {
+                self.advance_segment(&bytes[start..end]);
+                start = end;
+                self.on_marker(marker);
+            }
+            self.advance_segment(&bytes[start..]);
         }
-        let mut start = 0;
-        for (end, marker) in hits {
-            self.advance_segment(&bytes[start..end]);
-            start = end;
-            self.on_marker(marker);
-        }
-        self.advance_segment(&bytes[start..]);
+        self.reply_color_queries();
     }
 
     /// Feed one segment to alacritty and refresh the absolute-line origin.
@@ -259,6 +294,37 @@ impl Terminal {
         }
         self.parser.advance(&mut self.term, seg);
         self.sync_abs_base();
+    }
+
+    /// Resolve a color-query index against the active palette. OSC 4 passes
+    /// `0..=255`; OSC 10/11/12 pass the special slots 256 (fg) / 257 (bg) /
+    /// 258 (cursor), matching alacritty's `NamedColor` discriminants. The parser
+    /// never emits any other value here — `vte` clamps OSC 4 indices to `u8` and
+    /// rejects OSC 10/11/12 above cursor — so the catch-all only satisfies
+    /// `usize` exhaustiveness; foreground is a conservative default.
+    fn palette_color(&self, index: usize) -> Rgba {
+        match index {
+            0..=255 => self.palette.indexed(index as u8),
+            256 => self.palette.foreground,
+            257 => self.palette.background,
+            258 => self.palette.cursor,
+            _ => self.palette.foreground,
+        }
+    }
+
+    /// Drain pending OSC color queries and write their replies back to the PTY.
+    ///
+    /// The queries are parked by [`EventProxy`] (which can't see the palette);
+    /// here `&self.palette` is in scope, so we resolve each index and invoke the
+    /// formatter alacritty supplied — it already carries the OSC prefix and the
+    /// request's terminator, so the returned string is a ready-to-send reply.
+    fn reply_color_queries(&self) {
+        for q in self.color_queries.try_iter() {
+            let c = self.palette_color(q.index);
+            let rgb = Rgb { r: c.r, g: c.g, b: c.b };
+            let reply = (q.reply)(rgb);
+            let _ = self.tx.send(TermEvent::PtyWrite(reply.into_bytes()));
+        }
     }
 
     /// Act on a recognized shell-integration marker: update the block model and
@@ -2099,6 +2165,55 @@ mod tests {
             _ => None,
         });
         assert_eq!(stored.as_deref(), Some("hello"));
+    }
+
+    /// Pull the first `PtyWrite` reply emitted on the event channel, as bytes.
+    fn first_pty_write(t: &Terminal) -> Option<Vec<u8>> {
+        t.events().try_iter().find_map(|e| match e {
+            TermEvent::PtyWrite(b) => Some(b),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn osc11_background_query_replies() {
+        let mut t = terminal(20, 3);
+        // OSC 11 ; ? BEL — query the default background. alacritty doubles each
+        // 8-bit channel into the 16-bit `rgb:RRRR/GGGG/BBBB` form and echoes the
+        // request terminator (BEL).
+        t.process(b"\x1b]11;?\x07");
+        let bg = Palette::default().background;
+        let expected = format!(
+            "\x1b]11;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x07",
+            bg.r, bg.g, bg.b
+        );
+        assert_eq!(first_pty_write(&t).as_deref(), Some(expected.as_bytes()));
+    }
+
+    #[test]
+    fn osc10_foreground_query_replies() {
+        let mut t = terminal(20, 3);
+        t.process(b"\x1b]10;?\x07");
+        let fg = Palette::default().foreground;
+        let expected = format!(
+            "\x1b]10;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x07",
+            fg.r, fg.g, fg.b
+        );
+        assert_eq!(first_pty_write(&t).as_deref(), Some(expected.as_bytes()));
+    }
+
+    #[test]
+    fn osc4_indexed_query_replies() {
+        let mut t = terminal(20, 3);
+        // OSC 4 ; 1 ; ? BEL — query indexed color 1; the reply prefix echoes the
+        // index as `4;1`.
+        t.process(b"\x1b]4;1;?\x07");
+        let c = Palette::default().indexed(1);
+        let expected = format!(
+            "\x1b]4;1;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x07",
+            c.r, c.g, c.b
+        );
+        assert_eq!(first_pty_write(&t).as_deref(), Some(expected.as_bytes()));
     }
 
     #[test]
