@@ -209,6 +209,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.config.scrollback,
             self.config.theme.palette.clone(),
             self.config.theme.cursor_shape,
+            self.config.osc52_clipboard_read,
         );
         // Seed the cell pixel size so an early CSI 14t reports a real extent.
         let (cw, ch) = cell_pixels(&renderer);
@@ -335,6 +336,18 @@ impl ApplicationHandler<UserEvent> for App {
                             set_clipboard(state, kind, text, "osc52 clipboard write failed");
                         }
                     }
+                }
+                // A program asked to read the clipboard back (OSC 52 read); only
+                // reaches here when the config opt-in is on (the term denies it
+                // otherwise). Always reply (even on read failure) so the pending
+                // formatter is consumed and the program isn't left hanging; empty
+                // clipboard -> empty. Unlike the write path (MAX_OSC52_WRITE_BYTES),
+                // the reply is intentionally uncapped: the payload is the user's own
+                // clipboard, returned only on explicit opt-in, so there is no
+                // untrusted-program spam vector to bound here.
+                TermEvent::ClipboardLoad(kind) => {
+                    let contents = read_clipboard(state, kind).unwrap_or_default();
+                    state.terminal.provide_clipboard(&contents);
                 }
                 TermEvent::Bell | TermEvent::Wakeup
                 | TermEvent::MouseCursorDirty | TermEvent::WorkingDirectory(_) => {}
@@ -996,6 +1009,27 @@ fn write_clipboard(
     clipboard.set_text(text)
 }
 
+/// Read the clipboard or primary selection. `None` if the clipboard handle
+/// failed to init or the read errored. The cfg split mirrors [`write_clipboard`]:
+/// platforms with a distinct primary selection route `Primary` reads there.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+fn read_clipboard(state: &mut State, kind: ClipboardKind) -> Option<String> {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+    let clipboard = state.clipboard.as_mut()?;
+    let target = match kind {
+        ClipboardKind::Clipboard => LinuxClipboardKind::Clipboard,
+        ClipboardKind::Primary => LinuxClipboardKind::Primary,
+    };
+    clipboard.get().clipboard(target).text().ok()
+}
+
+/// Other platforms (macOS, Windows, …) have no primary selection; every read
+/// comes from the clipboard.
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
+fn read_clipboard(state: &mut State, _kind: ClipboardKind) -> Option<String> {
+    state.clipboard.as_mut()?.get_text().ok()
+}
+
 /// Copy the current selection to the system clipboard, if it is non-empty.
 fn copy_selection(state: &mut State) {
     let Some(text) = state.terminal.selection_text() else {
@@ -1396,7 +1430,7 @@ mod tests {
     /// A terminal carrying the given finished command blocks (oldest first), so
     /// `blocks()` has history to suggest from.
     fn term_with_history(cmds: &[&str]) -> Terminal {
-        let mut t = Terminal::new(40, 6, 1000, Palette::default(), CursorShape::Block);
+        let mut t = Terminal::new(40, 6, 1000, Palette::default(), CursorShape::Block, false);
         for cmd in cmds {
             // A complete OSC-133 block: prompt (;A), command (;B), output (;C),
             // finish (;D). The command is captured (trimmed) between ;B and ;C.

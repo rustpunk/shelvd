@@ -14,6 +14,11 @@
 # On by default; set to false to deny program-driven clipboard writes.
 # osc52_clipboard_write = true
 
+# Allow programs to read the system clipboard via OSC 52 (paste-back). Off by
+# default: a read query lets a program exfiltrate your clipboard over the PTY,
+# so it is opt-in. Set to true only if you trust what runs in the terminal.
+# osc52_clipboard_read = false
+
 [theme]
 # font_family = "JetBrains Mono"   # omit for a system monospace
 # font_size = 15.0                 # logical pixels
