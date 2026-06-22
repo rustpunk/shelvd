@@ -526,6 +526,12 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseButton::Left, ElementState::Pressed) => {
                         let (col, row, right) =
                             state.renderer.pixel_to_cell(state.mouse_pos.0, state.mouse_pos.1);
+                        if link_open_modifier(&state.modifiers) {
+                            if let Some(uri) = state.terminal.link_at(col, row, right) {
+                                open_link(&uri);
+                                return;
+                            }
+                        }
                         state.terminal.selection_start(col, row, right);
                         state.selecting = true;
                         state.window.request_redraw();
@@ -1258,14 +1264,76 @@ fn paste_to_pty(state: &mut State, text: &str) {
     }
 }
 
+/// The modifier that turns a left-click into a link-open: Cmd on macOS, Ctrl
+/// elsewhere. A bare click still selects.
+#[cfg(target_os = "macos")]
+fn link_open_modifier(m: &ModifiersState) -> bool {
+    m.super_key()
+}
+#[cfg(not(target_os = "macos"))]
+fn link_open_modifier(m: &ModifiersState) -> bool {
+    m.control_key()
+}
+
+/// Schemes shelvd will hand to the system opener. `file:` is deliberately
+/// excluded: an OSC 8 link's display text is attacker-controlled, and a
+/// `file://` target reaches arbitrary local resources (on Linux, xdg-open will
+/// launch a `.desktop` / registered-handler file), so a hostile program could
+/// disguise a one-click local open. Anything not listed (e.g. `javascript:`)
+/// is refused.
+const ALLOWED_LINK_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+/// Whether `uri`'s scheme is on the allow-list (case-insensitive).
+fn link_scheme_allowed(uri: &str) -> bool {
+    match uri.split_once(':') {
+        Some((scheme, _)) => ALLOWED_LINK_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Open an allow-listed link URI in the system handler, detached so it never
+/// blocks the event loop. Non-allow-listed schemes are refused.
+fn open_link(uri: &str) {
+    if !link_scheme_allowed(uri) {
+        log::debug!("ignored link with non-allow-listed scheme: {uri}");
+        return;
+    }
+    if let Err(e) = open::that_detached(uri) {
+        log::debug!("failed to open link {uri}: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_suggestion, fill_anim_offset, mouse_report, osc52_write_decision, suggest_completion,
-        BandInput, MouseAction, Terminal, MAX_OSC52_WRITE_BYTES,
+        accept_suggestion, fill_anim_offset, link_open_modifier, link_scheme_allowed, mouse_report,
+        osc52_write_decision, suggest_completion, BandInput, MouseAction, Terminal,
+        MAX_OSC52_WRITE_BYTES,
     };
     use shelvd_core::{CursorShape, Palette};
     use winit::keyboard::ModifiersState;
+
+    #[test]
+    fn link_scheme_allowlist() {
+        assert!(link_scheme_allowed("https://example.com"));
+        assert!(link_scheme_allowed("http://x"));
+        assert!(link_scheme_allowed("mailto:a@b.com"));
+        assert!(link_scheme_allowed("HTTPS://X")); // case-insensitive scheme
+        assert!(!link_scheme_allowed("file:///etc/hosts")); // local files refused (security)
+        assert!(!link_scheme_allowed("javascript:alert(1)"));
+        assert!(!link_scheme_allowed("data:text/html,x"));
+        assert!(!link_scheme_allowed("no-scheme-here"));
+    }
+
+    #[test]
+    fn link_open_modifier_requires_a_modifier() {
+        // The safety story rests on this gate: a bare click must never open a link.
+        assert!(!link_open_modifier(&ModifiersState::empty()));
+        #[cfg(target_os = "macos")]
+        assert!(link_open_modifier(&ModifiersState::SUPER));
+        #[cfg(not(target_os = "macos"))]
+        assert!(link_open_modifier(&ModifiersState::CONTROL));
+    }
 
     #[test]
     fn fill_anim_offset_eases_from_full_to_zero() {
