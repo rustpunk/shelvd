@@ -203,13 +203,16 @@ impl ApplicationHandler<UserEvent> for App {
         };
 
         let grid = renderer.grid_size();
-        let terminal = Terminal::new(
+        let mut terminal = Terminal::new(
             grid.cols,
             grid.rows,
             self.config.scrollback,
             self.config.theme.palette.clone(),
             self.config.theme.cursor_shape,
         );
+        // Seed the cell pixel size so an early CSI 14t reports a real extent.
+        let (cw, ch) = cell_pixels(&renderer);
+        terminal.set_cell_pixels(cw, ch);
         let terminal_anchor = terminal.anchor_shift();
 
         let proxy = self.proxy.clone();
@@ -398,6 +401,8 @@ impl ApplicationHandler<UserEvent> for App {
                 state.renderer.resize(size.width, size.height, scale);
                 let grid = state.renderer.grid_size();
                 state.terminal.resize(grid.cols, grid.rows);
+                let (cw, ch) = cell_pixels(&state.renderer);
+                state.terminal.set_cell_pixels(cw, ch);
                 let _ = state.pty.resize(PtySize {
                     rows: grid.rows,
                     cols: grid.cols,
@@ -415,6 +420,8 @@ impl ApplicationHandler<UserEvent> for App {
                 state.renderer.resize(size.width, size.height, scale_factor as f32);
                 let grid = state.renderer.grid_size();
                 state.terminal.resize(grid.cols, grid.rows);
+                let (cw, ch) = cell_pixels(&state.renderer);
+                state.terminal.set_cell_pixels(cw, ch);
                 let _ = state.pty.resize(PtySize {
                     rows: grid.rows,
                     cols: grid.cols,
@@ -716,6 +723,13 @@ fn cancel_fill_anim(state: &mut State) {
     state.anim_from_px = 0.0;
     state.prev_anchor_shift = state.terminal.anchor_shift();
     state.last_geometry_change = Instant::now();
+}
+
+/// The renderer's cell size rounded to whole pixels (width, height), for the
+/// terminal's CSI 14t text-area report. Pushed on init and on every resize.
+fn cell_pixels(renderer: &Renderer) -> (u16, u16) {
+    let m = renderer.cell_metrics();
+    (m.width.round() as u16, m.height.round() as u16)
 }
 
 /// A left press on the titlebar: a quick second press toggles maximize,
