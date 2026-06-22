@@ -10,6 +10,10 @@
 # Scrollback lines to retain.
 # scrollback = 10000
 
+# Allow programs to set the system clipboard via OSC 52 (e.g. yank over SSH).
+# On by default; set to false to deny program-driven clipboard writes.
+# osc52_clipboard_write = true
+
 [theme]
 # font_family = "JetBrains Mono"   # omit for a system monospace
 # font_size = 15.0                 # logical pixels

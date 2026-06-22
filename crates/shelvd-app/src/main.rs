@@ -100,6 +100,8 @@ struct State {
     modifiers: ModifiersState,
     /// System clipboard handle (`None` if it failed to initialize).
     clipboard: Option<Clipboard>,
+    /// Whether a program may set the system clipboard via OSC 52 (config-gated).
+    allow_clipboard_write: bool,
     /// Last known pointer position in physical pixels.
     mouse_pos: (f32, f32),
     /// Whether the left button is down and a selection is being dragged.
@@ -240,6 +242,7 @@ impl ApplicationHandler<UserEvent> for App {
             pty,
             modifiers: ModifiersState::empty(),
             clipboard: Clipboard::new().ok(),
+            allow_clipboard_write: self.config.osc52_clipboard_write,
             mouse_pos: (0.0, 0.0),
             selecting: false,
             mouse_held: None,
@@ -312,7 +315,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     dirty = true;
                 }
-                TermEvent::Bell | TermEvent::ClipboardStore(_) | TermEvent::Wakeup
+                // A program asked to set the system clipboard (OSC 52). Honor it
+                // unless the user disabled program-driven writes in config.
+                TermEvent::ClipboardStore(text) => {
+                    if state.allow_clipboard_write {
+                        set_clipboard(state, text, "osc52 clipboard write failed");
+                    } else {
+                        log::debug!("osc52 clipboard write denied by config");
+                    }
+                }
+                TermEvent::Bell | TermEvent::Wakeup
                 | TermEvent::MouseCursorDirty | TermEvent::WorkingDirectory(_) => {}
             }
         }
@@ -884,16 +896,22 @@ fn report_mouse(state: &mut State, action: MouseAction, col: u16, row: u16) {
     }
 }
 
+/// Write `text` to the system clipboard, logging a failure with `what` for
+/// context. No-op when the clipboard failed to initialize.
+fn set_clipboard(state: &mut State, text: String, what: &str) {
+    if let Some(clipboard) = state.clipboard.as_mut() {
+        if let Err(e) = clipboard.set_text(text) {
+            log::debug!("{what}: {e}");
+        }
+    }
+}
+
 /// Copy the current selection to the system clipboard, if it is non-empty.
 fn copy_selection(state: &mut State) {
     let Some(text) = state.terminal.selection_text() else {
         return;
     };
-    if let Some(clipboard) = state.clipboard.as_mut() {
-        if let Err(e) = clipboard.set_text(text) {
-            log::debug!("clipboard copy failed: {e}");
-        }
-    }
+    set_clipboard(state, text, "clipboard copy failed");
 }
 
 /// Copy the whole block at the top of the viewport to the system clipboard.
@@ -901,11 +919,7 @@ fn copy_block(state: &mut State) {
     let Some(text) = state.terminal.current_block_text() else {
         return;
     };
-    if let Some(clipboard) = state.clipboard.as_mut() {
-        if let Err(e) = clipboard.set_text(text) {
-            log::debug!("block copy failed: {e}");
-        }
-    }
+    set_clipboard(state, text, "block copy failed");
 }
 
 /// Route a key press to the open overlay: query edits, navigation, accept/cancel.
