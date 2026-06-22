@@ -6,7 +6,7 @@
 //! back to the PTY, title changes, the bell) surface as [`TermEvent`]s on a
 //! channel for the event-loop owner to act on.
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -112,28 +112,32 @@ impl Dimensions for TermDimensions {
     }
 }
 
-/// A pending OSC color query awaiting a reply. The reply closure (supplied by
-/// alacritty) already bakes in the OSC prefix and the request's terminator; we
-/// only resolve `index` against the active [`Palette`] to an [`Rgb`] and call it.
+/// A pending terminal query awaiting a reply. The reply closure (supplied by
+/// alacritty) already bakes in the response prefix and the request's terminator;
+/// we only resolve the request's payload (a palette color, the text-area pixel
+/// extent) and call it.
 ///
-/// This is forwarded on a dedicated channel rather than answered inline because
+/// These are forwarded on a dedicated channel rather than answered inline because
 /// [`EventProxy::send_event`] fires from inside `parser.advance` and has no
-/// access to the palette — that lives on [`Terminal`], reachable only after the
-/// parse returns (see [`Terminal::reply_color_queries`]).
-struct ColorQuery {
-    index: usize,
-    reply: Arc<dyn Fn(Rgb) -> String + Send + Sync>,
+/// access to the state they resolve against — the palette and the renderer's cell
+/// pixel size live on [`Terminal`], reachable only after the parse returns (see
+/// [`Terminal::reply_queries`]).
+enum DeferredQuery {
+    /// OSC 4/10/11/12: resolve `index` against the active [`Palette`].
+    Color { index: usize, reply: Arc<dyn Fn(Rgb) -> String + Send + Sync> },
+    /// CSI 14t: report the text-area size in pixels (rows/cols × cell pixels).
+    TextAreaSize { reply: Arc<dyn Fn(WindowSize) -> String + Send + Sync> },
 }
 
 /// Forwards alacritty events onto channels, mapping them to [`TermEvent`].
 ///
-/// Most events go straight to `events`. Color queries can't be answered here
-/// (no palette in scope), so they're parked on `colors` for [`Terminal`] to
-/// resolve after the parse.
+/// Most events go straight to `events`. Queries that need [`Terminal`]'s state
+/// (color resolution, the text-area pixel extent) can't be answered here, so
+/// they're parked on `queries` for [`Terminal`] to resolve after the parse.
 #[derive(Clone)]
 struct EventProxy {
     events: flume::Sender<TermEvent>,
-    colors: flume::Sender<ColorQuery>,
+    queries: flume::Sender<DeferredQuery>,
 }
 
 impl EventListener for EventProxy {
@@ -148,14 +152,20 @@ impl EventListener for EventProxy {
             Event::MouseCursorDirty => Some(TermEvent::MouseCursorDirty),
             Event::CursorBlinkingChange => Some(TermEvent::CursorBlink),
             Event::Exit => Some(TermEvent::Exit),
-            // Park color queries (OSC 4/10/11/12) on the dedicated channel; the
-            // palette they resolve against lives on `Terminal`, not here.
+            // Park callback-carrying queries on the dedicated channel; the state
+            // they resolve against lives on `Terminal`, not here.
+            // OSC 4/10/11/12 — palette color.
             Event::ColorRequest(index, formatter) => {
-                let _ = self.colors.send(ColorQuery { index, reply: formatter });
+                let _ = self.queries.send(DeferredQuery::Color { index, reply: formatter });
                 None
             }
-            // The remaining callback-carrying queries (clipboard-load,
-            // text-area-size) are still ignored; they land in a later milestone.
+            // CSI 14t — text-area size in pixels.
+            Event::TextAreaSizeRequest(formatter) => {
+                let _ = self.queries.send(DeferredQuery::TextAreaSize { reply: formatter });
+                None
+            }
+            // The clipboard-load query is still ignored; it lands in a later
+            // milestone.
             _ => None,
         };
         if let Some(ev) = mapped {
@@ -172,10 +182,10 @@ pub struct Terminal {
     /// Sender shared with [`EventProxy`], so OSC-133 markers detected by the tee
     /// reach the same channel as alacritty's own side effects.
     tx: flume::Sender<TermEvent>,
-    /// Pending OSC color queries forwarded by [`EventProxy`]. They're answered
-    /// here (not in the proxy) because resolving an index needs `self.palette`,
-    /// which the proxy can't reach from inside `parser.advance`.
-    color_queries: flume::Receiver<ColorQuery>,
+    /// Pending terminal queries forwarded by [`EventProxy`]. They're answered
+    /// here (not in the proxy) because resolving them needs `self.palette` /
+    /// `self.cell_px`, which the proxy can't reach from inside `parser.advance`.
+    queries: flume::Receiver<DeferredQuery>,
     /// Tees the byte stream for shell-integration markers `alacritty` drops.
     scanner: Scanner,
     /// Absolute grid-line index of active line 0, advanced as content scrolls
@@ -207,6 +217,10 @@ pub struct Terminal {
     palette: Palette,
     cursor_shape: CursorShape,
     dims: TermDimensions,
+    /// The renderer's pixel cell size (width, height), pushed by the app on init
+    /// and resize so CSI 14t can report the text-area pixel extent. `(0, 0)` until
+    /// the app supplies it.
+    cell_px: (u16, u16),
     /// Whether any PTY output has arrived yet. Before the shell prints its first
     /// byte the grid is empty; suppressing the cursor until then avoids a lone
     /// cursor flashing at the bottom of an otherwise blank, bottom-anchored screen.
@@ -233,17 +247,17 @@ impl Terminal {
         cursor_shape: CursorShape,
     ) -> Self {
         let (tx, rx) = flume::unbounded();
-        let (color_tx, color_rx) = flume::unbounded();
+        let (query_tx, query_rx) = flume::unbounded();
         let config = Config { scrolling_history: scrollback, ..Config::default() };
         let dims = TermDimensions::new(cols, rows);
-        let proxy = EventProxy { events: tx.clone(), colors: color_tx };
+        let proxy = EventProxy { events: tx.clone(), queries: query_tx };
         let term = Term::new(config, &dims, proxy);
         Self {
             term,
             parser: Processor::new(),
             events: rx,
             tx,
-            color_queries: color_rx,
+            queries: query_rx,
             scanner: Scanner::new(),
             abs_base: 0,
             prev_history: 0,
@@ -256,6 +270,7 @@ impl Terminal {
             palette,
             cursor_shape,
             dims,
+            cell_px: (0, 0),
             seen_output: false,
             band: BandState::default(),
             sel: None,
@@ -284,7 +299,7 @@ impl Terminal {
             }
             self.advance_segment(&bytes[start..]);
         }
-        self.reply_color_queries();
+        self.reply_queries();
     }
 
     /// Feed one segment to alacritty and refresh the absolute-line origin.
@@ -312,17 +327,30 @@ impl Terminal {
         }
     }
 
-    /// Drain pending OSC color queries and write their replies back to the PTY.
+    /// Drain pending terminal queries and write their replies back to the PTY.
     ///
-    /// The queries are parked by [`EventProxy`] (which can't see the palette);
-    /// here `&self.palette` is in scope, so we resolve each index and invoke the
-    /// formatter alacritty supplied — it already carries the OSC prefix and the
-    /// request's terminator, so the returned string is a ready-to-send reply.
-    fn reply_color_queries(&self) {
-        for q in self.color_queries.try_iter() {
-            let c = self.palette_color(q.index);
-            let rgb = Rgb { r: c.r, g: c.g, b: c.b };
-            let reply = (q.reply)(rgb);
+    /// The queries are parked by [`EventProxy`] (which can't see the palette or
+    /// the cell pixel size); here that state is in scope, so we resolve each
+    /// request and invoke the formatter alacritty supplied — it already carries
+    /// the response prefix and the request's terminator, so the returned string
+    /// is a ready-to-send reply.
+    fn reply_queries(&self) {
+        for q in self.queries.try_iter() {
+            let reply = match q {
+                DeferredQuery::Color { index, reply } => {
+                    let c = self.palette_color(index);
+                    reply(Rgb { r: c.r, g: c.g, b: c.b })
+                }
+                DeferredQuery::TextAreaSize { reply } => {
+                    let ws = WindowSize {
+                        num_lines: self.dims.rows,
+                        num_cols: self.dims.cols,
+                        cell_width: self.cell_px.0,
+                        cell_height: self.cell_px.1,
+                    };
+                    reply(ws)
+                }
+            };
             let _ = self.tx.send(TermEvent::PtyWrite(reply.into_bytes()));
         }
     }
@@ -874,6 +902,12 @@ impl Terminal {
     /// Replace the active palette (e.g. on theme change).
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+    }
+
+    /// Record the renderer's pixel cell size (width, height) so CSI 14t can
+    /// report the text-area pixel extent. Pushed by the app on init and resize.
+    pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
+        self.cell_px = (width, height);
     }
 
     // --- scrollback ----------------------------------------------------------
@@ -2214,6 +2248,23 @@ mod tests {
             c.r, c.g, c.b
         );
         assert_eq!(first_pty_write(&t).as_deref(), Some(expected.as_bytes()));
+    }
+
+    #[test]
+    fn csi14t_reports_text_area_pixels() {
+        let mut t = terminal(20, 3);
+        t.set_cell_pixels(8, 16);
+        t.process(b"\x1b[14t");
+        // height = rows(3) * 16 = 48 ; width = cols(20) * 8 = 160
+        assert_eq!(first_pty_write(&t).as_deref(), Some(b"\x1b[4;48;160t".as_ref()));
+    }
+
+    #[test]
+    fn csi18t_reports_text_area_chars() {
+        // Answered by alacritty directly (Event::PtyWrite); a regression guard.
+        let mut t = terminal(20, 3);
+        t.process(b"\x1b[18t");
+        assert_eq!(first_pty_write(&t).as_deref(), Some(b"\x1b[8;3;20t".as_ref()));
     }
 
     #[test]
