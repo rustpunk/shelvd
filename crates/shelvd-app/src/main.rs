@@ -321,10 +321,19 @@ impl ApplicationHandler<UserEvent> for App {
                 // A program asked to set the system clipboard (OSC 52). Honor it
                 // unless the user disabled program-driven writes in config.
                 TermEvent::ClipboardStore(text) => {
-                    if state.allow_clipboard_write {
-                        set_clipboard(state, text, "osc52 clipboard write failed");
-                    } else {
-                        log::debug!("osc52 clipboard write denied by config");
+                    match osc52_write_decision(state.allow_clipboard_write, text.len()) {
+                        Osc52Write::Denied => {
+                            log::debug!("osc52 clipboard write denied by config");
+                        }
+                        Osc52Write::TooLarge => {
+                            log::debug!(
+                                "osc52 clipboard write dropped: {} bytes exceeds {MAX_OSC52_WRITE_BYTES} cap",
+                                text.len()
+                            );
+                        }
+                        Osc52Write::Allowed => {
+                            set_clipboard(state, text, "osc52 clipboard write failed");
+                        }
                     }
                 }
                 TermEvent::Bell | TermEvent::Wakeup
@@ -910,6 +919,37 @@ fn report_mouse(state: &mut State, action: MouseAction, col: u16, row: u16) {
     }
 }
 
+/// Largest decoded OSC 52 payload the terminal will push to the system
+/// clipboard. A program writing to the PTY can emit an unbounded base64 blob
+/// (alacritty decodes it without a cap), so bound it here to avoid clipboard
+/// spam / memory pressure. User-initiated copies are not subject to this cap.
+const MAX_OSC52_WRITE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// What to do with a program-driven OSC 52 clipboard write, given config and
+/// the decoded payload size.
+#[derive(Debug, PartialEq, Eq)]
+enum Osc52Write {
+    /// Program-driven writes are disabled in config.
+    Denied,
+    /// Payload exceeds [`MAX_OSC52_WRITE_BYTES`]; dropped to avoid spam.
+    TooLarge,
+    /// Within policy; write it to the clipboard.
+    Allowed,
+}
+
+/// Decide the fate of an OSC 52 write of `len` decoded bytes. Config denial
+/// takes precedence over the size cap, which is inclusive (`len <= cap` is
+/// allowed).
+fn osc52_write_decision(allow_write: bool, len: usize) -> Osc52Write {
+    if !allow_write {
+        Osc52Write::Denied
+    } else if len > MAX_OSC52_WRITE_BYTES {
+        Osc52Write::TooLarge
+    } else {
+        Osc52Write::Allowed
+    }
+}
+
 /// Write `text` to the system clipboard, logging a failure with `what` for
 /// context. No-op when the clipboard failed to initialize.
 fn set_clipboard(state: &mut State, text: String, what: &str) {
@@ -1191,8 +1231,8 @@ fn paste_to_pty(state: &mut State, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_suggestion, fill_anim_offset, mouse_report, suggest_completion, BandInput,
-        MouseAction, Terminal,
+        accept_suggestion, fill_anim_offset, mouse_report, osc52_write_decision, suggest_completion,
+        BandInput, MouseAction, Terminal, MAX_OSC52_WRITE_BYTES,
     };
     use shelvd_core::{CursorShape, Palette};
     use winit::keyboard::ModifiersState;
@@ -1300,5 +1340,17 @@ mod tests {
         accept_suggestion(&mut input, &mut suggestion);
         assert_eq!(input.text(), "echo hi", "the suffix is appended to the typed prefix");
         assert!(suggestion.is_none(), "the accepted suggestion is consumed");
+    }
+
+    #[test]
+    fn osc52_write_decision_gates_and_caps() {
+        use super::Osc52Write::*;
+        // Config denial wins even for a tiny payload.
+        assert_eq!(osc52_write_decision(false, 0), Denied);
+        assert_eq!(osc52_write_decision(false, MAX_OSC52_WRITE_BYTES + 1), Denied);
+        // Enabled: inclusive up to the cap, dropped above it.
+        assert_eq!(osc52_write_decision(true, 0), Allowed);
+        assert_eq!(osc52_write_decision(true, MAX_OSC52_WRITE_BYTES), Allowed);
+        assert_eq!(osc52_write_decision(true, MAX_OSC52_WRITE_BYTES + 1), TooLarge);
     }
 }
