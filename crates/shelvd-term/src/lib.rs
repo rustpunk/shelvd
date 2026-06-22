@@ -10,7 +10,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, Rgb};
 use alacritty_terminal::Term;
 
@@ -42,8 +42,9 @@ pub enum TermEvent {
     Title(String),
     /// Reset the window title to the default.
     ResetTitle,
-    /// The program asked to put text on the system clipboard (OSC 52).
-    ClipboardStore(String),
+    /// The program asked to put text on the system clipboard or primary
+    /// selection (OSC 52).
+    ClipboardStore { kind: ClipboardKind, text: String },
     /// Ring the bell.
     Bell,
     /// The grid changed and should be redrawn.
@@ -60,6 +61,15 @@ pub enum TermEvent {
     WorkingDirectory(String),
     /// The child process exited.
     Exit,
+}
+
+/// Which selection an OSC 52 write targets. On Linux the primary selection
+/// (middle-click paste) is distinct from the clipboard; on other platforms
+/// only the clipboard exists and `Primary` is treated as `Clipboard`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardKind {
+    Clipboard,
+    Primary,
 }
 
 /// What the bottom input band should display this frame, pushed by the app via
@@ -146,7 +156,13 @@ impl EventListener for EventProxy {
             Event::PtyWrite(s) => Some(TermEvent::PtyWrite(s.into_bytes())),
             Event::Title(t) => Some(TermEvent::Title(t)),
             Event::ResetTitle => Some(TermEvent::ResetTitle),
-            Event::ClipboardStore(_, s) => Some(TermEvent::ClipboardStore(s)),
+            Event::ClipboardStore(ty, s) => {
+                let kind = match ty {
+                    ClipboardType::Clipboard => ClipboardKind::Clipboard,
+                    ClipboardType::Selection => ClipboardKind::Primary,
+                };
+                Some(TermEvent::ClipboardStore { kind, text: s })
+            }
             Event::Bell => Some(TermEvent::Bell),
             Event::Wakeup => Some(TermEvent::Wakeup),
             Event::MouseCursorDirty => Some(TermEvent::MouseCursorDirty),
@@ -2195,10 +2211,23 @@ mod tests {
         // decodes the payload before emitting, so the event carries plain text.
         t.process(b"\x1b]52;c;aGVsbG8=\x07");
         let stored = t.events().try_iter().find_map(|e| match e {
-            TermEvent::ClipboardStore(s) => Some(s),
+            TermEvent::ClipboardStore { kind, text } => Some((kind, text)),
             _ => None,
         });
-        assert_eq!(stored.as_deref(), Some("hello"));
+        assert_eq!(stored, Some((ClipboardKind::Clipboard, "hello".to_string())));
+    }
+
+    #[test]
+    fn osc52_primary_selection_surfaces_kind() {
+        let mut t = terminal(20, 3);
+        // OSC 52 ; p ; <base64> BEL — the `p` target is the primary selection,
+        // which must route distinctly from the clipboard on Linux.
+        t.process(b"\x1b]52;p;aGVsbG8=\x07");
+        let stored = t.events().try_iter().find_map(|e| match e {
+            TermEvent::ClipboardStore { kind, text } => Some((kind, text)),
+            _ => None,
+        });
+        assert_eq!(stored, Some((ClipboardKind::Primary, "hello".to_string())));
     }
 
     /// Pull the first `PtyWrite` reply emitted on the event channel, as bytes.

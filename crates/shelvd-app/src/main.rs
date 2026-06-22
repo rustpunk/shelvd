@@ -16,7 +16,7 @@ use arboard::Clipboard;
 use shelvd_core::{Config, OverlayColors, ResizeEdge, Rgba, TitlebarHit};
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
-use shelvd_term::{BandState, SemanticKind, TermEvent, Terminal};
+use shelvd_term::{BandState, ClipboardKind, SemanticKind, TermEvent, Terminal};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -320,7 +320,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // A program asked to set the system clipboard (OSC 52). Honor it
                 // unless the user disabled program-driven writes in config.
-                TermEvent::ClipboardStore(text) => {
+                TermEvent::ClipboardStore { kind, text } => {
                     match osc52_write_decision(state.allow_clipboard_write, text.len()) {
                         Osc52Write::Denied => {
                             log::debug!("osc52 clipboard write denied by config");
@@ -332,7 +332,7 @@ impl ApplicationHandler<UserEvent> for App {
                             );
                         }
                         Osc52Write::Allowed => {
-                            set_clipboard(state, text, "osc52 clipboard write failed");
+                            set_clipboard(state, kind, text, "osc52 clipboard write failed");
                         }
                     }
                 }
@@ -950,14 +950,44 @@ fn osc52_write_decision(allow_write: bool, len: usize) -> Osc52Write {
     }
 }
 
-/// Write `text` to the system clipboard, logging a failure with `what` for
-/// context. No-op when the clipboard failed to initialize.
-fn set_clipboard(state: &mut State, text: String, what: &str) {
-    if let Some(clipboard) = state.clipboard.as_mut() {
-        if let Err(e) = clipboard.set_text(text) {
-            log::debug!("{what}: {e}");
-        }
+/// Write `text` to the clipboard or primary selection, logging a failure with
+/// `what` for context. No-op when the clipboard failed to initialize.
+fn set_clipboard(state: &mut State, kind: ClipboardKind, text: String, what: &str) {
+    let Some(clipboard) = state.clipboard.as_mut() else {
+        return;
+    };
+    if let Err(e) = write_clipboard(clipboard, kind, text) {
+        log::debug!("{what}: {e}");
     }
+}
+
+/// Platforms with a distinct primary selection route `Primary` writes there.
+/// The cfg mirrors arboard's own primary-selection support boundary (its
+/// X11/Wayland backend: unix minus macOS/Android/emscripten), so BSDs — which
+/// have a real primary selection — aren't needlessly downgraded.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+fn write_clipboard(
+    clipboard: &mut Clipboard,
+    kind: ClipboardKind,
+    text: String,
+) -> Result<(), arboard::Error> {
+    use arboard::{LinuxClipboardKind, SetExtLinux};
+    let target = match kind {
+        ClipboardKind::Clipboard => LinuxClipboardKind::Clipboard,
+        ClipboardKind::Primary => LinuxClipboardKind::Primary,
+    };
+    clipboard.set().clipboard(target).text(text)
+}
+
+/// Other platforms (macOS, Windows, …) have no primary selection; every write
+/// goes to the clipboard.
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
+fn write_clipboard(
+    clipboard: &mut Clipboard,
+    _kind: ClipboardKind,
+    text: String,
+) -> Result<(), arboard::Error> {
+    clipboard.set_text(text)
 }
 
 /// Copy the current selection to the system clipboard, if it is non-empty.
@@ -965,7 +995,7 @@ fn copy_selection(state: &mut State) {
     let Some(text) = state.terminal.selection_text() else {
         return;
     };
-    set_clipboard(state, text, "clipboard copy failed");
+    set_clipboard(state, ClipboardKind::Clipboard, text, "clipboard copy failed");
 }
 
 /// Copy the whole block at the top of the viewport to the system clipboard.
@@ -973,7 +1003,7 @@ fn copy_block(state: &mut State) {
     let Some(text) = state.terminal.current_block_text() else {
         return;
     };
-    set_clipboard(state, text, "block copy failed");
+    set_clipboard(state, ClipboardKind::Clipboard, text, "block copy failed");
 }
 
 /// Route a key press to the open overlay: query edits, navigation, accept/cancel.
