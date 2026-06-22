@@ -1051,6 +1051,20 @@ impl Terminal {
         self.sel = None;
     }
 
+    /// The OSC 8 hyperlink URI at a viewport cell, if any. Uses the same
+    /// coordinate mapping as selection, so it tracks the bottom-anchor shift.
+    /// Resolves only at the live edge: scrolled-back history composites frozen
+    /// block buffers, which don't retain link info (tracked as a follow-up).
+    pub fn link_at(&self, col: u16, row: u16, right_half: bool) -> Option<String> {
+        if self.is_scrolled() {
+            return None;
+        }
+        let p = self.viewport_to_abs(col, row, right_half);
+        let line = self.abs_to_grid_line(p.abs);
+        let cell = &self.term.grid()[Line(line)][Column(p.col)];
+        cell.hyperlink().map(|h| h.uri().to_owned())
+    }
+
     /// The selected text, if the selection is non-empty. Walks the selected
     /// absolute lines through [`Self::composite_row_into`], so it reads frozen
     /// block buffers and the live grid identically — a selection can span the
@@ -1896,6 +1910,18 @@ mod tests {
 
     fn terminal(cols: u16, rows: u16) -> Terminal {
         Terminal::new(cols, rows, 1000, Palette::default(), CursorShape::Block)
+    }
+
+    #[test]
+    fn link_at_resolves_osc8_uri() {
+        let mut t = terminal(20, 3);
+        // OSC 8 ; ; <uri> ST  "link"  OSC 8 ; ; ST  — sets a hyperlink on "link".
+        t.process(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        // "link" sits on grid line 0; bottom-anchoring displays it at row anchor_shift().
+        let row = t.anchor_shift();
+        assert_eq!(t.link_at(0, row, false).as_deref(), Some("https://example.com"));
+        assert_eq!(t.link_at(0, row, false), t.link_at(3, row, false)); // whole word linked
+        assert_eq!(t.link_at(10, row, false), None); // past the text: no link
     }
 
     #[test]

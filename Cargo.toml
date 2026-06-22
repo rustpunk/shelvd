@@ -50,6 +50,8 @@ nix = { version = "0.28", features = ["term"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
 bitflags = "2"
 nucleo-matcher = "0.3"
+# Cross-platform URL/file opener (OSC 8 link click-to-open)
+open = "5"
 
 [profile.dev]
 opt-level = 1
