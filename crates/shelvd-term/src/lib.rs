@@ -10,7 +10,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{ClipboardType, Config, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Osc52, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, Rgb};
 use alacritty_terminal::Term;
 
@@ -45,6 +45,10 @@ pub enum TermEvent {
     /// The program asked to put text on the system clipboard or primary
     /// selection (OSC 52).
     ClipboardStore { kind: ClipboardKind, text: String },
+    /// A program asked to read the clipboard / primary selection back over the
+    /// PTY (OSC 52 read). Only emitted when clipboard read is enabled; the app
+    /// reads the clipboard and answers via [`Terminal::provide_clipboard`].
+    ClipboardLoad(ClipboardKind),
     /// Ring the bell.
     Bell,
     /// The grid changed and should be redrawn.
@@ -139,15 +143,23 @@ enum DeferredQuery {
     TextAreaSize { reply: Arc<dyn Fn(WindowSize) -> String + Send + Sync> },
 }
 
+/// An OSC 52 read formatter parked by [`EventProxy`] awaiting the app-fetched
+/// clipboard contents. Given the contents it returns the ready-to-send reply
+/// (base64-encoded, with the response prefix and terminator already baked in).
+type ClipboardReply = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Forwards alacritty events onto channels, mapping them to [`TermEvent`].
 ///
 /// Most events go straight to `events`. Queries that need [`Terminal`]'s state
 /// (color resolution, the text-area pixel extent) can't be answered here, so
 /// they're parked on `queries` for [`Terminal`] to resolve after the parse.
+/// OSC 52 read formatters need the app-fetched clipboard contents, so they're
+/// parked on `clipboard_loads` until the app supplies them.
 #[derive(Clone)]
 struct EventProxy {
     events: flume::Sender<TermEvent>,
     queries: flume::Sender<DeferredQuery>,
+    clipboard_loads: flume::Sender<ClipboardReply>,
 }
 
 impl EventListener for EventProxy {
@@ -180,8 +192,16 @@ impl EventListener for EventProxy {
                 let _ = self.queries.send(DeferredQuery::TextAreaSize { reply: formatter });
                 None
             }
-            // The clipboard-load query is still ignored; it lands in a later
-            // milestone.
+            // OSC 52 read — clipboard contents live app-side, so stash the formatter
+            // and surface the request; the app replies via `provide_clipboard`.
+            Event::ClipboardLoad(ty, formatter) => {
+                let _ = self.clipboard_loads.send(formatter);
+                let kind = match ty {
+                    ClipboardType::Clipboard => ClipboardKind::Clipboard,
+                    ClipboardType::Selection => ClipboardKind::Primary,
+                };
+                Some(TermEvent::ClipboardLoad(kind))
+            }
             _ => None,
         };
         if let Some(ev) = mapped {
@@ -202,6 +222,10 @@ pub struct Terminal {
     /// here (not in the proxy) because resolving them needs `self.palette` /
     /// `self.cell_px`, which the proxy can't reach from inside `parser.advance`.
     queries: flume::Receiver<DeferredQuery>,
+    /// Pending OSC 52 read formatters forwarded by [`EventProxy`], awaiting the
+    /// app-fetched clipboard contents. Drained one-per-reply by
+    /// [`Terminal::provide_clipboard`]. Empty unless clipboard read is enabled.
+    clipboard_loads: flume::Receiver<ClipboardReply>,
     /// Tees the byte stream for shell-integration markers `alacritty` drops.
     scanner: Scanner,
     /// Absolute grid-line index of active line 0, advanced as content scrolls
@@ -254,19 +278,23 @@ pub struct Terminal {
 
 impl Terminal {
     /// Create a terminal with the given grid size, scrollback depth, palette,
-    /// and default cursor shape.
+    /// and default cursor shape. `clipboard_read` opts into honoring OSC 52 read
+    /// (paste-back) queries; when false such queries are silently denied.
     pub fn new(
         cols: u16,
         rows: u16,
         scrollback: usize,
         palette: Palette,
         cursor_shape: CursorShape,
+        clipboard_read: bool,
     ) -> Self {
         let (tx, rx) = flume::unbounded();
         let (query_tx, query_rx) = flume::unbounded();
-        let config = Config { scrolling_history: scrollback, ..Config::default() };
+        let (clip_tx, clip_rx) = flume::unbounded();
+        let osc52 = if clipboard_read { Osc52::CopyPaste } else { Osc52::OnlyCopy };
+        let config = Config { scrolling_history: scrollback, osc52, ..Config::default() };
         let dims = TermDimensions::new(cols, rows);
-        let proxy = EventProxy { events: tx.clone(), queries: query_tx };
+        let proxy = EventProxy { events: tx.clone(), queries: query_tx, clipboard_loads: clip_tx };
         let term = Term::new(config, &dims, proxy);
         Self {
             term,
@@ -274,6 +302,7 @@ impl Terminal {
             events: rx,
             tx,
             queries: query_rx,
+            clipboard_loads: clip_rx,
             scanner: Scanner::new(),
             abs_base: 0,
             prev_history: 0,
@@ -924,6 +953,16 @@ impl Terminal {
     /// report the text-area pixel extent. Pushed by the app on init and resize.
     pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
         self.cell_px = (width, height);
+    }
+
+    /// Reply to a pending OSC 52 read (surfaced as [`TermEvent::ClipboardLoad`])
+    /// with the clipboard `contents` the app fetched. No-op if no read is
+    /// pending. The reply is base64-encoded by alacritty's formatter and written
+    /// back to the PTY.
+    pub fn provide_clipboard(&self, contents: &str) {
+        if let Ok(formatter) = self.clipboard_loads.try_recv() {
+            let _ = self.tx.send(TermEvent::PtyWrite(formatter(contents).into_bytes()));
+        }
     }
 
     // --- scrollback ----------------------------------------------------------
@@ -1909,7 +1948,50 @@ mod tests {
     use shelvd_core::Palette;
 
     fn terminal(cols: u16, rows: u16) -> Terminal {
-        Terminal::new(cols, rows, 1000, Palette::default(), CursorShape::Block)
+        Terminal::new(cols, rows, 1000, Palette::default(), CursorShape::Block, false)
+    }
+
+    fn terminal_read(cols: u16, rows: u16) -> Terminal {
+        Terminal::new(cols, rows, 1000, Palette::default(), CursorShape::Block, true)
+    }
+
+    #[test]
+    fn osc52_read_denied_by_default() {
+        let mut t = terminal(20, 3); // read disabled
+        t.process(b"\x1b]52;c;?\x07");
+        let load = t.events().try_iter().find(|e| matches!(e, TermEvent::ClipboardLoad(_)));
+        assert!(load.is_none(), "read must be denied unless opted in");
+    }
+
+    #[test]
+    fn osc52_read_surfaces_load_and_replies() {
+        let mut t = terminal_read(20, 3); // read enabled
+        t.process(b"\x1b]52;c;?\x07");
+        let kind = t.events().try_iter().find_map(|e| match e {
+            TermEvent::ClipboardLoad(k) => Some(k),
+            _ => None,
+        });
+        assert_eq!(kind, Some(ClipboardKind::Clipboard));
+        // App supplies the clipboard contents; the reply is base64("hello") = "aGVsbG8=".
+        t.provide_clipboard("hello");
+        let reply = t.events().try_iter().find_map(|e| match e {
+            TermEvent::PtyWrite(b) => Some(b),
+            _ => None,
+        });
+        assert_eq!(reply.as_deref(), Some(b"\x1b]52;c;aGVsbG8=\x07".as_ref()));
+    }
+
+    #[test]
+    fn osc52_read_primary_surfaces_kind() {
+        // `;p` (primary selection) read maps to ClipboardKind::Primary, the same
+        // way the store path does, so the app reads from the right selection.
+        let mut t = terminal_read(20, 3);
+        t.process(b"\x1b]52;p;?\x07");
+        let kind = t.events().try_iter().find_map(|e| match e {
+            TermEvent::ClipboardLoad(k) => Some(k),
+            _ => None,
+        });
+        assert_eq!(kind, Some(ClipboardKind::Primary));
     }
 
     #[test]
