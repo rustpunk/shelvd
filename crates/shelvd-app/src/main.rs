@@ -1030,19 +1030,34 @@ fn read_clipboard(state: &mut State, _kind: ClipboardKind) -> Option<String> {
     state.clipboard.as_mut()?.get_text().ok()
 }
 
-/// Copy the current selection to the system clipboard, if it is non-empty.
+/// Mirror selected `text` to the primary selection so a middle-click paste —
+/// in shelvd or any other app — reflects the freshest selection. Gated to the
+/// platforms arboard supports a primary selection on (the same boundary as
+/// [`write_clipboard`]); a no-op everywhere else, with no needless clone.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))]
+fn mirror_to_primary(state: &mut State, text: &str) {
+    set_clipboard(state, ClipboardKind::Primary, text.to_owned(), "primary selection copy failed");
+}
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten")))))]
+fn mirror_to_primary(_state: &mut State, _text: &str) {}
+
+/// Copy the current selection to the system clipboard, if it is non-empty, and
+/// mirror it to the primary selection where the platform has one.
 fn copy_selection(state: &mut State) {
     let Some(text) = state.terminal.selection_text() else {
         return;
     };
+    mirror_to_primary(state, &text);
     set_clipboard(state, ClipboardKind::Clipboard, text, "clipboard copy failed");
 }
 
-/// Copy the whole block at the top of the viewport to the system clipboard.
+/// Copy the whole block at the top of the viewport to the system clipboard, and
+/// mirror it to the primary selection where the platform has one.
 fn copy_block(state: &mut State) {
     let Some(text) = state.terminal.current_block_text() else {
         return;
     };
+    mirror_to_primary(state, &text);
     set_clipboard(state, ClipboardKind::Clipboard, text, "block copy failed");
 }
 
