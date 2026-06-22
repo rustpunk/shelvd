@@ -8,6 +8,7 @@
 
 mod overlay;
 
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1281,14 +1282,45 @@ fn paste_clipboard(state: &mut State) {
     }
 }
 
+/// The bracketed-paste end marker. A pasted payload that smuggles this in could
+/// forge an end-of-paste, drop the program out of bracketed mode mid-payload,
+/// and have the bytes that follow run as typed input (paste injection).
+const PASTE_END: &str = "\x1b[201~";
+/// The bracketed-paste start marker, stripped defensively alongside the end one.
+const PASTE_START: &str = "\x1b[200~";
+
+/// Remove any embedded bracketed-paste markers from `text` so a pasted blob
+/// cannot forge the end-of-paste boundary. A single forward pass that drops a
+/// marker as soon as its bytes complete in the output: this is inherently robust
+/// against reconstruction (excising a marker can splice the surrounding bytes
+/// into a fresh one, which the very next character re-detects against the new
+/// tail) and stays O(n) on adversarial input — no rescans. The markers are
+/// 6 ASCII bytes, so the suffix we truncate is always on a char boundary.
+/// Pastes without an ESC — the common case — are returned untouched, unallocated.
+fn strip_paste_markers(text: &str) -> Cow<'_, str> {
+    if !text.contains('\x1b') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        out.push(ch);
+        if out.ends_with(PASTE_END) || out.ends_with(PASTE_START) {
+            out.truncate(out.len() - PASTE_END.len());
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Write pasted text to the PTY, wrapping it in bracketed-paste markers when the
-/// program has enabled that mode.
+/// program has enabled that mode. In that mode the payload is sanitized first so
+/// it cannot forge an end-of-paste and inject commands.
 fn paste_to_pty(state: &mut State, text: &str) {
     let payload = if state.terminal.bracketed_paste() {
+        let text = strip_paste_markers(text);
         let mut buf = Vec::with_capacity(text.len() + 12);
-        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(PASTE_START.as_bytes());
         buf.extend_from_slice(text.as_bytes());
-        buf.extend_from_slice(b"\x1b[201~");
+        buf.extend_from_slice(PASTE_END.as_bytes());
         buf
     } else {
         text.as_bytes().to_vec()
@@ -1339,10 +1371,12 @@ fn open_link(uri: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{
         accept_suggestion, fill_anim_offset, link_open_modifier, link_scheme_allowed, mouse_report,
-        osc52_write_decision, suggest_completion, BandInput, MouseAction, Terminal,
-        MAX_OSC52_WRITE_BYTES,
+        osc52_write_decision, strip_paste_markers, suggest_completion, BandInput, MouseAction,
+        Terminal, MAX_OSC52_WRITE_BYTES, PASTE_END, PASTE_START,
     };
     use shelvd_core::{CursorShape, Palette};
     use winit::keyboard::ModifiersState;
@@ -1472,6 +1506,24 @@ mod tests {
         accept_suggestion(&mut input, &mut suggestion);
         assert_eq!(input.text(), "echo hi", "the suffix is appended to the typed prefix");
         assert!(suggestion.is_none(), "the accepted suggestion is consumed");
+    }
+
+    #[test]
+    fn strip_paste_markers_neutralizes_injection() {
+        // Ordinary text is returned untouched and without allocating.
+        assert!(matches!(strip_paste_markers("ls -la\n"), Cow::Borrowed("ls -la\n")));
+        // A smuggled end marker is removed, so the payload cannot forge an
+        // end-of-paste: "rm -rf ~" is left as inert text, not run as a command.
+        assert_eq!(strip_paste_markers("a\x1b[201~rm -rf ~\n"), "arm -rf ~\n");
+        // The start marker is stripped defensively too.
+        assert_eq!(strip_paste_markers("\x1b[200~payload"), "payload");
+        // Reconstruction: deleting the inner marker splices the outer bytes into
+        // a fresh `ESC[201~` — the loop must keep going until none remain.
+        assert_eq!(strip_paste_markers("\x1b[2\x1b[201~01~x"), "x");
+        // Nesting both ways still converges to a marker-free result.
+        let nested = "\x1b[200\x1b[200~~\x1b[201\x1b[201~~";
+        let out = strip_paste_markers(nested);
+        assert!(!out.contains(PASTE_END) && !out.contains(PASTE_START), "no marker survives: {out:?}");
     }
 
     #[test]
