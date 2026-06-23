@@ -103,6 +103,11 @@ struct State {
     clipboard: Option<Clipboard>,
     /// Whether a program may set the system clipboard via OSC 52 (config-gated).
     allow_clipboard_write: bool,
+    /// Whether shelvd owns the resting input line locally (Approach O, config-gated).
+    /// Off by default and read by nothing yet; see [`Config::owned_editor`]. The
+    /// `expect` lifts once the input-editing path consumes it, forcing its removal.
+    #[expect(dead_code, reason = "wired ahead of the owned-editor input path")]
+    owned_editor: bool,
     /// Last known pointer position in physical pixels.
     mouse_pos: (f32, f32),
     /// Whether the left button is down and a selection is being dragged.
@@ -248,6 +253,7 @@ impl ApplicationHandler<UserEvent> for App {
             modifiers: ModifiersState::empty(),
             clipboard: Clipboard::new().ok(),
             allow_clipboard_write: self.config.osc52_clipboard_write,
+            owned_editor: self.config.owned_editor,
             mouse_pos: (0.0, 0.0),
             selecting: false,
             mouse_held: None,
