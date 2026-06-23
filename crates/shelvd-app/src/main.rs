@@ -104,9 +104,8 @@ struct State {
     /// Whether a program may set the system clipboard via OSC 52 (config-gated).
     allow_clipboard_write: bool,
     /// Whether shelvd owns the resting input line locally (Approach O, config-gated).
-    /// Off by default and read by nothing yet; see [`Config::owned_editor`]. The
-    /// `expect` lifts once the input-editing path consumes it, forcing its removal.
-    #[expect(dead_code, reason = "wired ahead of the owned-editor input path")]
+    /// Off by default; see [`Config::owned_editor`]. Read in `sync_band` to gate the
+    /// owned-editing suppression pushed to the terminal.
     owned_editor: bool,
     /// Last known pointer position in physical pixels.
     mouse_pos: (f32, f32),
@@ -1171,6 +1170,16 @@ fn sync_band(state: &mut State) {
         // caret it rests at the end, reproducing the prior end-of-line behavior.
         caret: state.input.caret_col(),
     };
+    // Approach-O gate: own the resting input locally only when the feature is
+    // enabled and the shell is integrated, we're in the post-B/pre-C editing
+    // window, not on the alternate screen, and echo is on. Off by default, so the
+    // suppression never engages until the flag is set — production stays Approach P.
+    let owned_editing = state.owned_editor
+        && state.terminal.shell_integration()
+        && state.terminal.prompt_editing()
+        && !state.terminal.alt_screen()
+        && !masked;
+    state.terminal.set_owned_editing(owned_editing);
     state.terminal.set_band(band);
 }
 
