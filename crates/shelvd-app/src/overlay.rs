@@ -180,27 +180,51 @@ pub fn key_to_action(event: &KeyEvent, mods: ModifiersState) -> Option<Action> {
     })
 }
 
-/// A single editable text line: append-typed, backspace-deleted, with a caret
-/// that always rests at the end. The shared input primitive behind both the
-/// palette/history query and the compose-next band, so both edit text the same
-/// way — control chars ignored, the caret measured in display columns (wide
-/// glyphs count as two) rather than `char`s.
+/// A single editable text line with a caret: typed characters insert at the
+/// caret, backspace/delete remove around it, and the caret moves left/right and
+/// home/end. The shared input primitive behind both the palette/history query
+/// and the compose-next band. Append-only callers never move the caret, so it
+/// stays at the end and every method degenerates to today's plain
+/// append/backspace/end-of-line behavior.
+///
+/// The caret is a **char index** into `text`; display columns are derived via
+/// `unicode-width` at use sites, so a wide/CJK glyph before the caret counts as
+/// two columns. Char-stepping (not grapheme clusters) matches the rest of the
+/// crate.
 #[derive(Default)]
 struct InputLine {
     text: String,
+    /// Caret position as a char index in `[0, char count]`.
+    caret: usize,
 }
 
 impl InputLine {
-    /// Append a typed character (ignoring control chars).
-    fn input_char(&mut self, c: char) {
-        if !c.is_control() {
-            self.text.push(c);
-        }
+    /// Byte offset of char index `idx`, or `text.len()` at or past the end.
+    fn byte_at(&self, idx: usize) -> usize {
+        self.text.char_indices().nth(idx).map_or(self.text.len(), |(b, _)| b)
     }
 
-    /// Delete the last character.
+    /// Insert a typed character at the caret (ignoring control chars), advancing
+    /// the caret past it. With the caret at the end this is a plain append.
+    fn input_char(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        let at = self.byte_at(self.caret);
+        self.text.insert(at, c);
+        self.caret += 1;
+    }
+
+    /// Delete the character before the caret, moving the caret back one — a no-op
+    /// at the start. With the caret at the end this pops the last character.
     fn backspace(&mut self) {
-        self.text.pop();
+        if self.caret == 0 {
+            return;
+        }
+        let start = self.byte_at(self.caret - 1);
+        let end = self.byte_at(self.caret);
+        self.text.replace_range(start..end, "");
+        self.caret -= 1;
     }
 
     fn text(&self) -> &str {
@@ -211,15 +235,64 @@ impl InputLine {
         self.text.is_empty()
     }
 
-    /// Take the text, leaving the line empty (used to queue a composed command).
+    /// Take the text, leaving the line empty with the caret reset to the start.
+    /// Resetting the caret is load-bearing: otherwise it would dangle past the
+    /// now-empty buffer after each send/queue.
     fn take(&mut self) -> String {
+        self.caret = 0;
         std::mem::take(&mut self.text)
     }
 
-    /// Display column the caret rests on: the summed width of every glyph, so a
-    /// wide/CJK char advances it by two columns, not one.
+    /// Display column the caret rests on: the summed width of the glyphs *before*
+    /// the caret, so a wide/CJK glyph counts as two columns. With the caret at the
+    /// end this is the whole line's width (today's behavior).
     fn caret_col(&self) -> usize {
-        UnicodeWidthStr::width(self.text.as_str())
+        UnicodeWidthStr::width(&self.text[..self.byte_at(self.caret)])
+    }
+}
+
+/// Caret movement and forward-deletion — the editor operations that turn the
+/// append-only line into a full single-line editor. Exercised by the unit tests
+/// now; the production keystroke path that drives them is wired in a later slice.
+/// `allow` rather than `expect` because the tests already reach these methods, so
+/// they are dead only in the non-test binary build — an `expect` would go
+/// unfulfilled under `cfg(test)`. Drop the attribute once the keystroke path lands.
+#[allow(dead_code)]
+impl InputLine {
+    /// Number of chars in the line — the caret's upper bound.
+    fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Delete the character at the caret (forward delete); the caret stays put.
+    /// A no-op at the end of the line.
+    fn delete(&mut self) {
+        if self.caret >= self.char_len() {
+            return;
+        }
+        let start = self.byte_at(self.caret);
+        let end = self.byte_at(self.caret + 1);
+        self.text.replace_range(start..end, "");
+    }
+
+    /// Move the caret one char left, clamped at the start.
+    fn left(&mut self) {
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    /// Move the caret one char right, clamped at the end.
+    fn right(&mut self) {
+        self.caret = (self.caret + 1).min(self.char_len());
+    }
+
+    /// Move the caret to the start of the line.
+    fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    /// Move the caret to the end of the line.
+    fn end(&mut self) {
+        self.caret = self.char_len();
     }
 }
 
@@ -256,6 +329,14 @@ impl BandInput {
     /// Take the typed text, leaving the line empty.
     pub fn take(&mut self) -> String {
         self.line.take()
+    }
+
+    /// Display column the caret rests at, for placing the band's text cursor.
+    /// Consumed once the band renders the caret; tests reach it, so it is dead
+    /// only in the non-test build — `allow`, not `expect`. Drop it when rendered.
+    #[allow(dead_code)]
+    pub fn caret_col(&self) -> usize {
+        self.line.caret_col()
     }
 }
 
@@ -524,6 +605,120 @@ mod tests {
         let ov = h.to_overlay(test_colors(), 12);
         // prompt "history" = 7 cols, + 1 space, + 2 for the wide glyph.
         assert_eq!(ov.query_caret_col, 7 + 1 + 2);
+    }
+
+    #[test]
+    fn input_line_inserts_at_the_caret() {
+        let mut l = InputLine::default();
+        for c in "ac".chars() {
+            l.input_char(c);
+        }
+        l.left(); // caret between 'a' and 'c'
+        l.input_char('b');
+        assert_eq!(l.text(), "abc", "the char lands at the caret, not the end");
+        assert_eq!(l.caret_col(), 2, "caret advances past the inserted char");
+    }
+
+    #[test]
+    fn input_line_backspace_and_delete_act_around_the_caret() {
+        let mut l = InputLine::default();
+        for c in "abc".chars() {
+            l.input_char(c);
+        }
+        l.backspace(); // removes 'c' (before the end caret)
+        assert_eq!(l.text(), "ab");
+        l.home();
+        l.delete(); // removes 'a' (at the caret)
+        assert_eq!(l.text(), "b");
+        assert_eq!(l.caret_col(), 0, "forward-delete leaves the caret put");
+    }
+
+    #[test]
+    fn input_line_edits_at_boundaries_are_no_ops() {
+        let mut l = InputLine::default();
+        for c in "ab".chars() {
+            l.input_char(c);
+        }
+        l.end();
+        l.delete(); // forward-delete at the end: nothing to remove
+        assert_eq!(l.text(), "ab");
+        l.home();
+        l.backspace(); // backspace at the start: nothing to remove
+        assert_eq!(l.text(), "ab");
+        assert_eq!(l.caret_col(), 0);
+    }
+
+    #[test]
+    fn input_line_caret_clamps_at_both_ends() {
+        let mut l = InputLine::default();
+        for c in "ab".chars() {
+            l.input_char(c);
+        }
+        l.left();
+        l.left();
+        l.left(); // past the start
+        assert_eq!(l.caret_col(), 0, "caret clamps at the start");
+        l.right();
+        l.right();
+        l.right(); // past the end
+        assert_eq!(l.caret_col(), 2, "caret clamps at the end");
+    }
+
+    #[test]
+    fn input_line_caret_col_counts_wide_glyphs_before_the_caret() {
+        let mut l = InputLine::default();
+        for c in "世b".chars() {
+            l.input_char(c); // 世 is double-width, b single
+        }
+        assert_eq!(l.caret_col(), 3, "wide glyph (2) + ascii (1) with caret at end");
+        l.home();
+        assert_eq!(l.caret_col(), 0, "nothing precedes the caret at home");
+        l.right();
+        assert_eq!(l.caret_col(), 2, "the wide glyph alone counts as two columns");
+    }
+
+    #[test]
+    fn input_line_take_resets_the_caret() {
+        let mut l = InputLine::default();
+        for c in "hello".chars() {
+            l.input_char(c);
+        }
+        assert_eq!(l.take(), "hello");
+        assert!(l.is_empty(), "take leaves the line empty");
+        // The caret must be back at 0, not dangling at 5. Prove it by editing:
+        // type "ab", step left, insert 'X'. A reset caret yields "aXb"; a caret
+        // still parked at the old end would clamp the insert and yield "abX".
+        for c in "ab".chars() {
+            l.input_char(c);
+        }
+        l.left();
+        l.input_char('X');
+        assert_eq!(l.text(), "aXb", "take() reset the caret to the start");
+    }
+
+    #[test]
+    fn input_line_append_only_usage_degenerates_to_end_caret() {
+        // The palette/history query only types and backspaces — it never moves
+        // the caret. That usage must reproduce the pre-caret behavior: the caret
+        // tracks the end, so caret_col is the whole line's display width.
+        let mut l = InputLine::default();
+        for c in "echo 世".chars() {
+            l.input_char(c);
+        }
+        assert_eq!(l.text(), "echo 世");
+        assert_eq!(l.caret_col(), UnicodeWidthStr::width("echo 世"), "caret rests at the end");
+        l.backspace();
+        assert_eq!(l.text(), "echo ");
+        assert_eq!(l.caret_col(), UnicodeWidthStr::width("echo "));
+    }
+
+    #[test]
+    fn band_input_exposes_the_caret_column() {
+        let mut c = BandInput::default();
+        for ch in "ls".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(c.caret_col(), 2, "the band surfaces its caret column for rendering");
     }
 
     #[test]
