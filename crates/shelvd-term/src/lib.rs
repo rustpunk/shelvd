@@ -1067,8 +1067,16 @@ impl Terminal {
     /// input locally (Approach O shows it once, in the owned band). The single
     /// source of truth for the relocation decision, so the band-layout sites cannot
     /// drift apart. With `owned_editing` off this is exactly `!command_running()`.
+    ///
+    /// Ownership is re-derived against the live [`Self::prompt_editing`] window
+    /// rather than trusting `owned_editing` alone: the app pushes the latch on its
+    /// own events (config, keystrokes, echo) but a fresh prompt is reached purely
+    /// by PTY output (133;D then 133;A), so the latch can be left stale-true once
+    /// the editing window has closed. ANDing the live window keeps a stale latch
+    /// from suppressing relocation of the next resting prompt — the app owns the
+    /// input only within post-`B`/pre-`C`, which is exactly `prompt_editing()`.
     fn relocate_resting_input(&self) -> bool {
-        !self.command_running() && !self.owned_editing
+        !self.command_running() && !(self.owned_editing && self.prompt_editing())
     }
 
     /// Whether the live edge sits in the owned-editing window: the command-start
@@ -3157,6 +3165,32 @@ mod tests {
         t.set_owned_editing(true);
         assert!(!t.relocate_resting_input(), "owned: relocation suppressed");
         assert!(t.resting_band_layout().is_none(), "owned: no resting band layout");
+    }
+
+    #[test]
+    fn stale_owned_editing_does_not_suppress_relocation_at_a_fresh_prompt() {
+        // Regression: the app pushes the owned_editing latch on its own events
+        // (config/keystrokes/echo), but a fresh prompt is reached purely by PTY
+        // output (133;D then 133;A) with no app refresh. Once the editing window
+        // has closed, a stale-true latch must NOT keep suppressing relocation of
+        // the next resting prompt — the live prompt_editing() window gates it.
+        // Before the fix this returned false, floating the fresh prompt off the
+        // bottom anchor until the next keystroke re-pushed the latch.
+        let mut t = terminal(20, 6);
+        // Edit a command in the post-B/pre-C window; the app owns the line here.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07ls -la");
+        t.set_owned_editing(true);
+        assert!(t.prompt_editing(), "in the editing window");
+        assert!(!t.relocate_resting_input(), "owned: relocation suppressed in-window");
+        // The command runs and finishes, then a fresh prompt arrives (pre-B) — all
+        // via PTY output, leaving the owned_editing latch stale-true.
+        t.process(b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert!(!t.command_running(), "command finished");
+        assert!(!t.prompt_editing(), "a fresh prompt is pre-B, outside the editing window");
+        assert!(
+            t.relocate_resting_input(),
+            "a stale latch must not suppress relocation once the editing window closed"
+        );
     }
 
     #[test]
