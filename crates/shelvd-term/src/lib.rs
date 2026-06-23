@@ -98,6 +98,12 @@ pub struct BandState {
     /// rest of a prior command whose prefix matches `input`. None = nothing to
     /// suggest. The app computes it; the band only paints it.
     pub suggestion: Option<String>,
+    /// Display column of the caret within the rendered input source — `0` is the
+    /// first typed column (just past the prompt prefix), and the band maps it onto
+    /// the correct soft-wrapped row. The app supplies it in the same column-space
+    /// the band renders. The full input width (caret at the end) reproduces the
+    /// pre-caret end-of-line behavior.
+    pub caret: usize,
 }
 
 /// Grid dimensions handed to alacritty. `total_lines == screen_lines`; the grid
@@ -1740,16 +1746,37 @@ impl Terminal {
             return;
         }
 
-        // Soft-wrap the typed text (bullets when masked) into visual rows; show the
-        // bottom `height` of them so the caret row stays visible when clamped.
+        // Soft-wrap the typed text (bullets when masked) into visual rows.
         let fg_blank = CellSnapshot::blank(self.palette.foreground, bg);
         let source = self.band_input_source();
-        let (chunks, caret_wrapped) = wrap_chunks(prefix_w, &source, cols);
-        let total_rows = chunks.len() + caret_wrapped as usize;
-        let first_visible = total_rows.saturating_sub(height);
+        let (chunks, end_wrapped) = wrap_chunks(prefix_w, &source, cols);
+        let total_rows = chunks.len() + end_wrapped as usize;
+
+        // Caret position. Soft-wrap is a left-to-right, prefix-deterministic
+        // process, so the caret's (row, col) is exactly where wrapping the source
+        // *up to the caret column* ends. Reusing the end-of-wrap formula on that
+        // head keeps a caret at the end byte-for-byte identical to before, while a
+        // mid-line caret lands on its true wrapped row/column. `caret` is a display
+        // column into the source; a full-width caret means "at the end".
+        let total_w = UnicodeWidthStr::width(source.as_ref());
+        let caret_cols = self.band.caret.min(total_w);
+        let (head, _) = head_fit(&source, caret_cols);
+        let (caret_chunks, caret_spilled) = wrap_chunks(prefix_w, head, cols);
+        let (caret_vrow, caret_vcol) = if caret_spilled {
+            (caret_chunks.len(), 0)
+        } else {
+            let base = if caret_chunks.len() <= 1 { prefix_w } else { 0 };
+            (caret_chunks.len() - 1, base + UnicodeWidthStr::width(*caret_chunks.last().unwrap_or(&"")))
+        };
+
+        // Vertical clamp: when the field is taller than `height`, show the window
+        // of `height` rows that keeps the *caret* row visible (not merely the
+        // bottom row). A caret at the end reduces to showing the bottom rows.
+        let max_first = total_rows.saturating_sub(height);
+        let first_visible = caret_vrow.saturating_sub(height.saturating_sub(1)).min(max_first);
 
         for (vrow, chunk) in chunks.iter().enumerate() {
-            if vrow < first_visible {
+            if vrow < first_visible || vrow >= first_visible + height {
                 continue;
             }
             let brow = input_top + (vrow - first_visible);
@@ -1765,19 +1792,15 @@ impl Terminal {
             }
         }
 
-        // The caret sits after the last glyph, or at column 0 of the spilled row
-        // when the last row filled exactly.
-        let (caret_vrow, caret_vcol) = if caret_wrapped {
-            (chunks.len(), 0)
-        } else {
-            let base = if chunks.len() <= 1 { prefix_w } else { 0 };
-            (chunks.len() - 1, base + UnicodeWidthStr::width(*chunks.last().unwrap_or(&"")))
-        };
-
         // Ghost text: the un-typed completion, dimmed (the "ash" the placeholder
         // and queued rows use), from the caret to the end of its row — clipped, so
-        // the suggestion never grows the band.
-        if let (Some(suffix), true) = (self.band.suggestion.as_deref(), caret_vrow >= first_visible) {
+        // the suggestion never grows the band. Only when the caret is at the end of
+        // the input: a mid-line caret would otherwise paint the suffix into the
+        // middle of the line.
+        let at_end = caret_cols >= total_w;
+        if let (Some(suffix), true, true) =
+            (self.band.suggestion.as_deref(), at_end, caret_vrow >= first_visible)
+        {
             let brow = input_top + (caret_vrow - first_visible);
             let ghost = CellSnapshot::blank(self.palette.indexed(8), bg);
             let row = &mut snap.cells[row_range(brow)];
@@ -2935,6 +2958,7 @@ mod tests {
             queued: queued.iter().map(|s| (*s).to_owned()).collect(),
             masked: false,
             suggestion: None,
+            caret: UnicodeWidthStr::width(input),
         }
     }
 
@@ -2968,6 +2992,7 @@ mod tests {
             queued: Vec::new(),
             masked: true,
             suggestion: None,
+            caret: UnicodeWidthStr::width("hunter2"),
         });
         let snap = t.snapshot();
         let last = snap.rows - 1;
@@ -2993,6 +3018,7 @@ mod tests {
             queued: Vec::new(),
             masked: false,
             suggestion: Some("ho hi".to_owned()),
+            caret: UnicodeWidthStr::width("ec"),
         });
         let snap = t.snapshot();
         let last = snap.rows - 1;
@@ -3015,6 +3041,77 @@ mod tests {
         let last = snap.rows - 1;
         // Caret at "$ " (2) + "ec" (2) = col 4; with nothing to suggest it stays blank.
         assert!(snap.cell(4, last).unwrap().is_blank(), "no ghost text painted past the caret");
+    }
+
+    #[test]
+    fn band_caret_at_end_matches_prior_behavior() {
+        let mut t = terminal(10, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07");
+        // 15 chars wrap to two rows: "abcdefgh" then "ijklmno"; band() puts the
+        // caret at the end — exactly where the pre-caret renderer placed it.
+        t.set_band(band("abcdefghijklmno", &[]));
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last, "caret on the continuation (second) band row");
+        assert_eq!(cur.col, 7, "after 'ijklmno' (7 cols) on the second row");
+    }
+
+    #[test]
+    fn band_caret_renders_mid_line_on_a_wrapped_field() {
+        let mut t = terminal(10, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07");
+        // Same wrapped field, but the caret sits after "ijk" on the continuation
+        // row: display column 11 into the source (8 on row 0, then 3 into row 1).
+        let mut bs = band("abcdefghijklmno", &[]);
+        bs.caret = 11;
+        t.set_band(bs);
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, last, "caret on the continuation band row");
+        assert_eq!(cur.col, 3, "3 columns into the continuation row");
+    }
+
+    #[test]
+    fn band_caret_row_stays_visible_when_the_field_is_clamped() {
+        // rows=4 leaves the band at most 3 rows (one content row stays above it),
+        // yet the input wraps to 4 — so the band is clamped and must scroll to keep
+        // the caret's row visible, even when the caret is high up.
+        let mut t = terminal(10, 4);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07");
+        // 30 chars wrap to 4 rows: 8 (after the "$ " prefix) + 10 + 10 + 2.
+        let mut bs = band("abcdefghijklmnopqrstuvwxyz0123", &[]);
+        bs.caret = 3; // on the FIRST wrapped row, after "abc"
+        t.set_band(bs);
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 3, "band clamped to leave one content row");
+        let band_top = snap.rows - snap.input_band_rows; // the first band row
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.row, band_top, "the caret's row scrolled into the clamped window");
+        assert_eq!(cur.col, 5, "prompt prefix (2) + 'abc' (3)");
+        assert!(row_text(&snap, band_top).contains("abc"), "the caret row's content is on screen");
+    }
+
+    #[test]
+    fn band_suppresses_the_suggestion_when_the_caret_is_mid_line() {
+        let mut t = terminal(40, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07work\r\n");
+        // Typed "echo" with a ghost suffix offered, but the caret moved back to the
+        // middle — the suffix must not paint into the line.
+        t.set_band(BandState {
+            input: "echo".to_owned(),
+            queued: Vec::new(),
+            masked: false,
+            suggestion: Some(" hi".to_owned()),
+            caret: 2, // after "ec", not at the end (4)
+        });
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        // "$ echo" occupies cols 0..6; with the ghost suppressed, col 6 stays blank.
+        assert!(snap.cell(6, last).unwrap().is_blank(), "no ghost painted while editing mid-line");
+        let cur = snap.cursor.expect("a caret in the band");
+        assert_eq!(cur.col, 4, "caret rests mid-line at '$ ' (2) + 'ec' (2)");
     }
 
     #[test]

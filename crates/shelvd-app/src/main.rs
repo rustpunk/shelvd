@@ -1167,6 +1167,9 @@ fn sync_band(state: &mut State) {
         queued: state.queue.iter().cloned().collect(),
         masked,
         suggestion,
+        // Column the band paints the caret at. Until the keystroke path moves the
+        // caret it rests at the end, reproducing the prior end-of-line behavior.
+        caret: state.input.caret_col(),
     };
     state.terminal.set_band(band);
 }
