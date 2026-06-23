@@ -332,9 +332,6 @@ impl BandInput {
     }
 
     /// Display column the caret rests at, for placing the band's text cursor.
-    /// Consumed once the band renders the caret; tests reach it, so it is dead
-    /// only in the non-test build — `allow`, not `expect`. Drop it when rendered.
-    #[allow(dead_code)]
     pub fn caret_col(&self) -> usize {
         self.line.caret_col()
     }
