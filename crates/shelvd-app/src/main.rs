@@ -129,6 +129,10 @@ struct State {
     /// The bottom band's input line — what the user is typing while a command
     /// runs. Sent to the running command on Enter, or queued on Ctrl+Shift+Enter.
     input: BandInput,
+    /// Set when an owned-editing line is flushed to readline with Tab: control is
+    /// yielded so subsequent keys pass raw (readline drives the completion) until
+    /// the next prompt (OSC 133;A) clears it. Suppresses owned editing meanwhile.
+    yield_to_readline: bool,
     /// The pending ghost-text suggestion (the un-typed suffix shown dimmed after
     /// the caret), recomputed on every band edit. Right/End accepts exactly this.
     suggestion: Option<String>,
@@ -262,6 +266,7 @@ impl ApplicationHandler<UserEvent> for App {
             last_blink: Instant::now(),
             overlay: None,
             input: BandInput::default(),
+            yield_to_readline: false,
             suggestion: None,
             queue: VecDeque::new(),
             overlay_colors: overlay_colors(&self.config),
@@ -659,6 +664,24 @@ impl ApplicationHandler<UserEvent> for App {
                     && !mods.alt_key()
                 {
                     handle_band_key(state, &event);
+                    return;
+                }
+                // Owned editing (Approach O): behind the flag, at an idle integrated
+                // prompt in the post-B/pre-C window with echo on, buffer keystrokes
+                // locally and edit in the band instead of leaking raw to readline.
+                // Control/Alt combos fall through (SIGINT, Ctrl-R), the alt screen
+                // and no-echo prompts are exempt (the latter guards secrets), and a
+                // Tab-flush yields to readline until the next prompt.
+                if state.owned_editor
+                    && !state.yield_to_readline
+                    && state.terminal.shell_integration()
+                    && state.terminal.prompt_editing()
+                    && !state.terminal.alt_screen()
+                    && state.pty.echo_enabled()
+                    && !mods.control_key()
+                    && !mods.alt_key()
+                {
+                    handle_owned_key(state, &event);
                     return;
                 }
                 // Normal input: jump back to the live edge, then send the bytes.
@@ -1166,15 +1189,17 @@ fn sync_band(state: &mut State) {
         queued: state.queue.iter().cloned().collect(),
         masked,
         suggestion,
-        // Column the band paints the caret at. Until the keystroke path moves the
-        // caret it rests at the end, reproducing the prior end-of-line behavior.
-        caret: state.input.caret_col(),
+        // Column the band paints the caret at, in the band's render column-space:
+        // a display-width offset normally, or the char index when masked (each
+        // masked character renders as one width-1 bullet).
+        caret: if masked { state.input.caret_chars() } else { state.input.caret_col() },
     };
     // Approach-O gate: own the resting input locally only when the feature is
     // enabled and the shell is integrated, we're in the post-B/pre-C editing
     // window, not on the alternate screen, and echo is on. Off by default, so the
     // suppression never engages until the flag is set — production stays Approach P.
     let owned_editing = state.owned_editor
+        && !state.yield_to_readline
         && state.terminal.shell_integration()
         && state.terminal.prompt_editing()
         && !state.terminal.alt_screen()
@@ -1215,11 +1240,60 @@ fn handle_band_key(state: &mut State, event: &KeyEvent) {
     state.window.request_redraw();
 }
 
+/// Route a key press to the owned editor at an idle integrated prompt (Approach
+/// O): edit the buffered line locally rather than leaking raw to readline. Enter
+/// sends the whole line plus `\r`; Tab flushes it to readline without `\r` (so its
+/// completion runs) and yields control until the next prompt; the caret keys
+/// move/delete within the line. Control/Alt combos never reach here (the gate
+/// excludes them), so SIGINT, Ctrl-R and friends still pass raw to the PTY.
+fn handle_owned_key(state: &mut State, event: &KeyEvent) {
+    match &event.logical_key {
+        Key::Named(NamedKey::Enter) => {
+            // Send the whole owned line, then a carriage return to run it. take()
+            // clears the buffer so the prompt-start handoff can't re-send it.
+            let mut bytes = state.input.take().into_bytes();
+            bytes.push(b'\r');
+            if let Err(e) = state.pty.write(&bytes) {
+                log::debug!("owned send failed: {e}");
+            }
+        }
+        Key::Named(NamedKey::Tab) => {
+            // Hand the half-typed line to readline without running it (no `\r`),
+            // then yield: readline drives the line — completion and all — until the
+            // next prompt clears `yield_to_readline`.
+            let pending = state.input.take();
+            if let Err(e) = state.pty.write(pending.as_bytes()) {
+                log::debug!("owned tab-flush failed: {e}");
+            }
+            state.yield_to_readline = true;
+        }
+        Key::Named(NamedKey::Backspace) => state.input.backspace(),
+        Key::Named(NamedKey::Delete) => state.input.delete(),
+        Key::Named(NamedKey::ArrowLeft) => state.input.left(),
+        Key::Named(NamedKey::ArrowRight) => state.input.right(),
+        Key::Named(NamedKey::Home) => state.input.home(),
+        Key::Named(NamedKey::End) => state.input.end(),
+        Key::Named(NamedKey::Space) => state.input.input_char(' '),
+        Key::Character(s) => {
+            for ch in s.chars() {
+                state.input.input_char(ch);
+            }
+        }
+        _ => {}
+    }
+    // Keep the band at the live edge so the owned line stays on screen.
+    state.terminal.scroll_to_bottom();
+    sync_band(state);
+    state.window.request_redraw();
+}
+
 /// Handle a fresh shell prompt (OSC 133;A): advance the type-ahead queue by one.
 /// The queue runs on every prompt until drained. When nothing is queued but the
 /// band still holds a half-typed line, that line is handed to the now-idle prompt
 /// (no Enter, so it lands as editable input) rather than dropped.
 fn on_prompt_start(state: &mut State) {
+    // A fresh prompt resumes owning: any Tab-yield to readline ends with the line.
+    state.yield_to_readline = false;
     if let Some(cmd) = state.queue.pop_front() {
         let mut bytes = cmd.into_bytes();
         bytes.push(b'\r'); // type the command and run it
