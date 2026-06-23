@@ -252,12 +252,8 @@ impl InputLine {
 }
 
 /// Caret movement and forward-deletion — the editor operations that turn the
-/// append-only line into a full single-line editor. Exercised by the unit tests
-/// now; the production keystroke path that drives them is wired in a later slice.
-/// `allow` rather than `expect` because the tests already reach these methods, so
-/// they are dead only in the non-test binary build — an `expect` would go
-/// unfulfilled under `cfg(test)`. Drop the attribute once the keystroke path lands.
-#[allow(dead_code)]
+/// append-only line into a full single-line editor, driven by the owned-editing
+/// keystroke path (see `handle_owned_key`).
 impl InputLine {
     /// Number of chars in the line — the caret's upper bound.
     fn char_len(&self) -> usize {
@@ -331,9 +327,40 @@ impl BandInput {
         self.line.take()
     }
 
+    /// Delete the character at the caret (forward delete).
+    pub fn delete(&mut self) {
+        self.line.delete();
+    }
+
+    /// Move the caret one char left.
+    pub fn left(&mut self) {
+        self.line.left();
+    }
+
+    /// Move the caret one char right.
+    pub fn right(&mut self) {
+        self.line.right();
+    }
+
+    /// Move the caret to the start of the line.
+    pub fn home(&mut self) {
+        self.line.home();
+    }
+
+    /// Move the caret to the end of the line.
+    pub fn end(&mut self) {
+        self.line.end();
+    }
+
     /// Display column the caret rests at, for placing the band's text cursor.
     pub fn caret_col(&self) -> usize {
         self.line.caret_col()
+    }
+
+    /// The caret's position as a char index — the band's caret column when the
+    /// input is masked, since each masked char renders as one width-1 bullet.
+    pub fn caret_chars(&self) -> usize {
+        self.line.caret
     }
 }
 
@@ -716,6 +743,29 @@ mod tests {
             c.input_char(ch);
         }
         assert_eq!(c.caret_col(), 2, "the band surfaces its caret column for rendering");
+    }
+
+    #[test]
+    fn band_input_exposes_the_owned_editor_ops() {
+        // The owned-editing keystroke path drives the editor through BandInput, so
+        // its delegators must edit and move the caret like the line beneath them.
+        let mut c = BandInput::default();
+        for ch in "abc".chars() {
+            c.input_char(ch);
+        }
+        c.left(); // caret between 'b' and 'c'
+        c.input_char('X');
+        assert_eq!(c.text(), "abXc", "insert lands at the caret");
+        c.home();
+        assert_eq!(c.caret_chars(), 0, "home moves the caret to the start");
+        c.delete(); // forward-delete 'a'
+        assert_eq!(c.text(), "bXc");
+        c.end();
+        assert_eq!(c.caret_chars(), 3, "end moves the caret past the last char");
+        c.right(); // clamped at the end
+        assert_eq!(c.caret_chars(), 3, "right clamps at the end");
+        c.backspace(); // delete 'c' before the caret
+        assert_eq!(c.text(), "bX");
     }
 
     #[test]
