@@ -265,6 +265,12 @@ pub struct Terminal {
     /// byte the grid is empty; suppressing the cursor until then avoids a lone
     /// cursor flashing at the bottom of an otherwise blank, bottom-anchored screen.
     seen_output: bool,
+    /// Whether any shell-integration marker (an OSC 133 semantic prompt, or an
+    /// OSC 7 cwd report) has arrived this session. Latched once true and never
+    /// reset, so it survives a `clear`/RIS that empties the block model — letting
+    /// callers tell an un-integrated shell apart from an integrated one that was
+    /// just cleared.
+    seen_marker: bool,
     /// Input-band state pushed by the app: the editable compose line and the
     /// type-ahead queue. While either is active the band is forced (even at a
     /// prompt) and shows the type-ahead UI; otherwise it falls back to the locked
@@ -317,6 +323,7 @@ impl Terminal {
             dims,
             cell_px: (0, 0),
             seen_output: false,
+            seen_marker: false,
             band: BandState::default(),
             sel: None,
         }
@@ -403,6 +410,9 @@ impl Terminal {
     /// Act on a recognized shell-integration marker: update the block model and
     /// emit the marker on the event channel.
     fn on_marker(&mut self, marker: Marker) {
+        // Every shell-integration marker — semantic prompt or cwd — flows through
+        // here, so this is the choke point that latches integration-present.
+        self.seen_marker = true;
         match marker {
             Marker::Semantic(kind) => {
                 let line = self.absolute_cursor_line();
@@ -437,6 +447,7 @@ impl Terminal {
                 if let Some(b) = self.blocks.last_mut() {
                     b.command_line = line;
                     b.command_col = col;
+                    b.command_started = true;
                 }
             }
             SemanticKind::OutputStart => {
@@ -1027,6 +1038,28 @@ impl Terminal {
     /// type ahead of — so the app gates the keybinding on it.
     pub fn command_running(&self) -> bool {
         matches!(self.blocks.last(), Some(b) if b.output_line.is_some() && b.end_line.is_none())
+    }
+
+    /// Whether the live edge sits in the owned-editing window: the command-start
+    /// marker (OSC 133;B) has fired for the current prompt but neither output
+    /// (133;C) nor finish (133;D) has — the post-`B`/pre-`C` interval in which the
+    /// resting input line may be edited locally. False after `A` (before `B`),
+    /// once a command is running or finished, on the alternate screen, and with
+    /// no shell integration at all. No caller yet; the owned editor gates on it.
+    pub fn prompt_editing(&self) -> bool {
+        !self.alt_screen()
+            && matches!(
+                self.blocks.last(),
+                Some(b) if b.command_started && b.output_line.is_none() && b.end_line.is_none()
+            )
+    }
+
+    /// Whether shell integration is present — latched true once the first OSC-133
+    /// or OSC-7 marker arrives and never reset. Unlike [`Self::blocks`], it
+    /// survives a `clear`/RIS that empties the block model, so callers can tell an
+    /// un-integrated shell apart from an integrated one that was merely cleared.
+    pub fn shell_integration(&self) -> bool {
+        self.seen_marker
     }
 
     // --- terminal modes ------------------------------------------------------
@@ -2699,6 +2732,89 @@ mod tests {
         assert!(t.command_running(), "output started, not yet finished");
         t.process(b"out\r\n\x1b]133;D;0\x07");
         assert!(!t.command_running(), "command finished");
+    }
+
+    #[test]
+    fn prompt_editing_window_is_post_b_pre_c() {
+        let mut t = terminal(20, 6);
+        assert!(!t.prompt_editing(), "idle before any prompt");
+        t.process(b"\x1b]133;A\x07$ ");
+        assert!(!t.prompt_editing(), "after A (prompt start), before B");
+        t.process(b"\x1b]133;B\x07");
+        assert!(t.prompt_editing(), "post-B, pre-C: the editing window is open");
+        t.process(b"ls\r\n\x1b]133;C\x07");
+        assert!(!t.prompt_editing(), "after C: command running, window closed");
+        t.process(b"out\r\n\x1b]133;D;0\x07");
+        assert!(!t.prompt_editing(), "after D: finished, window closed");
+        // A fresh prompt re-opens the cycle: closed again until its own B.
+        t.process(b"\x1b]133;A\x07$ ");
+        assert!(!t.prompt_editing(), "re-prompt: closed until the next B");
+        t.process(b"\x1b]133;B\x07");
+        assert!(t.prompt_editing(), "re-opens on the next B");
+    }
+
+    #[test]
+    fn prompt_editing_needs_an_explicit_command_start() {
+        // `Block::new` pre-sets `command_line = prompt_line` at A, so after A
+        // alone the line/col shape already looks command-started — even at a
+        // column-0 prompt where `command_col` would also be 0. Only the explicit
+        // B-seen flag distinguishes the two.
+        let mut t = terminal(20, 6);
+        t.process(b"\x1b]133;A\x07"); // prompt start at column 0, no B yet
+        assert!(!t.prompt_editing(), "A alone is not an editing window");
+        t.process(b"\x1b]133;B\x07"); // B at column 0 — empty prefix, command_col == 0
+        assert!(t.prompt_editing(), "an explicit B at col 0 opens the window");
+    }
+
+    #[test]
+    fn prompt_editing_false_on_alt_screen() {
+        let mut t = terminal(20, 6);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(t.prompt_editing(), "post-B editing window before the alt screen");
+        t.process(b"\x1b[?1049h"); // a full-screen app takes over
+        assert!(!t.prompt_editing(), "no owned editing on the alternate screen");
+    }
+
+    #[test]
+    fn prompt_editing_false_without_shell_integration() {
+        let mut t = terminal(20, 6);
+        t.process(b"plain prompt $ typed text"); // no markers at all
+        assert!(!t.prompt_editing(), "no integration: never an editing window");
+        assert!(!t.shell_integration(), "and integration stays unreported");
+    }
+
+    #[test]
+    fn command_started_survives_reflow() {
+        let mut t = terminal(20, 4);
+        // A finished block (which gets a frozen buffer) then a fresh post-B prompt
+        // we rest at — the open block carries the B-seen flag.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07done\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(t.prompt_editing(), "post-B resting prompt is an editing window");
+        assert!(t.blocks().last().unwrap().command_started);
+        // Reflow rewrites only line anchors, so the B-seen flag must survive.
+        t.resize(10, 4);
+        assert!(
+            t.blocks().last().unwrap().command_started,
+            "command_started preserved across reflow"
+        );
+        assert!(t.prompt_editing(), "still an editing window after reflow");
+    }
+
+    #[test]
+    fn shell_integration_latches_on_first_marker_and_survives_clear() {
+        let mut t = terminal(20, 4);
+        assert!(!t.shell_integration(), "no markers seen yet");
+        // A non-semantic marker (OSC 7 cwd) is enough to latch it.
+        t.process(b"\x1b]7;file://host/tmp\x07");
+        assert!(t.shell_integration(), "latched on the first marker");
+        // Build history with a finished command, then RIS: history shrinks and the
+        // block model is wiped — but the integration latch must persist.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07a\r\n\x1b]133;C\x07l1\r\nl2\r\nl3\r\nl4\r\nl5\r\n\x1b]133;D;0\x07");
+        assert!(!t.blocks().is_empty(), "a block exists before the reset");
+        t.process(b"\x1bc");
+        assert!(t.blocks().is_empty(), "RIS clears the block model");
+        assert!(t.shell_integration(), "but integration stays latched");
     }
 
     #[test]

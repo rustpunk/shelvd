@@ -33,6 +33,12 @@ pub struct Block {
     pub command_line: i64,
     /// Column on `command_line` where command input begins.
     pub command_col: usize,
+    /// Whether the command-start marker (OSC 133;B) has fired for this block.
+    /// Distinct from `command_line`/`command_col`: `Block::new` pre-sets
+    /// `command_line = prompt_line` at `A`, so the line/col shape alone cannot
+    /// tell a post-`A` prompt from a post-`B` one (notably at a column-0 prompt
+    /// where the two coincide). This flag records that `B` specifically arrived.
+    pub command_started: bool,
     /// Absolute line where output begins (OSC 133;C), once known.
     pub output_line: Option<i64>,
     /// Absolute line the command finished on (OSC 133;D), once known.
@@ -64,6 +70,7 @@ impl Block {
             prompt_line,
             command_line: prompt_line,
             command_col: 0,
+            command_started: false,
             output_line: None,
             end_line: None,
             command: String::new(),
