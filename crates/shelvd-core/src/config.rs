@@ -32,6 +32,12 @@ pub struct Config {
     /// direction). Off by default: an OSC 52 read query lets a program exfiltrate
     /// whatever the user has on the clipboard back over the PTY, so it is opt-in.
     pub osc52_clipboard_read: bool,
+    /// Whether the bottom-band input line is *owned* by shelvd (Approach O): the
+    /// terminal edits the resting prompt locally between the command's start and
+    /// its first output, rather than echoing every keystroke through the PTY. Off
+    /// by default and read by nothing until the owned editor reaches parity; while
+    /// off, behavior is byte-for-byte the current echo-through path (Approach P).
+    pub owned_editor: bool,
 }
 
 impl Default for Config {
@@ -42,6 +48,7 @@ impl Default for Config {
             scrollback: 10_000,
             osc52_clipboard_write: true,
             osc52_clipboard_read: false,
+            owned_editor: false,
         }
     }
 }
@@ -96,6 +103,7 @@ struct ConfigFile {
     scrollback: Option<usize>,
     osc52_clipboard_write: Option<bool>,
     osc52_clipboard_read: Option<bool>,
+    owned_editor: Option<bool>,
     theme: ThemeFile,
 }
 
@@ -113,6 +121,9 @@ impl ConfigFile {
         }
         if let Some(osc52_clipboard_read) = self.osc52_clipboard_read {
             config.osc52_clipboard_read = osc52_clipboard_read;
+        }
+        if let Some(owned_editor) = self.owned_editor {
+            config.owned_editor = owned_editor;
         }
         self.theme.resolve_into(&mut config.theme)?;
         Ok(config)
@@ -299,6 +310,19 @@ mod tests {
     fn osc52_clipboard_read_can_be_enabled() {
         let config = resolve("osc52_clipboard_read = true\n").unwrap();
         assert!(config.osc52_clipboard_read);
+        // Anything not named keeps its default.
+        assert_eq!(config.scrollback, Config::default().scrollback);
+    }
+
+    #[test]
+    fn owned_editor_defaults_off() {
+        assert!(!resolve("").unwrap().owned_editor);
+    }
+
+    #[test]
+    fn owned_editor_can_be_enabled() {
+        let config = resolve("owned_editor = true\n").unwrap();
+        assert!(config.owned_editor);
         // Anything not named keeps its default.
         assert_eq!(config.scrollback, Config::default().scrollback);
     }
