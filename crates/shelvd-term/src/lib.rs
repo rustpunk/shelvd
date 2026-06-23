@@ -282,6 +282,13 @@ pub struct Terminal {
     /// prompt) and shows the type-ahead UI; otherwise it falls back to the locked
     /// running-command mirror.
     band: BandState,
+    /// Whether the app is owning the resting input line locally (Approach O).
+    /// Pushed by the app, which computes the full gate (the `owned_editor` config
+    /// flag ∧ shell integration ∧ the post-B/pre-C editing window ∧ not the alt
+    /// screen ∧ echo on); the term keeps its layout pure-derived. While set, the
+    /// Approach-P relocation of readline's resting input is suppressed so the line
+    /// shows once (in the owned band), not twice — see [`Self::relocate_resting_input`].
+    owned_editing: bool,
     /// Active text selection, in composite (absolute-line) coordinates so it spans
     /// frozen block buffers and the live grid alike. `None` when nothing is
     /// selected. Replaces alacritty's single-grid `Selection`.
@@ -331,6 +338,7 @@ impl Terminal {
             seen_output: false,
             seen_marker: false,
             band: BandState::default(),
+            owned_editing: false,
             sel: None,
         }
     }
@@ -1038,12 +1046,29 @@ impl Terminal {
         self.band = band;
     }
 
+    /// Push whether the app is owning the resting input line (Approach O). The app
+    /// computes the full gate; the term only consumes it through
+    /// [`Self::relocate_resting_input`].
+    pub fn set_owned_editing(&mut self, owned: bool) {
+        self.owned_editing = owned;
+    }
+
     /// Whether a command is running at the live edge: shell integration reported
     /// its output start (OSC 133;C) but not yet its finish (133;D). Compose-next
     /// mode only engages while this holds — there must be a running command to
     /// type ahead of — so the app gates the keybinding on it.
     pub fn command_running(&self) -> bool {
         matches!(self.blocks.last(), Some(b) if b.output_line.is_some() && b.end_line.is_none())
+    }
+
+    /// Whether readline's resting input line should be relocated into the pinned
+    /// band (the Approach-P behavior). True at a resting prompt; false while a
+    /// command runs (there is no resting prompt to move) and while the app owns the
+    /// input locally (Approach O shows it once, in the owned band). The single
+    /// source of truth for the relocation decision, so the band-layout sites cannot
+    /// drift apart. With `owned_editing` off this is exactly `!command_running()`.
+    fn relocate_resting_input(&self) -> bool {
+        !self.command_running() && !self.owned_editing
     }
 
     /// Whether the live edge sits in the owned-editing window: the command-start
@@ -1258,7 +1283,8 @@ impl Terminal {
         // output's lowest line — subtract their height, or the output would sit
         // needlessly high.
         let reserve = Self::BOTTOM_GUTTER.max(band);
-        let relocated = if self.command_running() { 0 } else { self.resting_input_height() };
+        let relocated =
+            if self.relocate_resting_input() { self.resting_input_height() } else { 0 };
         let out_bottom = self.content_bottom() - relocated;
         (rows - 1 - reserve - out_bottom).max(-band)
     }
@@ -1281,10 +1307,10 @@ impl Terminal {
         // The input line — the running type-ahead field (one row), or the relocated
         // resting prompt, which is as tall as its (soft-wrapped) logical input.
         let max_total = (self.dims.rows as i32 - 1).max(1);
-        let input = if self.command_running() {
-            self.band_input_height()
-        } else {
+        let input = if self.relocate_resting_input() {
             self.resting_input_height()
+        } else {
+            self.band_input_height()
         };
         let input = input.clamp(1, max_total);
         let queued = self.band.queued.len() as i32;
@@ -1346,7 +1372,7 @@ impl Terminal {
     /// layout [`Self::fill_input_band`]/[`Self::fill_resting_input`] paint, so
     /// selection hit-testing and painting share one source of truth.
     fn resting_band_layout(&self) -> Option<(usize, i32, usize)> {
-        if self.scroll_top_abs.is_some() || self.command_running() {
+        if self.scroll_top_abs.is_some() || !self.relocate_resting_input() {
             return None;
         }
         let band = self.input_band_rows();
@@ -1446,7 +1472,7 @@ impl Terminal {
         // them and leave the prompt in the scrolling area). While a command runs
         // there is no resting prompt to move.
         let relocate =
-            (band > 0 && !self.command_running()).then(|| self.resting_input_span());
+            (band > 0 && self.relocate_resting_input()).then(|| self.resting_input_span());
 
         for indexed in grid.display_iter() {
             if let Some((top, bottom)) = relocate {
@@ -1604,22 +1630,24 @@ impl Terminal {
         // The input occupies the bottom rows of the band, as tall as its
         // soft-wrapped height (the running type-ahead field or the relocated
         // resting prompt); queued commands stack in whatever rows remain above it.
-        let input_height = if self.command_running() {
-            (self.band_input_height() as usize).clamp(1, band as usize)
-        } else {
+        let input_height = if self.relocate_resting_input() {
             (self.resting_input_height() as usize).clamp(1, band as usize)
+        } else {
+            (self.band_input_height() as usize).clamp(1, band as usize)
         };
         let input_top = rows - input_height;
         let queue_rows = (band as usize).saturating_sub(input_height);
         self.fill_queued_rows(snap, band_top, queue_rows);
 
-        if self.command_running() {
-            // Running: the type-ahead field, led by the captured prompt prefix and
+        if self.relocate_resting_input() {
+            // Resting prompt (Approach P): relocate the (soft-wrapped) input line
+            // into the band.
+            self.fill_resting_input(snap, input_top, input_height);
+        } else {
+            // A command is running, or the app owns the input (Approach O): the
+            // type-ahead/owned field, led by the captured prompt prefix and
             // soft-wrapped down the input rows.
             self.fill_band_input(snap, input_top, input_height);
-        } else {
-            // Resting prompt: relocate the (soft-wrapped) input line into the band.
-            self.fill_resting_input(snap, input_top, input_height);
         }
     }
 
@@ -3112,6 +3140,63 @@ mod tests {
         assert!(snap.cell(6, last).unwrap().is_blank(), "no ghost painted while editing mid-line");
         let cur = snap.cursor.expect("a caret in the band");
         assert_eq!(cur.col, 4, "caret rests mid-line at '$ ' (2) + 'ec' (2)");
+    }
+
+    #[test]
+    fn owned_editing_suppresses_resting_relocation() {
+        let mut t = terminal(20, 6);
+        // Resting prompt with typed input on the grid (post-B, pre-C — the editing
+        // window), so Approach P would relocate it into the band.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07ls -la");
+        assert!(!t.command_running() && t.prompt_editing(), "resting, in the editing window");
+        // Off: relocation is active and there is a resting band layout.
+        assert!(t.relocate_resting_input(), "off: relocation active");
+        assert!(t.resting_band_layout().is_some(), "off: resting band layout present");
+        // Owned on: the app owns the line, so relocation is suppressed and there is
+        // no resting band layout (the band paints its own input instead).
+        t.set_owned_editing(true);
+        assert!(!t.relocate_resting_input(), "owned: relocation suppressed");
+        assert!(t.resting_band_layout().is_none(), "owned: no resting band layout");
+    }
+
+    #[test]
+    fn owned_editing_shows_the_band_input_and_keeps_the_grid_prompt() {
+        let mut t = terminal(20, 6);
+        // Readline's "$ ls" rests on the grid (post-B editing window).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07ls");
+        // The app owns the line: it pushes its own band input and the owned flag.
+        t.set_owned_editing(true);
+        t.set_band(band("ls -la", &[]));
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        // Band height is the owned field's (band_input_height == 1), not the
+        // relocated resting input's.
+        assert_eq!(snap.input_band_rows, 1, "band sized from the owned input");
+        // The band's bottom row shows the owned input.
+        assert!(row_text(&snap, last).contains("ls -la"), "band shows the owned input");
+        // The grid's readline prompt row still renders above (not skipped), so the
+        // line is drawn once in the band, not also relocated.
+        let above = (0..last).map(|r| row_text(&snap, r)).collect::<Vec<_>>().join("\n");
+        assert!(above.contains("$ ls"), "grid prompt stays in the output region: {above:?}");
+    }
+
+    #[test]
+    fn owned_editing_does_not_change_reflow_anchoring() {
+        // Reflow anchoring keys on `command_running`, not `relocate_resting_input`,
+        // so owning the input must not perturb how frozen blocks re-anchor on a
+        // resize (the `reanchor_blocks_for_reflow` regression guard).
+        let anchors = |owned: bool| {
+            let mut t = terminal(20, 4);
+            t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07AAA\r\n\x1b]133;D;0\x07");
+            t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07second"); // resting, post-B
+            t.set_owned_editing(owned);
+            t.resize(10, 4);
+            t.blocks()
+                .iter()
+                .map(|b| (b.prompt_line, b.output_line, b.end_line))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(anchors(false), anchors(true), "owned-editing must not perturb reflow anchors");
     }
 
     #[test]
