@@ -2,14 +2,17 @@
 //! from a shell's own engine and shape them into the protocol's
 //! [`CompletionResponse`] for the completion menu.
 //!
-//! This first slice drives **fish** with a one-shot `fish -c "complete -C …"`.
-//! Completion is Tab-triggered (a deliberate keypress), so a cold ~40 ms invoke
-//! is imperceptible and avoids a persistent-subshell state machine; a warm path
-//! is a later optimization if as-you-type menu refresh is ever added. The bash
-//! and zsh engines are separate follow-ups — the app routes by
-//! [`shelvd_pty::ShellKind`], so a non-fish shell simply gets no candidates here
-//! and the caller falls back to readline.
+//! Each engine drives a **cold one-shot** subshell: **fish** via
+//! `fish -c "complete -C …"`, **bash** via a one-shot `bash -c` that loads the
+//! system completion infrastructure and replays the partial line through the
+//! registered compspec. Completion is Tab-triggered (a deliberate keypress), so a
+//! cold ~tens-of-ms invoke is imperceptible and avoids a persistent-subshell state
+//! machine; a warm/live path is a later optimization (#85) for full session-state
+//! fidelity. The zsh engine is a separate follow-up — the app routes by
+//! [`shelvd_pty::ShellKind`], so a shell without a cold engine here simply gets no
+//! candidates and the caller falls back to readline.
 
+use std::collections::HashSet;
 use std::process::Command;
 
 use shelvd_term::{CompletionItem, CompletionResponse};
@@ -32,6 +35,98 @@ pub fn fish_complete(line: &str, cursor: usize) -> Option<CompletionResponse> {
         return None;
     }
     Some(CompletionResponse { replace_start: last_token_start(prefix), replace_end: cursor, items })
+}
+
+/// A self-contained bash script that replays a partial command line through
+/// bash's own programmable completion and prints the candidates, one per line.
+///
+/// `$1` is the line prefix to complete (everything up to the caret). The script
+/// loads the system completion infrastructure (best-effort), reconstructs the
+/// `COMP_*` environment bash hands a compspec, lazily loads the spec for the
+/// command, then either calls the registered `-F` function and dumps `COMPREPLY`,
+/// or falls back to `compgen` (command names for the first word, filenames
+/// otherwise). Word splitting is whitespace-only — a first-cut boundary matching
+/// [`last_token_start`]; `COMP_WORDBREAKS` punctuation (`:`, `=`) is not honored.
+/// The line arrives as an argv argument, never interpolated into the script, so
+/// an arbitrary line cannot inject shell.
+const BASH_DRIVER: &str = r#"
+line="$1"
+for f in /usr/share/bash-completion/bash_completion /etc/bash_completion; do
+  if [[ -r "$f" ]]; then source "$f" >/dev/null 2>&1; break; fi
+done
+COMP_LINE="$line"
+COMP_POINT="${#COMP_LINE}"
+read -ra COMP_WORDS <<< "$COMP_LINE"
+if [[ "$COMP_LINE" == *[[:space:]] || ${#COMP_WORDS[@]} -eq 0 ]]; then
+  COMP_WORDS+=("")
+fi
+COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+cmd="${COMP_WORDS[0]}"
+cur="${COMP_WORDS[COMP_CWORD]}"
+prev=""
+(( COMP_CWORD > 0 )) && prev="${COMP_WORDS[COMP_CWORD-1]}"
+# The first word names a command: complete from PATH/builtins/aliases.
+if (( COMP_CWORD == 0 )); then
+  compgen -c -- "$cur"
+  exit 0
+fi
+# Trigger the on-demand loader so the command's compspec is registered.
+if declare -F _completion_loader >/dev/null 2>&1; then
+  _completion_loader "$cmd" >/dev/null 2>&1
+fi
+spec="$(complete -p "$cmd" 2>/dev/null)"
+if [[ "$spec" == *" -F "* ]]; then
+  func="${spec#* -F }"
+  func="${func%% *}"
+  COMPREPLY=()
+  "$func" "$cmd" "$cur" "$prev" >/dev/null 2>&1
+  printf '%s\n' "${COMPREPLY[@]}"
+else
+  # No completion function registered: fall back to filename completion.
+  compgen -f -- "$cur"
+fi
+"#;
+
+/// Fetch bash completions for `line` with the caret at byte offset `cursor`.
+/// Returns `None` when bash is unavailable, errors, or yields nothing — the
+/// caller then falls back to readline. Drives bash's own programmable completion
+/// via a one-shot [`BASH_DRIVER`]; the replacement range is the in-progress word
+/// (the last whitespace-delimited token up to the caret).
+///
+/// This is the cold engine: a fresh `bash -c` cannot see the live session's
+/// interactively-defined aliases/functions/vars (that is #85's live transport),
+/// but it reflects every compspec the system installs.
+pub fn bash_complete(line: &str, cursor: usize) -> Option<CompletionResponse> {
+    // Complete the line up to the caret; snap a stray offset to a char boundary.
+    let cursor = floor_char_boundary(line, cursor.min(line.len()));
+    let prefix = &line[..cursor];
+    let output =
+        Command::new("bash").arg("-c").arg(BASH_DRIVER).arg("shelvd-complete").arg(prefix).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let items = parse_bash_completions(&String::from_utf8_lossy(&output.stdout));
+    if items.is_empty() {
+        return None;
+    }
+    Some(CompletionResponse { replace_start: last_token_start(prefix), replace_end: cursor, items })
+}
+
+/// Parse the bash driver's output: one candidate per line, no descriptions
+/// (bash carries none). Compspecs append a trailing-space suffix to a complete
+/// match, so trailing spaces are stripped; command completion lists the same name
+/// once per source (builtin, alias, PATH), so duplicates are dropped, first
+/// occurrence wins.
+fn parse_bash_completions(stdout: &str) -> Vec<CompletionItem> {
+    let mut seen = HashSet::new();
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let value = line.trim_end_matches(' ');
+            (!value.is_empty() && seen.insert(value.to_owned()))
+                .then(|| CompletionItem { value: value.to_owned(), description: None })
+        })
+        .collect()
 }
 
 /// Parse fish's `complete -C` output: one candidate per line, the value and an
@@ -133,6 +228,48 @@ mod tests {
             return;
         }
         let resp = fish_complete("ech", 3).expect("fish returns candidates for 'ech'");
+        assert!(resp.items.iter().any(|i| i.value == "echo"), "'echo' is among the candidates");
+        assert_eq!((resp.replace_start, resp.replace_end), (0, 3), "the single token spans 0..3");
+    }
+
+    #[test]
+    fn parse_bash_completions_trims_suffix_and_dedups() {
+        // git's compspec appends a trailing space to each match; command
+        // completion repeats a name once per source (builtin + PATH).
+        let out = "checkout \ncherry-pick \ncherry \n";
+        let items = parse_bash_completions(out);
+        assert_eq!(items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(), [
+            "checkout",
+            "cherry-pick",
+            "cherry"
+        ]);
+        assert!(items.iter().all(|i| i.description.is_none()), "bash carries no descriptions");
+
+        let deduped = parse_bash_completions("echo\necho\necho\n");
+        assert_eq!(deduped.len(), 1, "duplicate command names collapse to one");
+        assert_eq!(deduped[0].value, "echo");
+    }
+
+    #[test]
+    fn parse_bash_completions_skips_blank_lines() {
+        assert!(parse_bash_completions("\n \n").is_empty(), "blank and all-space lines drop out");
+        assert_eq!(parse_bash_completions("only\n").len(), 1);
+    }
+
+    #[test]
+    fn bash_complete_lists_command_names_when_bash_is_present() {
+        // Self-skips where bash isn't installed, so the suite stays green without
+        // it. Command completion (the first word) needs only the `compgen` builtin,
+        // not the bash-completion package, so this stays deterministic across hosts.
+        let present = Command::new("bash")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !present {
+            eprintln!("skipping bash_complete live check: bash not on PATH");
+            return;
+        }
+        let resp = bash_complete("ech", 3).expect("bash returns candidates for 'ech'");
         assert!(resp.items.iter().any(|i| i.value == "echo"), "'echo' is among the candidates");
         assert_eq!((resp.replace_start, resp.replace_end), (0, 3), "the single token spans 0..3");
     }
