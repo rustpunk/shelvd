@@ -34,11 +34,18 @@ pub enum Marker {
     Semantic(SemanticKind),
     /// An OSC 7 working-directory report, decoded to a filesystem path.
     Cwd(String),
+    /// A shelvd completion response (private OSC 5379), carrying the parsed
+    /// candidate list for the owned editor's completion menu.
+    Completion(crate::completion::CompletionResponse),
 }
 
 /// Upper bound on an OSC payload we will buffer; a longer sequence is abandoned
 /// rather than grown without limit (alacritty still parses it on its own path).
 const MAX_OSC: usize = 4096;
+
+/// A completion response (OSC 5379) can list many candidates, so it is allowed to
+/// grow past [`MAX_OSC`] up to this larger bound; anything longer is abandoned.
+const MAX_COMPLETION_OSC: usize = 64 * 1024;
 
 /// Where the scanner is in the middle of recognizing an OSC sequence. The buffer
 /// holds the payload accumulated after `ESC ]`, so a split read resumes cleanly.
@@ -92,7 +99,15 @@ impl Scanner {
                 (State::Osc(buf), 0x1b) => State::OscEsc(buf),
                 (State::Osc(mut buf), b) => {
                     buf.push(b);
-                    if buf.len() > MAX_OSC {
+                    // Most OSC payloads are abandoned past MAX_OSC, but a
+                    // completion response may legitimately be larger, so it gets a
+                    // bigger bound. The prefix check only runs once a payload has
+                    // already exceeded MAX_OSC, so the common path stays a length
+                    // compare.
+                    let over_general = buf.len() > MAX_OSC;
+                    let completion = over_general
+                        && buf.starts_with(crate::completion::RESPONSE_PREFIX.as_bytes());
+                    if (over_general && !completion) || buf.len() > MAX_COMPLETION_OSC {
                         State::Ground
                     } else {
                         State::Osc(buf)
@@ -124,9 +139,13 @@ fn push_hit(hits: &mut Vec<(usize, Marker)>, term_index: usize, payload: &[u8]) 
     }
 }
 
-/// Recognize an OSC 133 semantic prompt or an OSC 7 cwd report in `payload`
-/// (the bytes between `ESC ]` and the terminator).
+/// Recognize an OSC 133 semantic prompt, an OSC 7 cwd report, or a shelvd
+/// completion response (OSC 5379) in `payload` (the bytes between `ESC ]` and the
+/// terminator).
 fn parse_marker(payload: &[u8]) -> Option<Marker> {
+    if let Some(rest) = payload.strip_prefix(crate::completion::RESPONSE_PREFIX.as_bytes()) {
+        return crate::completion::parse_response_payload(rest).map(Marker::Completion);
+    }
     if let Some(rest) = payload.strip_prefix(b"133;") {
         let mut parts = rest.split(|&b| b == b';');
         let kind = match parts.next()? {
@@ -160,9 +179,9 @@ fn file_url_to_path(url: &str) -> Option<String> {
     Some(percent_decode(&authority_and_path[slash..]))
 }
 
-/// Decode `%XX` escapes in a URL path; bytes that are not valid escapes pass
-/// through unchanged.
-fn percent_decode(s: &str) -> String {
+/// Decode `%XX` escapes; bytes that are not valid escapes pass through unchanged.
+/// The inverse of [`percent_encode_strict`], and also used to decode OSC 7 paths.
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -186,6 +205,32 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+/// Percent-encode every byte outside the RFC 3986 unreserved set (`A-Za-z0-9` and
+/// `-._~`). Strict on purpose: the completion framing bytes `;`, `,`, `%`, the OSC
+/// terminators, spaces, and all non-ASCII bytes are escaped, so an encoded field
+/// is a single token safe to drop into an OSC payload or a shell word.
+pub(crate) fn percent_encode_strict(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(hex_digit(b >> 4));
+            out.push(hex_digit(b & 0x0f));
+        }
+    }
+    out
+}
+
+/// The uppercase hex digit for a nibble `0..=15`.
+fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        _ => (b'A' + (n - 10)) as char,
     }
 }
 
@@ -314,5 +359,75 @@ mod tests {
         // `ESC ]` while mid-OSC discards the partial and begins fresh.
         let out = markers(b"\x1b]garbage\x1b]133;B\x07");
         assert_eq!(out, vec![Marker::Semantic(SemanticKind::PromptEnd)]);
+    }
+
+    #[test]
+    fn parses_a_completion_response_round_trip() {
+        use crate::completion::{encode_response, CompletionItem, CompletionResponse};
+        let res = CompletionResponse {
+            replace_start: 4,
+            replace_end: 7,
+            items: vec![
+                CompletionItem { value: "checkout".into(), description: Some("switch".into()) },
+                CompletionItem { value: "cherry-pick".into(), description: None },
+            ],
+        };
+        // The scanner frames the emitted OSC and surfaces the parsed response.
+        assert_eq!(markers(&encode_response(&res)), vec![Marker::Completion(res)]);
+    }
+
+    #[test]
+    fn a_large_completion_response_within_the_bigger_cap_is_recognized() {
+        use crate::completion::{encode_response, CompletionItem, CompletionResponse};
+        // ~200 candidates: well past the general OSC cap, under the completion cap.
+        // A non-completion OSC this long would be abandoned (see below).
+        let items = (0..200)
+            .map(|i| CompletionItem {
+                value: format!("candidate-number-{i:04}-with-some-length"),
+                description: Some("a description that adds bytes".into()),
+            })
+            .collect();
+        let res = CompletionResponse { replace_start: 0, replace_end: 3, items };
+        let bytes = encode_response(&res);
+        assert!(bytes.len() > MAX_OSC, "the payload exceeds the general cap");
+        assert!(bytes.len() <= MAX_COMPLETION_OSC, "but stays within the completion cap");
+        assert_eq!(markers(&bytes), vec![Marker::Completion(res)]);
+    }
+
+    #[test]
+    fn a_completion_response_past_the_bigger_cap_is_abandoned() {
+        // The response prefix followed by enough bytes to blow the completion cap
+        // is dropped rather than buffered without bound — no marker, no panic.
+        let mut bytes = b"\x1b]5379;res;0;0".to_vec();
+        bytes.extend(std::iter::repeat_n(b';', MAX_COMPLETION_OSC + 16));
+        bytes.extend_from_slice(b"\x1b\\");
+        assert!(markers(&bytes).is_empty());
+    }
+
+    #[test]
+    fn a_general_osc_is_still_capped_at_max_osc() {
+        // A valid-but-over-long OSC 7 is abandoned at the general cap, so it yields
+        // no marker — proving the bigger cap is gated on the completion prefix, not
+        // applied to every OSC.
+        let mut bytes = b"\x1b]7;file://h/".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', MAX_OSC));
+        bytes.extend_from_slice(b"\x1b\\");
+        assert!(markers(&bytes).is_empty(), "an over-long OSC 7 is dropped, not parsed");
+    }
+
+    #[test]
+    fn a_completion_response_split_across_chunks_is_recognized() {
+        use crate::completion::{encode_response, CompletionItem, CompletionResponse};
+        let res = CompletionResponse {
+            replace_start: 1,
+            replace_end: 2,
+            items: vec![CompletionItem { value: "value".into(), description: None }],
+        };
+        let bytes = encode_response(&res);
+        let mut s = Scanner::new();
+        let mid = bytes.len() / 2;
+        assert!(s.scan(&bytes[..mid]).is_empty(), "no marker before the terminator");
+        let hits: Vec<Marker> = s.scan(&bytes[mid..]).into_iter().map(|(_, m)| m).collect();
+        assert_eq!(hits, vec![Marker::Completion(res)]);
     }
 }

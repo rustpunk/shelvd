@@ -360,6 +360,9 @@ impl ApplicationHandler<UserEvent> for App {
                     let contents = read_clipboard(state, kind).unwrap_or_default();
                     state.terminal.provide_clipboard(&contents);
                 }
+                // Surfaced for the owned editor's completion menu; no consumer
+                // wires these up yet, so they are ignored here for now.
+                TermEvent::Completion(_) => {}
                 TermEvent::Bell | TermEvent::Wakeup
                 | TermEvent::MouseCursorDirty | TermEvent::WorkingDirectory(_) => {}
             }

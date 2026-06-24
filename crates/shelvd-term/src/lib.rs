@@ -25,9 +25,14 @@ use shelvd_core::{
 };
 
 mod block;
+mod completion;
 mod osc133;
 
 pub use block::{Block, BlockState};
+pub use completion::{
+    encode_request, encode_response, parse_request, CompletionItem, CompletionRequest,
+    CompletionResponse,
+};
 pub use osc133::SemanticKind;
 use osc133::{Marker, Scanner};
 
@@ -63,6 +68,9 @@ pub enum TermEvent {
     SemanticPrompt { kind: SemanticKind, line: i64 },
     /// The shell reported its working directory (OSC 7).
     WorkingDirectory(String),
+    /// A completion responder answered with candidates (private OSC 5379), for
+    /// the owned editor's completion menu.
+    Completion(CompletionResponse),
     /// The child process exited.
     Exit,
 }
@@ -424,17 +432,18 @@ impl Terminal {
     /// Act on a recognized shell-integration marker: update the block model and
     /// emit the marker on the event channel.
     fn on_marker(&mut self, marker: Marker) {
-        // Every shell-integration marker — semantic prompt or cwd — flows through
-        // here, so this is the choke point that latches integration-present.
-        self.seen_marker = true;
         match marker {
             Marker::Semantic(kind) => {
+                // A prompt marker latches integration-present; this and the cwd
+                // arm are the choke point for that signal.
+                self.seen_marker = true;
                 let line = self.absolute_cursor_line();
                 let col = self.term.grid().cursor.point.column.0;
                 self.apply_semantic(&kind, line, col);
                 let _ = self.tx.send(TermEvent::SemanticPrompt { kind, line });
             }
             Marker::Cwd(path) => {
+                self.seen_marker = true;
                 // Attach to the current block if it lacks one; stash for the next.
                 if let Some(b) = self.blocks.last_mut() {
                     if b.cwd.is_none() {
@@ -443,6 +452,13 @@ impl Terminal {
                 }
                 self.pending_cwd = Some(path.clone());
                 let _ = self.tx.send(TermEvent::WorkingDirectory(path));
+            }
+            Marker::Completion(response) => {
+                // A completion response is request-driven payload, not a prompt
+                // boundary, so it neither touches the block model nor latches
+                // integration-present (a prompt marker already did, before the
+                // request that prompted this reply). Just hand it to the app.
+                let _ = self.tx.send(TermEvent::Completion(response));
             }
         }
     }
@@ -2085,6 +2101,29 @@ mod tests {
         t.process(b"\x1b]52;c;?\x07");
         let load = t.events().try_iter().find(|e| matches!(e, TermEvent::ClipboardLoad(_)));
         assert!(load.is_none(), "read must be denied unless opted in");
+    }
+
+    #[test]
+    fn completion_response_surfaces_as_an_event_without_latching_integration() {
+        let mut t = terminal(20, 3);
+        let res = CompletionResponse {
+            replace_start: 4,
+            replace_end: 7,
+            items: vec![
+                CompletionItem { value: "checkout".into(), description: Some("switch".into()) },
+                CompletionItem { value: "cherry".into(), description: None },
+            ],
+        };
+        t.process(&encode_response(&res));
+
+        let got = t.events().try_iter().find_map(|e| match e {
+            TermEvent::Completion(r) => Some(r),
+            _ => None,
+        });
+        assert_eq!(got, Some(res), "the parsed response reaches the app as an event");
+        // A completion response is request-driven payload, not a prompt marker, so
+        // it must not flip the integration-present latch on its own.
+        assert!(!t.shell_integration(), "a completion reply alone is not a prompt marker");
     }
 
     #[test]
