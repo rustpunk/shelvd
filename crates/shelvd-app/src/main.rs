@@ -6,6 +6,7 @@
 //! back to the PTY. The PTY reader thread wakes the loop through an
 //! [`EventLoopProxy`].
 
+mod completion;
 mod overlay;
 
 use std::borrow::Cow;
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use shelvd_core::{Config, OverlayColors, ResizeEdge, Rgba, TitlebarHit};
-use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
+use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize, ShellKind};
 use shelvd_render::Renderer;
 use shelvd_term::{
     BandState, ClipboardKind, CompletionResponse, SemanticKind, TermEvent, Terminal,
@@ -1290,14 +1291,19 @@ fn handle_owned_key(state: &mut State, event: &KeyEvent) {
             }
         }
         Key::Named(NamedKey::Tab) => {
-            // Hand the half-typed line to readline without running it (no `\r`),
-            // then yield: readline drives the line — completion and all — until the
-            // next prompt clears `yield_to_readline`.
-            let pending = state.input.take();
-            if let Err(e) = state.pty.write(pending.as_bytes()) {
-                log::debug!("owned tab-flush failed: {e}");
+            // Tab requests completion. When the shell is fish and its engine
+            // returns candidates, open the menu over the owned line. Otherwise hand
+            // the half-typed line to readline without running it (no `\r`) and yield
+            // until the next prompt, so readline's own Tab-completion still works.
+            let opened =
+                state.pty.shell_kind() == ShellKind::Fish && try_open_fish_completion(state);
+            if !opened {
+                let pending = state.input.take();
+                if let Err(e) = state.pty.write(pending.as_bytes()) {
+                    log::debug!("owned tab-flush failed: {e}");
+                }
+                state.yield_to_readline = true;
             }
-            state.yield_to_readline = true;
         }
         Key::Named(NamedKey::Backspace) => state.input.backspace(),
         Key::Named(NamedKey::Delete) => state.input.delete(),
@@ -1363,6 +1369,20 @@ fn open_completion_overlay(state: &mut State, response: CompletionResponse) {
     state.selecting = false; // drop any in-progress drag
     state.overlay =
         Some(OverlayState::completion(items, response.replace_start, response.replace_end));
+}
+
+/// Fetch fish completions for the owned line and open the menu if any came back.
+/// Returns whether the menu opened, so the caller skips the readline fallback only
+/// when shelvd actually has candidates to show. Runs a one-shot `fish -c` (~40 ms)
+/// synchronously — acceptable for a deliberate Tab press.
+fn try_open_fish_completion(state: &mut State) -> bool {
+    let line = state.input.text().to_owned();
+    let cursor = state.input.caret_byte();
+    let Some(response) = completion::fish_complete(&line, cursor) else {
+        return false;
+    };
+    open_completion_overlay(state, response);
+    state.overlay.is_some()
 }
 
 /// Recent command strings, most recent first, deduplicated.

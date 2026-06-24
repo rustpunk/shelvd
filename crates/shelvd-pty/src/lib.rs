@@ -91,6 +91,8 @@ pub struct Pty {
     /// Temp dir holding the generated shell-integration init files, removed on
     /// drop.
     integration_dir: Option<PathBuf>,
+    /// The classified shell, for per-shell completion routing.
+    kind: ShellKind,
 }
 
 impl Pty {
@@ -121,9 +123,12 @@ impl Pty {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "shelvd");
 
+        // Classify the shell once, for both integration injection and per-shell
+        // completion routing.
+        let kind = shell.as_deref().map(ShellKind::detect).unwrap_or(ShellKind::Other);
+
         // Auto-inject shell integration unless the caller supplied its own args.
         let integration_dir = if opts.shell_integration && opts.args.is_empty() {
-            let kind = shell.as_deref().map(ShellKind::detect).unwrap_or(ShellKind::Other);
             inject_integration(&mut cmd, kind).unwrap_or_else(|e| {
                 log::debug!("shell integration injection skipped: {e}");
                 None
@@ -170,7 +175,21 @@ impl Pty {
                 notify();
             })?;
 
-        Ok(Self { master: pair.master, writer, rx, child, reader: Some(reader), integration_dir })
+        Ok(Self {
+            master: pair.master,
+            writer,
+            rx,
+            child,
+            reader: Some(reader),
+            integration_dir,
+            kind,
+        })
+    }
+
+    /// The classified shell behind this PTY — the routing key for per-shell
+    /// completion (the app fetches candidates from the matching engine).
+    pub fn shell_kind(&self) -> ShellKind {
+        self.kind
     }
 
     /// Non-blocking receiver of reader-thread messages.
@@ -235,9 +254,10 @@ impl Drop for Pty {
     }
 }
 
-/// The shells whose integration shelvd can auto-inject.
+/// The shells whose integration shelvd can auto-inject — also the routing key for
+/// per-shell completion (the app fetches candidates from the matching engine).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ShellKind {
+pub enum ShellKind {
     Bash,
     Zsh,
     Fish,
