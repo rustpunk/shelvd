@@ -802,6 +802,14 @@ impl Terminal {
     /// Fill in per-row block decoration, the sticky header, and resolve the
     /// block colors from the palette (color resolution stays in this crate).
     fn decorate(&self, snap: &mut GridSnapshot, offset: i32, shift: i32) {
+        // The alt screen is a full-screen app's own buffer; block decoration is a
+        // primary-grid concept. Without this guard the blocks' absolute lines map
+        // onto the alt-screen rows, washing a failed command's red stripe/tint
+        // across e.g. vim. Mirrors `display_shift_with`/`input_band_rows`, which
+        // also bail on the alt screen.
+        if self.alt_screen() {
+            return;
+        }
         snap.block_stripe = self.palette.indexed(9); // bright red
         let red = self.palette.indexed(1);
         snap.block_tint = Rgba::new(red.r, red.g, red.b, 30); // subtle wash
@@ -1076,7 +1084,9 @@ impl Terminal {
     /// from suppressing relocation of the next resting prompt — the app owns the
     /// input only within post-`B`/pre-`C`, which is exactly `prompt_editing()`.
     fn relocate_resting_input(&self) -> bool {
-        !self.command_running() && !(self.owned_editing && self.prompt_editing())
+        // Relocate unless a command is running or the app owns the live input
+        // window (the De Morgan of "not running ∧ not owned-and-editing").
+        !(self.command_running() || (self.owned_editing && self.prompt_editing()))
     }
 
     /// Whether the live edge sits in the owned-editing window: the command-start
@@ -1312,6 +1322,15 @@ impl Terminal {
         if self.dims.rows <= 1 || self.is_scrolled() || self.alt_screen() {
             return 0;
         }
+        // A running command that turned terminal echo off is reading an inline
+        // secret (a `sudo`/`ssh` password prompt). The type-ahead band would lead
+        // with the stale prompt prefix and pull the cursor down into the strip,
+        // detaching it from the program's prompt; suppress it so the grid cursor
+        // renders in place, like a conventional terminal. `masked` is the app's
+        // live echo signal, refreshed before every frame.
+        if self.command_running() && self.band.masked {
+            return 0;
+        }
         // The input line — the running type-ahead field (one row), or the relocated
         // resting prompt, which is as tall as its (soft-wrapped) logical input.
         let max_total = (self.dims.rows as i32 - 1).max(1);
@@ -1401,7 +1420,11 @@ impl Terminal {
     }
 
     /// The typed input as it is rendered into the band: the text itself, or one
-    /// bullet per character when masked (no-echo). Borrows when unmasked.
+    /// bullet per character when masked (no-echo). Borrows when unmasked. A
+    /// no-echo running command normally suppresses the band outright (see
+    /// [`Self::input_band_rows`]), so the masked branch is a defensive fallback —
+    /// it guarantees a secret is never shown verbatim even if the band is ever
+    /// painted while echo is off.
     fn band_input_source(&self) -> std::borrow::Cow<'_, str> {
         if self.band.masked {
             std::borrow::Cow::Owned("\u{2022}".repeat(self.band.input.chars().count()))
@@ -2556,6 +2579,58 @@ mod tests {
     }
 
     #[test]
+    fn alt_screen_suppresses_block_decoration() {
+        let mut t = terminal(40, 6);
+        // A cancelled/failed command leaves a red-decorated block on the primary
+        // grid (cf. `sudo true` interrupted with Ctrl-C).
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07boom\r\n\x1b]133;C\x07err\r\n\x1b]133;D;130\x07");
+        let primary = t.snapshot();
+        assert!(
+            primary.rows_decor.iter().any(|d| d.failed && d.block_id != 0),
+            "the failed block decorates the primary grid"
+        );
+
+        // A full-screen app takes over the alternate screen.
+        t.process(b"\x1b[?1049h");
+        assert!(t.alt_screen());
+        let snap = t.snapshot();
+        assert!(
+            snap.rows_decor.iter().all(|d| d.block_id == 0 && !d.failed),
+            "no primary-grid block decoration bleeds onto the alt screen"
+        );
+        assert!(snap.sticky.is_none(), "no sticky header on the alt screen");
+    }
+
+    #[test]
+    fn no_echo_prompt_suppresses_the_band_and_keeps_the_cursor_inline() {
+        let mut t = terminal(40, 6);
+        // A running command that prompts inline (B..C reached, output started, no D
+        // yet) — e.g. `sudo` asking for a password.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sudo true\r\n\x1b]133;C\x07[sudo] password: ");
+        assert!(t.command_running(), "the command is still running");
+
+        // Echo on: the type-ahead band is present (baseline).
+        t.set_band(band("", &[]));
+        assert_eq!(
+            t.snapshot().input_band_rows,
+            1,
+            "an echo-on running command shows the type-ahead band"
+        );
+
+        // Echo off (password prompt): the app masks the band.
+        let mut masked = band("", &[]);
+        masked.masked = true;
+        t.set_band(masked);
+        let snap = t.snapshot();
+        assert_eq!(snap.input_band_rows, 0, "the band is suppressed at a no-echo prompt");
+        let cur = snap.cursor.expect("an inline cursor at the prompt");
+        assert!(
+            row_text(&snap, cur.row).contains("password"),
+            "the cursor shares the prompt's row instead of sitting in a bottom band"
+        );
+    }
+
+    #[test]
     fn second_prompt_closes_the_first_block() {
         let mut t = terminal(40, 12);
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07a\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
@@ -3019,10 +3094,14 @@ mod tests {
     }
 
     #[test]
-    fn masked_band_hides_typed_input_behind_bullets() {
+    fn masked_running_band_is_suppressed_so_the_secret_never_shows() {
         let mut t = terminal(40, 6);
         // A running command (e.g. `sudo`) that turned echo off to read a secret.
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sudo true\r\n\x1b]133;C\x07");
+        // Even if a secret somehow reached the band buffer, a no-echo running
+        // prompt suppresses the band entirely (the cursor renders inline instead),
+        // so the secret never reaches any bottom strip — neither verbatim nor as
+        // bullets.
         t.set_band(BandState {
             input: "hunter2".to_owned(),
             queued: Vec::new(),
@@ -3031,17 +3110,15 @@ mod tests {
             caret: UnicodeWidthStr::width("hunter2"),
         });
         let snap = t.snapshot();
-        let last = snap.rows - 1;
-        let line = row_text(&snap, last);
-        assert!(line.starts_with("$ "), "the prompt prefix is still shown: {line:?}");
-        assert!(!line.contains("hunter2"), "the secret never reaches the screen: {line:?}");
-        // One bullet per typed character, and nothing but bullets after the prefix.
-        let bullets = line.chars().filter(|&c| c == '\u{2022}').count();
-        assert_eq!(bullets, "hunter2".chars().count(), "one bullet per typed char");
-        // The beam caret still trails the masked text (prompt "$ " = 2 cols + 7).
-        let cur = snap.cursor.expect("a caret in the band");
-        assert_eq!(cur.row, last);
-        assert_eq!(cur.col, 9, "the caret rests past the prompt and the masked text");
+        assert_eq!(snap.input_band_rows, 0, "the band is suppressed at a no-echo prompt");
+        for row in 0..snap.rows {
+            let line = row_text(&snap, row);
+            assert!(!line.contains("hunter2"), "the secret never reaches the screen: {line:?}");
+            assert!(
+                !line.contains('\u{2022}'),
+                "no masked bottom field is drawn either: {line:?}"
+            );
+        }
     }
 
     #[test]
