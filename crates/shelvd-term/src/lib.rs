@@ -458,10 +458,19 @@ impl Terminal {
                 self.blocks.push(Block::new(id, line, cwd));
             }
             SemanticKind::PromptEnd => {
+                // Capture the prompt prefix (the columns before the command on the
+                // prompt row) at B, where `col` already marks its width and the
+                // prefix is fully drawn. The owned-editor band edits in the
+                // post-B/pre-C window — before OutputStart/C, where the prefix is
+                // otherwise first captured — so without this the owned band shows
+                // no prompt. OutputStart re-captures it as the authoritative final
+                // value (the prefix is unchanged B..C, so they agree).
+                let prompt_prefix = self.capture_row_cells(line, col);
                 if let Some(b) = self.blocks.last_mut() {
                     b.command_line = line;
                     b.command_col = col;
                     b.command_started = true;
+                    b.prompt_prefix = prompt_prefix;
                 }
             }
             SemanticKind::OutputStart => {
@@ -3091,6 +3100,25 @@ mod tests {
         // Caret after the prompt ("$ " = 2 cols) plus the typed text ("echo hi" = 7).
         assert_eq!(cur.col, 9, "the caret rests past the prompt and the typed text");
         assert_eq!(cur.shape, CursorShape::Beam, "a beam reads as a text-insertion point");
+    }
+
+    #[test]
+    fn owned_band_shows_the_prompt_prefix_before_output_start() {
+        let mut t = terminal(40, 6);
+        // Post-B / pre-C: the prompt is drawn and input begins, but no command has
+        // been submitted (no OutputStart/C yet) — the owned-editing window.
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(t.prompt_editing(), "in the post-B/pre-C editing window");
+        // The app owns the input here (Approach O).
+        t.set_owned_editing(true);
+        t.set_band(band("echo hi", &[]));
+        let snap = t.snapshot();
+        let last = snap.rows - 1;
+        let line = row_text(&snap, last);
+        // The prefix is captured at B, so it leads the owned band before C — the
+        // owned prompt no longer renders bare.
+        assert!(line.starts_with("$ "), "the prompt prefix leads the owned band before C: {line:?}");
+        assert!(line.contains("echo hi"), "the typed text follows the prefix: {line:?}");
     }
 
     #[test]
