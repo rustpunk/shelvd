@@ -32,10 +32,15 @@ use winit::window::{ResizeDirection, Window, WindowId};
 use overlay::{key_to_action, Action, BandInput, OverlayState};
 
 /// Events delivered to the loop from other threads.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum UserEvent {
     /// The PTY reader thread has new output (or the child exited).
     PtyReadable,
+    /// A completion worker finished. `generation` ties the result to the request
+    /// that spawned it, so a stale answer (the owned line changed, or a new prompt
+    /// arrived, since the request) is dropped instead of opening a wrong menu.
+    /// `None` means the engine found nothing — the caller falls back to readline.
+    CompletionReady { generation: u64, response: Option<CompletionResponse> },
 }
 
 /// How long each cursor blink phase (visible, then hidden) lasts.
@@ -98,6 +103,13 @@ struct App {
 
 struct State {
     window: Arc<Window>,
+    /// Handle for posting [`UserEvent`]s back to the loop from worker threads —
+    /// completion runs off-thread and delivers its result this way.
+    proxy: EventLoopProxy<UserEvent>,
+    /// Monotonic id bumped on every owned-editor keypress and every fresh prompt.
+    /// A completion request captures the current value; a result is applied only if
+    /// the counter still matches (otherwise the line moved on — drop the answer).
+    completion_gen: u64,
     renderer: Renderer,
     terminal: Terminal,
     pty: Pty,
@@ -253,6 +265,8 @@ impl ApplicationHandler<UserEvent> for App {
         window.request_redraw();
         self.state = Some(State {
             window,
+            proxy: self.proxy.clone(),
+            completion_gen: 0,
             renderer,
             terminal,
             pty,
@@ -284,7 +298,15 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::PtyReadable = event;
+        // A completion worker reported back: apply it (if still current) and stop.
+        if let UserEvent::CompletionReady { generation, response } = event {
+            if let Some(state) = self.state.as_mut() {
+                apply_completion_result(state, generation, response);
+                state.window.request_redraw();
+            }
+            return;
+        }
+        // Otherwise the PTY reader woke us: drain output and terminal side effects.
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -1280,6 +1302,9 @@ fn handle_band_key(state: &mut State, event: &KeyEvent) {
 /// move/delete within the line. Control/Alt combos never reach here (the gate
 /// excludes them), so SIGINT, Ctrl-R and friends still pass raw to the PTY.
 fn handle_owned_key(state: &mut State, event: &KeyEvent) {
+    // Any owned-editor keypress invalidates an in-flight completion: editing,
+    // navigating, or running the line all make a pending result stale.
+    state.completion_gen = state.completion_gen.wrapping_add(1);
     match &event.logical_key {
         Key::Named(NamedKey::Enter) => {
             // Send the whole owned line, then a carriage return to run it. take()
@@ -1291,12 +1316,14 @@ fn handle_owned_key(state: &mut State, event: &KeyEvent) {
             }
         }
         Key::Named(NamedKey::Tab) => {
-            // Tab requests completion. When the shell has a cold completion engine
-            // (fish/bash) and it returns candidates, open the menu over the owned
-            // line. Otherwise hand the half-typed line to readline without running
-            // it (no `\r`) and yield until the next prompt, so readline's own
-            // Tab-completion still works.
-            if !try_open_completion(state) {
+            // Tab requests completion. Shells with a cold engine (fish/bash/zsh)
+            // run it on a worker thread so the event loop never blocks; the result
+            // arrives as `UserEvent::CompletionReady` and either opens the menu or
+            // falls back to readline (see `apply_completion_result`). Shells without
+            // an engine fall back immediately: hand the half-typed line to readline
+            // without running it (no `\r`) and yield until the next prompt, so
+            // readline's own Tab-completion still works.
+            if !spawn_completion(state) {
                 let pending = state.input.take();
                 if let Err(e) = state.pty.write(pending.as_bytes()) {
                     log::debug!("owned tab-flush failed: {e}");
@@ -1331,6 +1358,8 @@ fn handle_owned_key(state: &mut State, event: &KeyEvent) {
 fn on_prompt_start(state: &mut State) {
     // A fresh prompt resumes owning: any Tab-yield to readline ends with the line.
     state.yield_to_readline = false;
+    // A new prompt makes any in-flight completion's context stale; invalidate it.
+    state.completion_gen = state.completion_gen.wrapping_add(1);
     if let Some(cmd) = state.queue.pop_front() {
         let mut bytes = cmd.into_bytes();
         bytes.push(b'\r'); // type the command and run it
@@ -1370,26 +1399,59 @@ fn open_completion_overlay(state: &mut State, response: CompletionResponse) {
         Some(OverlayState::completion(items, response.replace_start, response.replace_end));
 }
 
-/// Fetch owned-editor completions for the live shell and open the menu if any
-/// came back. Returns whether the menu opened, so the caller skips the readline
-/// fallback only when shelvd actually has candidates to show. Routes by shell
-/// kind to the matching cold engine; a shell without one (`Other`) returns `false`
-/// and falls through to readline. Runs a one-shot subshell (~tens of ms)
-/// synchronously — acceptable for a deliberate Tab press.
-fn try_open_completion(state: &mut State) -> bool {
+/// Kick off completion for the owned line on a worker thread, delivering the
+/// result as [`UserEvent::CompletionReady`] tagged with the current generation.
+/// Returns whether an engine was dispatched: `true` for fish/bash/zsh (the caller
+/// then waits for the async result), `false` for shells without one (the caller
+/// falls back to readline immediately). Off-thread so a slow or wedged completion
+/// never blocks the event loop — the in-engine [`completion`] timeout is now only a
+/// resource backstop.
+fn spawn_completion(state: &State) -> bool {
+    let kind = state.pty.shell_kind();
+    if !matches!(kind, ShellKind::Fish | ShellKind::Bash | ShellKind::Zsh) {
+        return false;
+    }
     let line = state.input.text().to_owned();
     let cursor = state.input.caret_byte();
-    let response = match state.pty.shell_kind() {
-        ShellKind::Fish => completion::fish_complete(&line, cursor),
-        ShellKind::Bash => completion::bash_complete(&line, cursor),
-        ShellKind::Zsh => completion::zsh_complete(&line, cursor),
-        ShellKind::Other => None,
-    };
-    let Some(response) = response else {
-        return false;
-    };
-    open_completion_overlay(state, response);
-    state.overlay.is_some()
+    let generation = state.completion_gen;
+    let proxy = state.proxy.clone();
+    std::thread::spawn(move || {
+        let response = match kind {
+            ShellKind::Fish => completion::fish_complete(&line, cursor),
+            ShellKind::Bash => completion::bash_complete(&line, cursor),
+            ShellKind::Zsh => completion::zsh_complete(&line, cursor),
+            ShellKind::Other => None,
+        };
+        let _ = proxy.send_event(UserEvent::CompletionReady { generation, response });
+    });
+    true
+}
+
+/// Apply a completion worker's result on the loop thread. Dropped when stale —
+/// the owned line changed or a new prompt arrived since the request (generation
+/// mismatch), or owned editing is no longer in effect. A live `Some` opens the
+/// menu; a live `None` performs the deferred readline fallback (the same hand-off
+/// the synchronous path used to do inline), so readline's own completion still runs
+/// when shelvd's engine had nothing.
+fn apply_completion_result(
+    state: &mut State,
+    generation: u64,
+    response: Option<CompletionResponse>,
+) {
+    if generation != state.completion_gen || !state.owned_editor {
+        return;
+    }
+    match response {
+        Some(response) => open_completion_overlay(state, response),
+        None => {
+            let pending = state.input.take();
+            if let Err(e) = state.pty.write(pending.as_bytes()) {
+                log::debug!("owned tab-flush failed: {e}");
+            }
+            state.yield_to_readline = true;
+            sync_band(state);
+        }
+    }
 }
 
 /// Recent command strings, most recent first, deduplicated.

@@ -24,10 +24,13 @@ use std::time::{Duration, Instant};
 
 use shelvd_term::{CompletionItem, CompletionResponse};
 
-/// Wall-clock cap for a completion subprocess. A deliberate Tab press easily
-/// tolerates a few hundred ms; the cap exists only so a wedged shell or a
-/// pathological completion function can never freeze the owned editor.
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Wall-clock backstop for a completion subprocess. The engines run on a worker
+/// thread (the caller delivers the result asynchronously), so this no longer gates
+/// UI responsiveness — a legitimately slow completion (a networked CLI, a cold
+/// `compinit`) returns late rather than being clipped. The cap exists only so a
+/// truly wedged shell can't leak a thread and subprocess forever; a request the
+/// user has already moved past is discarded by generation regardless.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run `cmd` and return its stdout, killing the child and returning `None` if it
 /// does not finish within `timeout`. A reader thread drains stdout so a chatty
