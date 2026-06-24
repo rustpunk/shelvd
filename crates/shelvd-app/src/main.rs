@@ -657,9 +657,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // Ctrl+Shift+Enter — handled above — queues it) instead of leaking
                 // raw into the output. Control/Alt combos still pass straight
                 // through, so Ctrl+C and friends can signal the command. The alt
-                // screen is exempt — full-screen apps own all input there.
+                // screen is exempt — full-screen apps own all input there. So is a
+                // no-echo prompt (a `sudo`/`ssh` password): there the band is
+                // suppressed and the cursor renders inline, so keystrokes fall
+                // through to the normal PTY path — typed straight to the program,
+                // never buffered in the band where the secret would linger.
                 if state.terminal.command_running()
                     && !state.terminal.alt_screen()
+                    && state.pty.echo_enabled()
                     && !mods.control_key()
                     && !mods.alt_key()
                 {
@@ -703,6 +708,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // Refresh the band from live state before snapshotting. A running
+                // command can flip terminal echo (e.g. a `sudo` password prompt)
+                // via output alone, with no keystroke to trigger a band sync, so
+                // `masked` would otherwise stay stale and the band would not
+                // suppress in time. Cheap and idempotent; keeps the rendered frame
+                // derived from current echo/input state.
+                sync_band(state);
                 let mut snapshot = state.terminal.snapshot();
                 // Honor the blink phase: while focused and the program asked for
                 // a blinking cursor, drop the cursor on the "off" phase.
