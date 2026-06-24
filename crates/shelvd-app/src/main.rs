@@ -17,7 +17,9 @@ use arboard::Clipboard;
 use shelvd_core::{Config, OverlayColors, ResizeEdge, Rgba, TitlebarHit};
 use shelvd_pty::{Pty, PtyMsg, PtyOptions, PtySize};
 use shelvd_render::Renderer;
-use shelvd_term::{BandState, ClipboardKind, SemanticKind, TermEvent, Terminal};
+use shelvd_term::{
+    BandState, ClipboardKind, CompletionResponse, SemanticKind, TermEvent, Terminal,
+};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -360,9 +362,12 @@ impl ApplicationHandler<UserEvent> for App {
                     let contents = read_clipboard(state, kind).unwrap_or_default();
                     state.terminal.provide_clipboard(&contents);
                 }
-                // Surfaced for the owned editor's completion menu; no consumer
-                // wires these up yet, so they are ignored here for now.
-                TermEvent::Completion(_) => {}
+                // A responder answered with candidates: open the completion menu
+                // over the owned line.
+                TermEvent::Completion(response) => {
+                    open_completion_overlay(state, response);
+                    dirty = true;
+                }
                 TermEvent::Bell | TermEvent::Wakeup
                 | TermEvent::MouseCursorDirty | TermEvent::WorkingDirectory(_) => {}
             }
@@ -1127,12 +1132,17 @@ fn handle_overlay_key(state: &mut State, event_loop: &ActiveEventLoop, event: &K
     }
 
     // Everything else edits the live overlay; bind it mutably just once.
+    let shift = state.modifiers.shift_key();
     let Some(o) = state.overlay.as_mut() else {
         return;
     };
     match &event.logical_key {
         Key::Named(NamedKey::ArrowUp) => o.move_selection(-1),
         Key::Named(NamedKey::ArrowDown) => o.move_selection(1),
+        // In the completion menu, Tab / Shift+Tab cycle candidates (Enter accepts).
+        Key::Named(NamedKey::Tab) if o.is_completion() => {
+            o.move_selection(if shift { -1 } else { 1 });
+        }
         Key::Named(NamedKey::Backspace) => o.backspace(),
         Key::Named(NamedKey::Space) => o.input_char(' '),
         Key::Character(s) => {
@@ -1183,6 +1193,13 @@ fn run_action(state: &mut State, event_loop: &ActiveEventLoop, action: Action) {
             if !line.trim().is_empty() {
                 state.queue.push_back(line);
             }
+            sync_band(state);
+        }
+        Action::CompleteWord { value, replace_start, replace_end } => {
+            // Accept a completion into the owned line: replace the in-progress word
+            // with the candidate, then re-sync the band so it redraws the edit.
+            state.input.splice(replace_start, replace_end, &value);
+            state.terminal.scroll_to_bottom();
             sync_band(state);
         }
     }
@@ -1332,6 +1349,20 @@ fn open_history(state: &mut State) {
     let commands = history_commands(&state.terminal);
     state.selecting = false; // drop any in-progress drag
     state.overlay = Some(OverlayState::history(commands));
+}
+
+/// Open the completion menu from a responder's candidates (private OSC 5379).
+/// Only the owned editor can accept a candidate (it splices into shelvd's local
+/// line), so a response is ignored unless owned editing is on; an empty candidate
+/// list opens nothing.
+fn open_completion_overlay(state: &mut State, response: CompletionResponse) {
+    if !state.owned_editor || response.items.is_empty() {
+        return;
+    }
+    let items = response.items.into_iter().map(|i| (i.value, i.description));
+    state.selecting = false; // drop any in-progress drag
+    state.overlay =
+        Some(OverlayState::completion(items, response.replace_start, response.replace_end));
 }
 
 /// Recent command strings, most recent first, deduplicated.

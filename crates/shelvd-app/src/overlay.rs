@@ -37,6 +37,11 @@ pub enum Action {
     Quit,
     /// Write this command into the PTY's input line (a history pick).
     InsertCommand(String),
+    /// Accept a completion candidate: splice `value` over the owned line's byte
+    /// range `replace_start..replace_end` (the in-progress word). Unlike
+    /// [`InsertCommand`](Action::InsertCommand), this edits shelvd's local buffer,
+    /// not the PTY — the owned editor holds the line.
+    CompleteWord { value: String, replace_start: usize, replace_end: usize },
     /// Add the band's current input to the type-ahead queue, to run on the next
     /// prompt (the global "queue this command" action).
     QueueInput,
@@ -290,6 +295,29 @@ impl InputLine {
     fn end(&mut self) {
         self.caret = self.char_len();
     }
+
+    /// Replace the byte range `start..end` with `text`, leaving the caret just
+    /// past the inserted text — accepting a completion candidate over the
+    /// in-progress word. The offsets are snapped down to char boundaries and
+    /// clamped to the line, so a stale or mis-aligned range can never panic; a
+    /// degenerate `start == end` is a plain insertion.
+    fn splice(&mut self, start: usize, end: usize, text: &str) {
+        let start = floor_char_boundary(&self.text, start);
+        let end = floor_char_boundary(&self.text, end).max(start);
+        self.text.replace_range(start..end, text);
+        let caret_byte = start + text.len();
+        self.caret = self.text[..caret_byte].chars().count();
+    }
+}
+
+/// Largest char boundary `<= i` (and `<= s.len()`). A hand-rolled
+/// `str::floor_char_boundary`, which is still unstable.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// The band's input line: the next command being typed at the bottom while a
@@ -352,6 +380,12 @@ impl BandInput {
         self.line.end();
     }
 
+    /// Accept a completion candidate: replace the byte range `start..end` (the
+    /// in-progress word) with `value`, caret left just past it.
+    pub fn splice(&mut self, start: usize, end: usize, value: &str) {
+        self.line.splice(start, end, value);
+    }
+
     /// Display column the caret rests at, for placing the band's text cursor.
     pub fn caret_col(&self) -> usize {
         self.line.caret_col()
@@ -368,6 +402,7 @@ impl BandInput {
 enum Kind {
     Palette,
     History,
+    Completion,
 }
 
 struct Candidate {
@@ -426,6 +461,27 @@ impl OverlayState {
         Self::build(Kind::History, candidates)
     }
 
+    /// The completion menu: one row per candidate the shell's engine returned.
+    /// Every row accepts to the same owned-line byte range `replace_start..replace_end`
+    /// (the in-progress word), so picking any candidate replaces that word with its
+    /// `value`. `items` is `(value, description)` pairs, decoupled from the term
+    /// crate's response type — the caller maps the response into them.
+    pub fn completion(
+        items: impl IntoIterator<Item = (String, Option<String>)>,
+        replace_start: usize,
+        replace_end: usize,
+    ) -> Self {
+        let candidates = items
+            .into_iter()
+            .map(|(value, description)| {
+                let action =
+                    Action::CompleteWord { value: value.clone(), replace_start, replace_end };
+                Candidate::new(value, description.as_deref(), action)
+            })
+            .collect();
+        Self::build(Kind::Completion, candidates)
+    }
+
     fn build(kind: Kind, candidates: Vec<Candidate>) -> Self {
         let mut state = Self {
             kind,
@@ -464,6 +520,12 @@ impl OverlayState {
     pub fn selected_action(&self) -> Option<Action> {
         let idx = *self.filtered.get(self.selected)?;
         Some(self.candidates[idx].action.clone())
+    }
+
+    /// Whether this is the completion menu — the app binds Tab/Shift+Tab to cycle
+    /// candidates only here (the palette and history use the arrow keys).
+    pub fn is_completion(&self) -> bool {
+        self.kind == Kind::Completion
     }
 
     fn refilter(&mut self) {
@@ -527,6 +589,7 @@ impl OverlayState {
         let prompt = match self.kind {
             Kind::Palette => ">".to_owned(),
             Kind::History => "history".to_owned(),
+            Kind::Completion => "complete".to_owned(),
         };
         // Caret column = display width of "<prompt> <query>" (the renderer draws
         // the prompt, one space, then the query). Using display width — not a
@@ -922,5 +985,100 @@ mod tests {
             .unwrap();
         assert_eq!(copy_block.label, Some("Copy current block"));
         assert_eq!(copy_block.chord.unwrap().hint(), "Ctrl+Shift+X");
+    }
+
+    fn completion_value(action: Option<Action>) -> String {
+        match action {
+            Some(Action::CompleteWord { value, .. }) => value,
+            other => panic!("expected CompleteWord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_overlay_lists_candidates_and_cycles_like_the_others() {
+        let items = vec![
+            ("checkout".to_string(), Some("switch branches".to_string())),
+            ("cherry-pick".to_string(), None),
+            ("commit".to_string(), None),
+        ];
+        let mut c = OverlayState::completion(items, 4, 6);
+        assert!(c.is_completion());
+        assert_eq!(c.filtered.len(), 3, "every candidate is listed before any query");
+        // The first row carries the shared replacement range.
+        match c.selected_action() {
+            Some(Action::CompleteWord { value, replace_start, replace_end }) => {
+                assert_eq!((value.as_str(), replace_start, replace_end), ("checkout", 4, 6));
+            }
+            other => panic!("expected CompleteWord, got {other:?}"),
+        }
+        // Selection wraps both ways, like the palette/history overlays.
+        c.move_selection(-1);
+        assert_eq!(completion_value(c.selected_action()), "commit");
+        c.move_selection(1);
+        assert_eq!(completion_value(c.selected_action()), "checkout");
+    }
+
+    #[test]
+    fn completion_query_narrows_to_the_match() {
+        let items = vec![
+            ("checkout".to_string(), None),
+            ("commit".to_string(), None),
+            ("clone".to_string(), None),
+        ];
+        let mut c = OverlayState::completion(items, 0, 3);
+        for ch in "comm".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(completion_value(c.selected_action()), "commit");
+    }
+
+    #[test]
+    fn accepting_a_completion_replaces_the_word_not_appends() {
+        // "git co" with the in-progress word "co" spanning bytes 4..6.
+        let mut input = BandInput::default();
+        for ch in "git co".chars() {
+            input.input_char(ch);
+        }
+        input.splice(4, 6, "commit");
+        assert_eq!(input.text(), "git commit", "the word is replaced, not appended");
+        assert_eq!(input.caret_chars(), "git commit".chars().count(), "caret rests past the splice");
+    }
+
+    #[test]
+    fn splice_into_the_middle_keeps_the_tail() {
+        let mut input = BandInput::default();
+        for ch in "cd /us/bar".chars() {
+            input.input_char(ch);
+        }
+        // Replace "/us" (bytes 3..6) with "/usr"; the "/bar" tail survives.
+        input.splice(3, 6, "/usr");
+        assert_eq!(input.text(), "cd /usr/bar");
+        assert_eq!(input.caret_chars(), 7, "caret sits just past the inserted text");
+    }
+
+    #[test]
+    fn splice_clamps_an_out_of_range_end() {
+        let mut input = BandInput::default();
+        for ch in "ab".chars() {
+            input.input_char(ch);
+        }
+        // An end past the line is clamped to the line length rather than panicking.
+        input.splice(1, 99, "XYZ");
+        assert_eq!(input.text(), "aXYZ");
+        // A start at/past the end is a plain append.
+        input.splice(99, 99, "!");
+        assert_eq!(input.text(), "aXYZ!");
+    }
+
+    #[test]
+    fn splice_snaps_an_offset_inside_a_glyph_to_a_boundary() {
+        let mut input = BandInput::default();
+        for ch in "aéb".chars() {
+            input.input_char(ch); // é is two bytes, at byte offset 1..3
+        }
+        // Byte 2 is inside 'é'; a zero-width splice there snaps down to byte 1
+        // (before é) and inserts cleanly rather than panicking on a non-boundary.
+        input.splice(2, 2, "Z");
+        assert_eq!(input.text(), "aZéb");
     }
 }
