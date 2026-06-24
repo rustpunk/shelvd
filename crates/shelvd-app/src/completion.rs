@@ -5,17 +5,64 @@
 //! Each engine drives a **cold one-shot** subshell: **fish** via
 //! `fish -c "complete -C …"`, **bash** via a one-shot `bash -c` that loads the
 //! system completion infrastructure and replays the partial line through the
-//! registered compspec. Completion is Tab-triggered (a deliberate keypress), so a
-//! cold ~tens-of-ms invoke is imperceptible and avoids a persistent-subshell state
-//! machine; a warm/live path is a later optimization (#85) for full session-state
-//! fidelity. The zsh engine is a separate follow-up — the app routes by
+//! registered compspec, **zsh** via a one-shot `zsh` that hosts the real
+//! completion system inside a `zpty` child and captures its matches. Completion is
+//! Tab-triggered (a deliberate keypress), so a cold ~tens-of-ms invoke is
+//! imperceptible and avoids a persistent-subshell state machine; a warm/live path
+//! is a later optimization (#85) for full session-state fidelity. The app routes by
 //! [`shelvd_pty::ShellKind`], so a shell without a cold engine here simply gets no
 //! candidates and the caller falls back to readline.
+//!
+//! Every engine shells out under [`output_within_timeout`], so a wedged shell or a
+//! pathological completion function can never freeze the owned editor on Tab.
 
 use std::collections::HashSet;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use shelvd_term::{CompletionItem, CompletionResponse};
+
+/// Wall-clock cap for a completion subprocess. A deliberate Tab press easily
+/// tolerates a few hundred ms; the cap exists only so a wedged shell or a
+/// pathological completion function can never freeze the owned editor.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Run `cmd` and return its stdout, killing the child and returning `None` if it
+/// does not finish within `timeout`. A reader thread drains stdout so a chatty
+/// child can't deadlock against a full pipe while the timer runs. `None` also
+/// covers a failed spawn (shell absent) or a non-zero exit — every caller then
+/// falls back to readline.
+fn output_within_timeout(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child =
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    // Drain stdout on a thread: a chatty child blocks writing once the pipe buffer
+    // fills, and we'd then never observe its exit.
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = rx.recv().ok()?; // the reader finishes as the pipe closes
+                return status.success().then_some(out);
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(8)),
+            Err(_) => return None,
+        }
+    }
+}
 
 /// Fetch fish completions for `line` with the caret at byte offset `cursor`.
 /// Returns `None` when fish is unavailable, errors, or yields nothing — the
@@ -26,11 +73,10 @@ pub fn fish_complete(line: &str, cursor: usize) -> Option<CompletionResponse> {
     let cursor = floor_char_boundary(line, cursor.min(line.len()));
     let prefix = &line[..cursor];
     let script = format!("complete -C -- {}", fish_single_quote(prefix));
-    let output = Command::new("fish").arg("-c").arg(script).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let items = parse_completions(&String::from_utf8_lossy(&output.stdout));
+    let mut cmd = Command::new("fish");
+    cmd.arg("-c").arg(script);
+    let stdout = output_within_timeout(cmd, COMPLETION_TIMEOUT)?;
+    let items = parse_completions(&String::from_utf8_lossy(&stdout));
     if items.is_empty() {
         return None;
     }
@@ -100,12 +146,118 @@ pub fn bash_complete(line: &str, cursor: usize) -> Option<CompletionResponse> {
     // Complete the line up to the caret; snap a stray offset to a char boundary.
     let cursor = floor_char_boundary(line, cursor.min(line.len()));
     let prefix = &line[..cursor];
-    let output =
-        Command::new("bash").arg("-c").arg(BASH_DRIVER).arg("shelvd-complete").arg(prefix).output().ok()?;
-    if !output.status.success() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(BASH_DRIVER).arg("shelvd-complete").arg(prefix);
+    let stdout = output_within_timeout(cmd, COMPLETION_TIMEOUT)?;
+    let items = parse_bash_completions(&String::from_utf8_lossy(&stdout));
+    if items.is_empty() {
         return None;
     }
-    let items = parse_bash_completions(&String::from_utf8_lossy(&output.stdout));
+    Some(CompletionResponse { replace_start: last_token_start(prefix), replace_end: cursor, items })
+}
+
+/// A self-contained zsh script that captures what zsh's own completion system
+/// would offer for a partial line and prints the candidates, one per line as
+/// `value<TAB>description` (the description present only when zsh supplies one).
+///
+/// zsh has no stdout-printing `compgen`/`complete -C`, so the script hosts a real
+/// interactive zsh inside a `zpty` child and turns completion into a capture: it
+/// neutralizes execution (Enter is unbound; Tab runs `complete-word`) and replaces
+/// the `compadd` builtin with a hook that diverts matches into an array and prints
+/// them instead of inserting them — the established "zsh-capture-completion"
+/// technique. `compprefuncs`/`comppostfuncs` frame one completion pass with private
+/// sentinels, and the post hook `exit`s the child so the pty closes and the read
+/// loop ends. `$1` is the line prefix; it is fed to the child as keystrokes (never
+/// executed), so an arbitrary line cannot inject shell.
+///
+/// `setopt rcquotes` makes `''` denote a literal single quote inside the
+/// single-quoted setup that is sourced into the child.
+const ZSH_DRIVER: &str = r#"
+setopt rcquotes
+zmodload zsh/zpty 2>/dev/null || exit 1
+zpty CAP zsh -f -i
+_shelvd_wait() {
+  local want=$1 line acc=
+  integer n=0
+  while zpty -r CAP line; do
+    acc+=$line
+    [[ $acc == *$want* ]] && return 0
+    (( ++n > 4000 )) && return 1
+  done
+  return 1
+}
+() { zpty -w CAP "source $1"; _shelvd_wait SHELVD_READY || exit 2 } =( <<< '
+PROMPT=
+RPROMPT=
+autoload -Uz compinit && compinit -u -d "${TMPDIR:-/tmp}/shelvd-zcompdump-$UID" >/dev/null 2>&1
+zmodload zsh/zutil
+# Never run a command: Enter is inert, Tab completes.
+bindkey ''^M'' undefined
+bindkey ''^J'' undefined
+bindkey ''^I'' complete-word
+zstyle '':completion:*'' list-grouped false
+zstyle '':completion:*'' insert-tab false
+# Frame one completion pass; the post hook exits so the pty closes.
+_shelvd_pre()  { print -r -- SHELVD_BEGIN }
+_shelvd_post() { print -r -- SHELVD_END; exit }
+compprefuncs=( _shelvd_pre )
+comppostfuncs=( _shelvd_post )
+# Divert matches instead of inserting them.
+compadd () {
+  # Calls that already capture (-O/-A/-D) must pass straight through.
+  if [[ ${@[1,(i)(-|--)]} == *-(O|A|D)\ * ]]; then
+    builtin compadd "$@"
+    return $?
+  fi
+  typeset -a __hits __dscr
+  if (( $@[(I)-d] )); then
+    local __t=${@[$[${@[(i)-d]}+1]]}
+    if [[ $__t == \(* ]]; then
+      eval "__dscr=$__t"
+    else
+      __dscr=( "${(@P)__t}" )
+    fi
+  fi
+  builtin compadd -A __hits -D __dscr "$@"
+  setopt localoptions norcexpandparam extendedglob
+  typeset -A apre hpre hsuf asuf
+  zparseopts -E P:=apre p:=hpre S:=asuf s:=hsuf
+  [[ -n $__hits ]] || return
+  local i dscr
+  for i in {1..$#__hits}; do
+    (( $#__dscr >= i )) && dscr=$''\t''${${__dscr[i]}##$__hits[i] #} || dscr=
+    print -r -- $IPREFIX$apre$hpre$__hits[i]$hsuf$asuf$dscr
+  done
+}
+print -r -- SHELVD_READY')
+zpty -w CAP "$1"$'\t'
+integer infr=0
+while zpty -r CAP; do :; done | while IFS= read -r line; do
+  line=${line%$'\r'}
+  [[ $line == *SHELVD_BEGIN* ]] && { infr=1; continue; }
+  [[ $line == *SHELVD_END* ]] && break
+  (( infr )) && print -r -- $line
+done
+exit 0
+"#;
+
+/// Fetch zsh completions for `line` with the caret at byte offset `cursor`.
+/// Returns `None` when zsh is unavailable, errors, times out, or yields nothing —
+/// the caller then falls back to readline. Captures zsh's own completion via a
+/// one-shot [`ZSH_DRIVER`]; the replacement range is the in-progress word (the last
+/// whitespace-delimited token up to the caret).
+///
+/// This is the cold engine: a fresh `zsh` cannot see the live session's
+/// interactively-defined aliases/functions/vars (that is #85's live transport),
+/// but it reflects every completion the system installs, descriptions included.
+pub fn zsh_complete(line: &str, cursor: usize) -> Option<CompletionResponse> {
+    // Complete the line up to the caret; snap a stray offset to a char boundary.
+    let cursor = floor_char_boundary(line, cursor.min(line.len()));
+    let prefix = &line[..cursor];
+    let mut cmd = Command::new("zsh");
+    cmd.arg("-f").arg("-c").arg(ZSH_DRIVER).arg("shelvd-complete").arg(prefix);
+    let stdout = output_within_timeout(cmd, COMPLETION_TIMEOUT)?;
+    let items = parse_zsh_completions(&String::from_utf8_lossy(&stdout));
     if items.is_empty() {
         return None;
     }
@@ -125,6 +277,31 @@ fn parse_bash_completions(stdout: &str) -> Vec<CompletionItem> {
             let value = line.trim_end_matches(' ');
             (!value.is_empty() && seen.insert(value.to_owned()))
                 .then(|| CompletionItem { value: value.to_owned(), description: None })
+        })
+        .collect()
+}
+
+/// Parse the zsh driver's output: one candidate per line, `value<TAB>description`
+/// where present. zsh formats descriptions as `-- text`, so a leading `-- ` is
+/// stripped; matches can repeat across completion tags, so duplicate values are
+/// dropped, first occurrence wins.
+fn parse_zsh_completions(stdout: &str) -> Vec<CompletionItem> {
+    let mut seen = HashSet::new();
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (value, description) = match line.split_once('\t') {
+                Some((v, d)) => {
+                    let d = d.trim();
+                    let d = d.strip_prefix("-- ").unwrap_or(d).trim();
+                    (v, (!d.is_empty()).then(|| d.to_owned()))
+                }
+                None => (line, None),
+            };
+            if value.is_empty() || !seen.insert(value.to_owned()) {
+                return None;
+            }
+            Some(CompletionItem { value: value.to_owned(), description })
         })
         .collect()
 }
@@ -272,5 +449,63 @@ mod tests {
         let resp = bash_complete("ech", 3).expect("bash returns candidates for 'ech'");
         assert!(resp.items.iter().any(|i| i.value == "echo"), "'echo' is among the candidates");
         assert_eq!((resp.replace_start, resp.replace_end), (0, 3), "the single token spans 0..3");
+    }
+
+    #[test]
+    fn parse_zsh_completions_splits_dedups_and_strips_dashes() {
+        // zsh repeats `echo` across tags and prefixes descriptions with `-- `.
+        let out = "echo\nechotc\necho\n--color\t-- control use of color\n--help\tshow help\n";
+        let items = parse_zsh_completions(out);
+        assert_eq!(items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(), [
+            "echo", "echotc", "--color", "--help"
+        ]);
+        assert_eq!(items[0].description, None);
+        assert_eq!(items[2].description.as_deref(), Some("control use of color"), "'-- ' stripped");
+        assert_eq!(items[3].description.as_deref(), Some("show help"));
+    }
+
+    #[test]
+    fn parse_zsh_completions_skips_blank_lines() {
+        assert!(parse_zsh_completions("\n\n").is_empty());
+        assert_eq!(parse_zsh_completions("only\n").len(), 1);
+    }
+
+    #[test]
+    fn zsh_complete_lists_candidates_when_zsh_is_present() {
+        // Self-skips where zsh isn't installed, so the suite stays green without it.
+        let present = Command::new("zsh")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !present {
+            eprintln!("skipping zsh_complete live check: zsh not on PATH");
+            return;
+        }
+        let resp = zsh_complete("ech", 3).expect("zsh returns candidates for 'ech'");
+        assert!(resp.items.iter().any(|i| i.value == "echo"), "'echo' is among the candidates");
+        assert_eq!((resp.replace_start, resp.replace_end), (0, 3), "the single token spans 0..3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_timeout_returns_a_fast_child_stdout() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("hi");
+        let out = output_within_timeout(cmd, Duration::from_secs(5)).expect("printf exits in budget");
+        assert_eq!(out, b"hi");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_timeout_kills_a_slow_child() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let start = Instant::now();
+        let out = output_within_timeout(cmd, Duration::from_millis(200));
+        assert!(out.is_none(), "a child past the budget yields no output");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "returns promptly after the timeout, not after the child exits"
+        );
     }
 }
