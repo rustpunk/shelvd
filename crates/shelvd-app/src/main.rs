@@ -1291,13 +1291,12 @@ fn handle_owned_key(state: &mut State, event: &KeyEvent) {
             }
         }
         Key::Named(NamedKey::Tab) => {
-            // Tab requests completion. When the shell is fish and its engine
-            // returns candidates, open the menu over the owned line. Otherwise hand
-            // the half-typed line to readline without running it (no `\r`) and yield
-            // until the next prompt, so readline's own Tab-completion still works.
-            let opened =
-                state.pty.shell_kind() == ShellKind::Fish && try_open_fish_completion(state);
-            if !opened {
+            // Tab requests completion. When the shell has a cold completion engine
+            // (fish/bash) and it returns candidates, open the menu over the owned
+            // line. Otherwise hand the half-typed line to readline without running
+            // it (no `\r`) and yield until the next prompt, so readline's own
+            // Tab-completion still works.
+            if !try_open_completion(state) {
                 let pending = state.input.take();
                 if let Err(e) = state.pty.write(pending.as_bytes()) {
                     log::debug!("owned tab-flush failed: {e}");
@@ -1371,14 +1370,21 @@ fn open_completion_overlay(state: &mut State, response: CompletionResponse) {
         Some(OverlayState::completion(items, response.replace_start, response.replace_end));
 }
 
-/// Fetch fish completions for the owned line and open the menu if any came back.
-/// Returns whether the menu opened, so the caller skips the readline fallback only
-/// when shelvd actually has candidates to show. Runs a one-shot `fish -c` (~40 ms)
-/// synchronously — acceptable for a deliberate Tab press.
-fn try_open_fish_completion(state: &mut State) -> bool {
+/// Fetch owned-editor completions for the live shell and open the menu if any
+/// came back. Returns whether the menu opened, so the caller skips the readline
+/// fallback only when shelvd actually has candidates to show. Routes by shell
+/// kind to the matching cold engine; a shell without one (zsh until #84, and
+/// `Other`) returns `false` and falls through to readline. Runs a one-shot
+/// subshell (~tens of ms) synchronously — acceptable for a deliberate Tab press.
+fn try_open_completion(state: &mut State) -> bool {
     let line = state.input.text().to_owned();
     let cursor = state.input.caret_byte();
-    let Some(response) = completion::fish_complete(&line, cursor) else {
+    let response = match state.pty.shell_kind() {
+        ShellKind::Fish => completion::fish_complete(&line, cursor),
+        ShellKind::Bash => completion::bash_complete(&line, cursor),
+        ShellKind::Zsh | ShellKind::Other => None,
+    };
+    let Some(response) = response else {
         return false;
     };
     open_completion_overlay(state, response);
