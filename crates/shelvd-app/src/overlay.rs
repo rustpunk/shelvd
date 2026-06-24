@@ -254,6 +254,12 @@ impl InputLine {
     fn caret_col(&self) -> usize {
         UnicodeWidthStr::width(&self.text[..self.byte_at(self.caret)])
     }
+
+    /// Byte offset of the caret in the line — the cursor a completion request
+    /// reports (it completes the line up to here).
+    fn caret_byte(&self) -> usize {
+        self.byte_at(self.caret)
+    }
 }
 
 /// Caret movement and forward-deletion — the editor operations that turn the
@@ -395,6 +401,11 @@ impl BandInput {
     /// input is masked, since each masked char renders as one width-1 bullet.
     pub fn caret_chars(&self) -> usize {
         self.line.caret
+    }
+
+    /// The caret's byte offset in the line — the cursor a completion request reports.
+    pub fn caret_byte(&self) -> usize {
+        self.line.caret_byte()
     }
 }
 
