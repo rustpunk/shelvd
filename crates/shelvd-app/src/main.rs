@@ -1373,16 +1373,17 @@ fn open_completion_overlay(state: &mut State, response: CompletionResponse) {
 /// Fetch owned-editor completions for the live shell and open the menu if any
 /// came back. Returns whether the menu opened, so the caller skips the readline
 /// fallback only when shelvd actually has candidates to show. Routes by shell
-/// kind to the matching cold engine; a shell without one (zsh until #84, and
-/// `Other`) returns `false` and falls through to readline. Runs a one-shot
-/// subshell (~tens of ms) synchronously — acceptable for a deliberate Tab press.
+/// kind to the matching cold engine; a shell without one (`Other`) returns `false`
+/// and falls through to readline. Runs a one-shot subshell (~tens of ms)
+/// synchronously — acceptable for a deliberate Tab press.
 fn try_open_completion(state: &mut State) -> bool {
     let line = state.input.text().to_owned();
     let cursor = state.input.caret_byte();
     let response = match state.pty.shell_kind() {
         ShellKind::Fish => completion::fish_complete(&line, cursor),
         ShellKind::Bash => completion::bash_complete(&line, cursor),
-        ShellKind::Zsh | ShellKind::Other => None,
+        ShellKind::Zsh => completion::zsh_complete(&line, cursor),
+        ShellKind::Other => None,
     };
     let Some(response) = response else {
         return false;
