@@ -24,6 +24,84 @@ use std::time::{Duration, Instant};
 
 use shelvd_term::{CompletionItem, CompletionResponse};
 
+/// What the event loop should do with a completion worker's result, decided by
+/// [`CompletionState::resolve`]. Keeping the decision in a pure value — no winit,
+/// no app state — makes the cancellation policy exhaustively unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompletionOutcome {
+    /// Stale (the owned line moved on) or owned editing is off — ignore the result.
+    Discard,
+    /// Open the completion menu with these candidates.
+    Open(CompletionResponse),
+    /// The engine found nothing — hand the line to readline.
+    FallBack,
+}
+
+/// Generation bookkeeping for owned-editor completion. A request captures the
+/// current [`CompletionState::dispatch`] generation; when its result arrives it is
+/// applied only if the generation still matches — otherwise an owned-editor
+/// keypress or a fresh prompt has [`CompletionState::invalidate`]d it. Pure and
+/// single-threaded (it lives on the loop thread; workers only carry a generation
+/// back), so there is no shared state and the whole policy is testable in isolation.
+#[derive(Default)]
+pub struct CompletionState {
+    generation: u64,
+}
+
+impl CompletionState {
+    /// Invalidate any in-flight request: a new owned keypress or fresh prompt makes
+    /// a pending result stale.
+    pub fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The generation to tag a request dispatched now. Call after [`Self::invalidate`].
+    pub fn dispatch(&self) -> u64 {
+        self.generation
+    }
+
+    /// Decide what to do with the result of request `generation`. `owned` is whether
+    /// owned editing is still in effect. A result is applied only when it is both
+    /// current and still owned; otherwise it is discarded.
+    pub fn resolve(
+        &self,
+        generation: u64,
+        owned: bool,
+        response: Option<CompletionResponse>,
+    ) -> CompletionOutcome {
+        if !owned || generation != self.generation {
+            CompletionOutcome::Discard
+        } else if let Some(response) = response {
+            CompletionOutcome::Open(response)
+        } else {
+            CompletionOutcome::FallBack
+        }
+    }
+}
+
+/// Carries a completion worker's result back to the event loop. Abstracts the
+/// winit `EventLoopProxy` so [`spawn_completion_with`] is testable with a fake.
+pub trait CompletionSink: Send + 'static {
+    fn deliver(&self, generation: u64, response: Option<CompletionResponse>);
+}
+
+/// Run `engine` for `line`/`cursor` on a worker thread and deliver the result,
+/// tagged with `generation`, through `sink`. Both the engine and the sink are
+/// injected, so the worker round-trip is testable without spawning a shell or a
+/// winit loop.
+pub fn spawn_completion_with(
+    engine: fn(&str, usize) -> Option<CompletionResponse>,
+    line: String,
+    cursor: usize,
+    generation: u64,
+    sink: impl CompletionSink,
+) {
+    std::thread::spawn(move || {
+        let response = engine(&line, cursor);
+        sink.deliver(generation, response);
+    });
+}
+
 /// Wall-clock backstop for a completion subprocess. The engines run on a worker
 /// thread (the caller delivers the result asynchronously), so this no longer gates
 /// UI responsiveness — a legitimately slow completion (a networked CLI, a cold
@@ -510,5 +588,99 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "returns promptly after the timeout, not after the child exits"
         );
+    }
+
+    fn a_response() -> CompletionResponse {
+        CompletionResponse {
+            replace_start: 0,
+            replace_end: 2,
+            items: vec![CompletionItem { value: "echo".to_owned(), description: None }],
+        }
+    }
+
+    #[test]
+    fn resolve_opens_a_current_owned_some_result() {
+        let cs = CompletionState::default();
+        let gen = cs.dispatch();
+        assert_eq!(cs.resolve(gen, true, Some(a_response())), CompletionOutcome::Open(a_response()));
+    }
+
+    #[test]
+    fn resolve_falls_back_when_the_engine_is_empty() {
+        let cs = CompletionState::default();
+        let gen = cs.dispatch();
+        assert_eq!(cs.resolve(gen, true, None), CompletionOutcome::FallBack);
+    }
+
+    #[test]
+    fn resolve_discards_a_result_made_stale_by_a_keypress() {
+        let mut cs = CompletionState::default();
+        let gen = cs.dispatch(); // request dispatched
+        cs.invalidate(); // a keypress happened before the result arrived
+        assert_eq!(cs.resolve(gen, true, Some(a_response())), CompletionOutcome::Discard);
+    }
+
+    #[test]
+    fn resolve_discards_when_owned_editing_is_off() {
+        let cs = CompletionState::default();
+        let gen = cs.dispatch();
+        assert_eq!(cs.resolve(gen, false, Some(a_response())), CompletionOutcome::Discard);
+        assert_eq!(cs.resolve(gen, false, None), CompletionOutcome::Discard);
+    }
+
+    #[test]
+    fn only_the_newest_of_two_in_flight_requests_resolves() {
+        // Two dispatches without a result in between (out-of-order workers / a
+        // double Tab): the older generation must be discarded, the newer applied.
+        let mut cs = CompletionState::default();
+        cs.invalidate();
+        let first = cs.dispatch();
+        cs.invalidate();
+        let second = cs.dispatch();
+        assert_ne!(first, second);
+        assert_eq!(cs.resolve(first, true, Some(a_response())), CompletionOutcome::Discard);
+        assert_eq!(cs.resolve(second, true, None), CompletionOutcome::FallBack);
+    }
+
+    #[test]
+    fn invalidate_wraps_without_panicking() {
+        let mut cs = CompletionState { generation: u64::MAX };
+        cs.invalidate();
+        assert_eq!(cs.dispatch(), 0, "generation wraps rather than overflowing");
+    }
+
+    #[test]
+    fn spawn_completion_with_delivers_the_tagged_engine_result() {
+        // A fake sink + fake engine exercise the worker round-trip with no winit
+        // loop and no shell: the engine runs with the given line/cursor and its
+        // result is delivered tagged with the request generation.
+        struct ChanSink(mpsc::Sender<(u64, Option<CompletionResponse>)>);
+        impl CompletionSink for ChanSink {
+            fn deliver(&self, generation: u64, response: Option<CompletionResponse>) {
+                let _ = self.0.send((generation, response));
+            }
+        }
+        fn echo_engine(line: &str, cursor: usize) -> Option<CompletionResponse> {
+            Some(CompletionResponse {
+                replace_start: 0,
+                replace_end: cursor,
+                items: vec![CompletionItem { value: line.to_owned(), description: None }],
+            })
+        }
+        fn empty_engine(_: &str, _: usize) -> Option<CompletionResponse> {
+            None
+        }
+
+        let (tx, rx) = mpsc::channel();
+        spawn_completion_with(echo_engine, "git".to_owned(), 3, 42, ChanSink(tx.clone()));
+        let (generation, response) = rx.recv_timeout(Duration::from_secs(5)).expect("worker delivered");
+        assert_eq!(generation, 42, "the result carries the request generation");
+        let response = response.expect("echo_engine returned Some");
+        assert_eq!(response.items[0].value, "git", "the engine ran with the given line");
+        assert_eq!(response.replace_end, 3, "the engine ran with the given cursor");
+
+        spawn_completion_with(empty_engine, "x".to_owned(), 1, 7, ChanSink(tx));
+        let (generation, response) = rx.recv_timeout(Duration::from_secs(5)).expect("worker delivered");
+        assert_eq!((generation, response), (7, None), "an empty engine delivers a tagged None");
     }
 }
